@@ -420,7 +420,8 @@ def help_text():
         "/format - show the market format\n"
         "/scan - score sample_markets.txt\n"
         "/top - show top markets from candidate_markets.txt\n"
-        "/watch - show only WATCH and SMALL TEST from candidate_markets.txt\n\n"
+        "/watch - show only WATCH and SMALL TEST from candidate_markets.txt\n"
+        "/refresh - reload candidate_markets.txt and count market blocks\n\n"
         "You can also paste one or more market blocks directly."
     )
 
@@ -492,6 +493,15 @@ def run_watch():
 
     ranked = sorted(filtered, key=lambda x: x["best"]["edge_mid"], reverse=True)
     return format_ranked(ranked)
+
+def run_refresh():
+    blocks = load_candidate_markets()
+    count = len(blocks)
+
+    if count == 0:
+        return "Refresh done. No candidate markets found in candidate_markets.txt"
+
+    return f"Refresh done. Loaded {count} candidate market blocks from candidate_markets.txt"
 
 # =====================
 # TELEGRAM SEND
@@ -566,6 +576,8 @@ def webhook():
             reply = run_top()
         elif lower == "/watch":
             reply = run_watch()
+        elif lower == "/refresh":
+            reply = run_refresh()
         else:
             reply = format_ranked(score_blocks(split_blocks(text)))
 

@@ -24,18 +24,17 @@ LIVE_FEED_SOURCE_URL = os.getenv("LIVE_FEED_SOURCE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.15"))   # -15%
-WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.10"))   # -10%
-SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "600"))  # 10 min
+# Since your current feed does NOT contain true imbalance data,
+# these thresholds are for a derived proxy score instead.
+ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.20"))
+WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.12"))
+
+SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "600"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 STATE_FILE = os.getenv("STATE_FILE", "alert_state.json")
 SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "false").lower() == "true"
 QUIET_MODE = os.getenv("QUIET_MODE", "false").lower() == "true"
 PORT = int(os.getenv("PORT", "10000"))
-
-# =========================
-# APP
-# =========================
 
 app = Flask(__name__)
 
@@ -48,7 +47,7 @@ class MarketCandidate:
     market_id: str
     title: str
     ticker: str
-    imbalance: float
+    imbalance: float  # used here as proxy_score
     volume: Optional[float] = None
     liquidity: Optional[float] = None
     url: Optional[str] = None
@@ -78,6 +77,7 @@ def load_state() -> Dict[str, Any]:
             return json.load(f)
     except Exception:
         return {"alerted": {}, "watch_alerted": {}}
+
 
 def save_state(state: Dict[str, Any]) -> None:
     tmp = f"{STATE_FILE}.tmp"
@@ -132,31 +132,29 @@ def parse_float(value: Any) -> Optional[float]:
     except Exception:
         return None
 
-def normalize_imbalance(value: Any) -> Optional[float]:
-    """
-    Converts either:
-    - -0.153 -> -0.153
-    - -15.3  -> -0.153
-    - '-15.3%' -> -0.153
-    """
-    num = parse_float(value)
-    if num is None:
-        return None
 
-    if abs(num) > 1.0:
-        return num / 100.0
-    return num
+def fmt_num(x: Optional[float]) -> str:
+    if x is None:
+        return "n/a"
+    if abs(x) >= 1_000_000:
+        return f"{x / 1_000_000:.2f}M"
+    if abs(x) >= 1_000:
+        return f"{x / 1_000:.2f}K"
+    return f"{x:.2f}"
 
-def safe_str(value: Any, fallback: str = "") -> str:
-    if value is None:
-        return fallback
-    return str(value).strip()
 
-def get_first(d: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
-    for k in keys:
-        if k in d and d[k] not in (None, ""):
-            return d[k]
-    return default
+def fmt_pct(x: Optional[float]) -> str:
+    if x is None:
+        return "n/a"
+    return f"{x * 100:.2f}%"
+
+
+def safe_div(a: float, b: float) -> float:
+    return a / b if b else 0.0
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
 
 # =========================
@@ -171,134 +169,134 @@ def fetch_live_feed() -> str:
     r.raise_for_status()
     return r.text
 
-def try_parse_json(text: str) -> Optional[Any]:
+
+# =========================
+# PARSER FOR YOUR CURRENT FEED
+# =========================
+
+def parse_text_feed(text: str) -> List[MarketCandidate]:
+    """
+    Parses feed entries like:
+
+    Market BTC settles above 85000 by Apr 1 Mode settle Spot 68981 Strike 85000 Vol 26.94M
+    Expiry 20 days Yes ask 0.18 No ask 0.83 Liquidity 5.23M Spread 0.01
+
+    Works even if the whole file is one long line.
+    """
+
+    normalized = normalize_text(text)
+
+    pattern = re.compile(
+        r"Market\s+(?P<title>.*?)\s+"
+        r"Mode\s+(?P<mode>\w+)\s+"
+        r"Spot\s+(?P<spot>[-+]?\d+(?:\.\d+)?)\s+"
+        r"Strike\s+(?P<strike>[-+]?\d+(?:\.\d+)?)\s+"
+        r"Vol\s+(?P<vol>[-+]?\d+(?:\.\d+)?(?:[KkMm])?)\s+"
+        r"Expiry\s+(?P<expiry>\d+)\s+days\s+"
+        r"Yes ask\s+(?P<yes_ask>[-+]?\d+(?:\.\d+)?)\s+"
+        r"No ask\s+(?P<no_ask>[-+]?\d+(?:\.\d+)?)\s+"
+        r"Liquidity\s+(?P<liquidity>[-+]?\d+(?:\.\d+)?(?:[KkMm])?)\s+"
+        r"Spread\s+(?P<spread>[-+]?\d+(?:\.\d+)?)",
+        re.IGNORECASE,
+    )
+
+    matches = list(pattern.finditer(normalized))
+    candidates: List[MarketCandidate] = []
+
+    for i, m in enumerate(matches, start=1):
+        title = m.group("title").strip()
+        mode = m.group("mode").strip().lower()
+        spot = parse_human_number(m.group("spot")) or 0.0
+        strike = parse_human_number(m.group("strike")) or 0.0
+        vol = parse_human_number(m.group("vol"))
+        expiry_days = parse_human_number(m.group("expiry")) or 0.0
+        yes_ask = parse_human_number(m.group("yes_ask")) or 0.0
+        no_ask = parse_human_number(m.group("no_ask")) or 0.0
+        liquidity = parse_human_number(m.group("liquidity"))
+        spread = parse_human_number(m.group("spread")) or 0.0
+
+        ticker = infer_ticker(title, i)
+        market_id = f"{ticker}_{i}"
+
+        # Derived proxy score:
+        # Negative score = farther OTM with relatively cheap yes pricing and wider frictions.
+        # This is NOT true order imbalance.
+        distance_pct = safe_div((strike - spot), spot)
+
+        # Base proxy
+        proxy_score = yes_ask - distance_pct - spread
+
+        # Mild penalty for low liquidity
+        if liquidity is not None:
+            if liquidity < 5000:
+                proxy_score -= 0.03
+            elif liquidity < 15000:
+                proxy_score -= 0.01
+
+        # Mild penalty for very short expiry
+        if expiry_days <= 3:
+            proxy_score -= 0.02
+
+        candidate = MarketCandidate(
+            market_id=market_id,
+            title=title,
+            ticker=ticker,
+            imbalance=proxy_score,
+            volume=vol,
+            liquidity=liquidity,
+            url=None,
+            raw={
+                "mode": mode,
+                "spot": spot,
+                "strike": strike,
+                "expiry_days": expiry_days,
+                "yes_ask": yes_ask,
+                "no_ask": no_ask,
+                "spread": spread,
+                "distance_pct": distance_pct,
+                "proxy_score": proxy_score,
+            },
+        )
+        candidates.append(candidate)
+
+    return candidates
+
+
+def parse_human_number(value: str) -> Optional[float]:
+    if value is None:
+        return None
+    s = str(value).strip().replace(",", "")
+    mult = 1.0
+
+    if s.lower().endswith("k"):
+        mult = 1_000.0
+        s = s[:-1]
+    elif s.lower().endswith("m"):
+        mult = 1_000_000.0
+        s = s[:-1]
+
     try:
-        return json.loads(text)
+        return float(s) * mult
     except Exception:
         return None
 
 
-# =========================
-# PARSERS
-# =========================
+def infer_ticker(title: str, idx: int) -> str:
+    # Try to infer ticker from common crypto/market shorthand in title
+    upper = title.upper()
+    for token in ["BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "AVAX"]:
+        if token in upper:
+            return token
 
-def parse_json_feed(data: Any) -> List[MarketCandidate]:
-    items: List[Dict[str, Any]] = []
+    # Fallback: first alphanumeric word
+    m = re.search(r"[A-Z0-9]+", upper)
+    if m:
+        return m.group(0)[:12]
 
-    if isinstance(data, list):
-        items = [x for x in data if isinstance(x, dict)]
-    elif isinstance(data, dict):
-        for key in ["markets", "data", "items", "results", "candidates"]:
-            if isinstance(data.get(key), list):
-                items = [x for x in data[key] if isinstance(x, dict)]
-                break
-        if not items:
-            items = [data]
+    return f"MKT{idx}"
 
-    candidates: List[MarketCandidate] = []
-
-    for item in items:
-        title = safe_str(get_first(item, ["title", "name", "question", "market", "label"], "Untitled Market"))
-        ticker = safe_str(get_first(item, ["ticker", "symbol", "slug", "code"], title[:24]))
-        market_id = safe_str(get_first(item, ["id", "market_id", "slug", "ticker"], ticker or title))
-
-        imbalance_raw = get_first(
-            item,
-            ["imbalance", "rsv", "rsv_close", "closing_imbalance", "imbalance_pct", "imbalance_percent"],
-            None,
-        )
-        imbalance = normalize_imbalance(imbalance_raw)
-        if imbalance is None:
-            continue
-
-        volume = parse_float(get_first(item, ["volume", "vol", "daily_volume", "market_volume"], None))
-        liquidity = parse_float(get_first(item, ["liquidity", "liq"], None))
-        url = safe_str(get_first(item, ["url", "link", "market_url"], ""), "")
-
-        candidates.append(
-            MarketCandidate(
-                market_id=market_id,
-                title=title,
-                ticker=ticker,
-                imbalance=imbalance,
-                volume=volume,
-                liquidity=liquidity,
-                url=url or None,
-                raw=item,
-            )
-        )
-
-    return candidates
-
-def parse_text_feed(text: str) -> List[MarketCandidate]:
-    """
-    Flexible text parser for feed blocks like:
-    Title: ...
-    Ticker: ...
-    Imbalance: -16.2%
-    Volume: 12345
-    Liquidity: 9999
-    URL: ...
-    """
-    blocks = re.split(r"\n\s*\n", text.strip())
-    candidates: List[MarketCandidate] = []
-
-    for i, block in enumerate(blocks, start=1):
-        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-        if not lines:
-            continue
-
-        merged = "\n".join(lines)
-
-        title_match = re.search(r"(?im)^(?:title|market|name|question)\s*:\s*(.+)$", merged)
-        ticker_match = re.search(r"(?im)^(?:ticker|symbol|code|slug)\s*:\s*(.+)$", merged)
-        imbalance_match = re.search(
-            r"(?im)^(?:imbalance|rsv|rsv_close|closing_imbalance|imbalance_pct|imbalance_percent)\s*:\s*([\-+]?\d+(?:\.\d+)?%?)$",
-            merged,
-        )
-        volume_match = re.search(r"(?im)^(?:volume|vol)\s*:\s*([$0-9,.\-]+)$", merged)
-        liquidity_match = re.search(r"(?im)^(?:liquidity|liq)\s*:\s*([$0-9,.\-]+)$", merged)
-        url_match = re.search(r"(?im)^(?:url|link)\s*:\s*(https?://\S+)$", merged)
-
-        if not imbalance_match:
-            pct_inline = re.search(r"([\-+]?\d+(?:\.\d+)?)\s*%", merged)
-            if pct_inline:
-                imbalance_val = normalize_imbalance(pct_inline.group(1) + "%")
-            else:
-                continue
-        else:
-            imbalance_val = normalize_imbalance(imbalance_match.group(1))
-
-        if imbalance_val is None:
-            continue
-
-        title = title_match.group(1).strip() if title_match else f"Market Block {i}"
-        ticker = ticker_match.group(1).strip() if ticker_match else f"MKT{i}"
-        market_id = ticker or f"market_{i}"
-
-        volume = parse_float(volume_match.group(1)) if volume_match else None
-        liquidity = parse_float(liquidity_match.group(1)) if liquidity_match else None
-        url = url_match.group(1).strip() if url_match else None
-
-        candidates.append(
-            MarketCandidate(
-                market_id=market_id,
-                title=title,
-                ticker=ticker,
-                imbalance=imbalance_val,
-                volume=volume,
-                liquidity=liquidity,
-                url=url,
-                raw={"block": merged},
-            )
-        )
-
-    return candidates
 
 def parse_feed(raw_text: str) -> List[MarketCandidate]:
-    parsed_json = try_parse_json(raw_text)
-    if parsed_json is not None:
-        return parse_json_feed(parsed_json)
     return parse_text_feed(raw_text)
 
 
@@ -320,34 +318,26 @@ def classify_candidate(c: MarketCandidate) -> MarketCandidate:
 # MESSAGE BUILDERS
 # =========================
 
-def fmt_pct(x: Optional[float]) -> str:
-    if x is None:
-        return "n/a"
-    return f"{x * 100:.2f}%"
-
-def fmt_num(x: Optional[float]) -> str:
-    if x is None:
-        return "n/a"
-    if abs(x) >= 1_000_000:
-        return f"{x / 1_000_000:.2f}M"
-    if abs(x) >= 1_000:
-        return f"{x / 1_000:.2f}K"
-    return f"{x:.2f}"
-
 def build_alert_message(c: MarketCandidate) -> str:
+    raw = c.raw or {}
     lines = [
         f"{BOT_LABEL} | {c.category}",
         f"Market: {c.title}",
         f"Ticker: {c.ticker}",
-        f"Imbalance: {fmt_pct(c.imbalance)}",
-        f"Threshold hit: YES (<= {fmt_pct(ALERT_THRESHOLD)})" if c.category == "ALERT" else f"Threshold hit: watch (<= {fmt_pct(WATCH_THRESHOLD)})",
+        f"Proxy score: {c.imbalance:.3f}",
+        f"Spot: {raw.get('spot', 'n/a')}",
+        f"Strike: {raw.get('strike', 'n/a')}",
+        f"Distance: {fmt_pct(raw.get('distance_pct'))}",
+        f"Yes ask: {raw.get('yes_ask', 'n/a')}",
+        f"No ask: {raw.get('no_ask', 'n/a')}",
+        f"Expiry days: {raw.get('expiry_days', 'n/a')}",
         f"Volume: {fmt_num(c.volume)}",
         f"Liquidity: {fmt_num(c.liquidity)}",
-        "Expected reaction window: 2:00–4:00 a.m. ET, strongest 2:00–3:00 a.m. ET",
+        f"Spread: {raw.get('spread', 'n/a')}",
+        f"Alert threshold: {ALERT_THRESHOLD:.2f}",
     ]
-    if c.url:
-        lines.append(f"Link: {c.url}")
     return "\n".join(lines)
+
 
 def build_summary(candidates: List[MarketCandidate]) -> str:
     total = len(candidates)
@@ -371,7 +361,12 @@ def scan_once(send_summary: bool = False) -> Dict[str, Any]:
     state = load_state()
 
     raw_text = fetch_live_feed()
+    log(f"Fetched feed length: {len(raw_text)}")
+    log(f"Feed preview: {raw_text[:500]}")
+
     candidates = parse_feed(raw_text)
+    log(f"Parsed candidates before classify: {len(candidates)}")
+
     candidates = [classify_candidate(c) for c in candidates]
 
     log(build_summary(candidates))
@@ -398,7 +393,11 @@ def scan_once(send_summary: bool = False) -> Dict[str, Any]:
 
     save_state(state)
 
-    result = {
+    top_candidates = [
+        asdict(c) for c in sorted(candidates, key=lambda x: x.imbalance)[:10]
+    ]
+
+    return {
         "ok": True,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "counts": {
@@ -411,18 +410,8 @@ def scan_once(send_summary: bool = False) -> Dict[str, Any]:
             "alert": sent_alerts,
             "watch": sent_watch,
         },
-        "top_candidates": [asdict(c) for c in candidates if c.category in ("ALERT", "WATCH")][:10],
+        "top_candidates": top_candidates,
     }
-
-    if send_summary:
-        send_telegram_message(
-            f"{BOT_LABEL} summary\n"
-            f"Alert sent: {sent_alerts}\n"
-            f"Watch sent: {sent_watch}\n"
-            f"Total scanned: {len(candidates)}"
-        )
-
-    return result
 
 
 # =========================
@@ -440,6 +429,7 @@ def scanner_loop() -> None:
         except Exception as e:
             log(f"Scan error: {e}")
         time.sleep(SCAN_EVERY_SECONDS)
+
 
 def start_background_worker() -> None:
     global _worker_started
@@ -462,9 +452,24 @@ def home():
         "message": "Webhook + background alert scanner running"
     })
 
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
+
+
+@app.route("/debug-feed", methods=["GET"])
+def debug_feed():
+    try:
+        raw_text = fetch_live_feed()
+        return jsonify({
+            "ok": True,
+            "length": len(raw_text),
+            "preview": raw_text[:4000],
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.route("/scan-now", methods=["GET", "POST"])
 def scan_now():
@@ -474,12 +479,9 @@ def scan_now():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
-    """
-    Optional webhook endpoint.
-    If you later wire Telegram webhook here, it can reply to simple commands.
-    """
     try:
         payload = request.get_json(force=True, silent=True) or {}
         message = payload.get("message", {})
@@ -497,9 +499,16 @@ def telegram_webhook():
         elif text == "/status":
             send_telegram_message(
                 f"{BOT_LABEL} status\n"
-                f"Threshold: {fmt_pct(ALERT_THRESHOLD)}\n"
-                f"Watch: {fmt_pct(WATCH_THRESHOLD)}\n"
+                f"Alert threshold: {ALERT_THRESHOLD}\n"
+                f"Watch threshold: {WATCH_THRESHOLD}\n"
                 f"Scan every: {SCAN_EVERY_SECONDS} sec"
+            )
+        elif text == "/debug":
+            raw_text = fetch_live_feed()
+            send_telegram_message(
+                f"{BOT_LABEL} debug\n"
+                f"Feed length: {len(raw_text)}\n"
+                f"Preview: {raw_text[:1000]}"
             )
 
         return jsonify({"ok": True})

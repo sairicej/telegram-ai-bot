@@ -16,9 +16,15 @@ MAX_SPREAD = 0.03
 GOOD_SPREAD = 0.015
 IGNORE_NEAR_CERTAIN = True
 
+# Alert-ready settings
+ALERT_MIN_EDGE = 0.20
+ALERT_MIN_LIQUIDITY = 20000.0
+ALERT_REQUIRE_ROBUST = True
+
 SAMPLE_MARKETS_FILE = "sample_markets.txt"
 CANDIDATE_MARKETS_FILE = "candidate_markets.txt"
 INCOMING_MARKETS_FILE = "incoming_markets.txt"
+SHORTLIST_MARKETS_FILE = "shortlist_markets.txt"
 
 # =====================
 # ENV / TOKEN
@@ -393,6 +399,21 @@ def format_ranked(results):
 
     return "\n".join(lines)
 
+def format_counts(results, label):
+    ok_results = [r for r in results if r.get("ok")]
+    total = len(ok_results)
+    smalltest = sum(1 for r in ok_results if r["action"] == "SMALL TEST")
+    watch = sum(1 for r in ok_results if r["action"] == "WATCH")
+    skip = sum(1 for r in ok_results if r["action"] == "SKIP")
+
+    return (
+        f"{label}\n"
+        f"- Total valid markets: {total}\n"
+        f"- SMALL TEST: {smalltest}\n"
+        f"- WATCH: {watch}\n"
+        f"- SKIP: {skip}"
+    )
+
 # =====================
 # FILE LOADERS
 # =====================
@@ -414,6 +435,56 @@ def load_candidate_markets():
 def load_incoming_markets():
     return load_text_blocks_from_file(INCOMING_MARKETS_FILE)
 
+def load_shortlist_markets():
+    return load_text_blocks_from_file(SHORTLIST_MARKETS_FILE)
+
+# =====================
+# FILTER HELPERS
+# =====================
+def score_blocks(blocks):
+    results = []
+    for block in blocks:
+        m = extract_inputs(block)
+        results.append(compute_one(m))
+    return results
+
+def filter_results_by_action(results, actions):
+    filtered = [
+        r for r in results
+        if r.get("ok") and r.get("action") in actions
+    ]
+    return sorted(filtered, key=lambda x: x["best"]["edge_mid"], reverse=True)
+
+def filter_alert_candidates(results):
+    filtered = []
+    for r in results:
+        if not r.get("ok"):
+            continue
+        if r["best"]["edge_mid"] < ALERT_MIN_EDGE:
+            continue
+        if ALERT_REQUIRE_ROBUST and not r["best"]["robust"]:
+            continue
+        if r.get("liquidity") is not None and r["liquidity"] < ALERT_MIN_LIQUIDITY:
+            continue
+        filtered.append(r)
+    return sorted(filtered, key=lambda x: x["best"]["edge_mid"], reverse=True)
+
+def quick_top_text(results, title, limit=5):
+    ok_results = [r for r in results if r.get("ok")]
+    if not ok_results:
+        return f"No valid markets found for {title.lower()}."
+
+    ranked = sorted(ok_results, key=lambda x: x["best"]["edge_mid"], reverse=True)
+
+    lines = [f"{title}\n"]
+    for i, r in enumerate(ranked[:limit], start=1):
+        badge = {"SMALL TEST": "✅", "WATCH": "👀", "SKIP": "⛔"}.get(r["action"], "•")
+        best = r["best"]
+        lines.append(
+            f"{i}. {badge} {r['market']} | {r['action']} | best {best['side']} | edge {fmt_pct(best['edge_mid'])}"
+        )
+    return "\n".join(lines)
+
 # =====================
 # COMMAND TEXT
 # =====================
@@ -422,11 +493,25 @@ def help_text():
         "Commands:\n"
         "/help - show commands\n"
         "/format - show the market format\n"
-        "/scan - score sample_markets.txt\n"
-        "/top - show top markets from candidate_markets.txt\n"
-        "/watch - show only WATCH and SMALL TEST from candidate_markets.txt\n"
-        "/refresh - reload candidate_markets.txt and count market blocks\n"
-        "/inbox - score incoming_markets.txt\n\n"
+        "/scan - score sample_markets.txt\n\n"
+        "Candidate commands:\n"
+        "/top - top candidates\n"
+        "/watch - WATCH and SMALL TEST candidates\n"
+        "/smalltest - only SMALL TEST candidates\n"
+        "/skip - only SKIP candidates\n"
+        "/counts - candidate counts\n"
+        "/refresh - reload candidate file count\n"
+        "/alertcheck - candidate alert-ready markets\n\n"
+        "Inbox commands:\n"
+        "/inbox - full inbox scoring\n"
+        "/inboxtop - top inbox ideas\n"
+        "/inboxwatch - inbox WATCH and SMALL TEST\n"
+        "/inboxcounts - inbox counts\n"
+        "/inboxalert - inbox alert-ready markets\n\n"
+        "Shortlist commands:\n"
+        "/shortlist - full shortlist scoring\n"
+        "/shortlisttop - top shortlist ideas\n"
+        "/shortlistcounts - shortlist counts\n\n"
         "You can also paste one or more market blocks directly."
     )
 
@@ -448,13 +533,6 @@ def format_text():
 # =====================
 # COMMAND RUNNERS
 # =====================
-def score_blocks(blocks):
-    results = []
-    for block in blocks:
-        m = extract_inputs(block)
-        results.append(compute_one(m))
-    return results
-
 def run_scan():
     blocks = load_sample_markets()
     if not blocks:
@@ -465,56 +543,110 @@ def run_top():
     blocks = load_candidate_markets()
     if not blocks:
         return "No candidate markets found in candidate_markets.txt"
-
-    results = [r for r in score_blocks(blocks) if r["ok"]]
-    if not results:
-        return "No valid candidate markets parsed."
-
-    ranked = sorted(results, key=lambda x: x["best"]["edge_mid"], reverse=True)
-
-    lines = ["Top market candidates:\n"]
-    for i, r in enumerate(ranked[:5], start=1):
-        badge = {"SMALL TEST": "✅", "WATCH": "👀", "SKIP": "⛔"}.get(r["action"], "•")
-        best = r["best"]
-        lines.append(
-            f"{i}. {badge} {r['market']} | {r['action']} | best {best['side']} | edge {fmt_pct(best['edge_mid'])}"
-        )
-
-    return "\n".join(lines)
+    return quick_top_text(score_blocks(blocks), "Top candidate markets:")
 
 def run_watch():
     blocks = load_candidate_markets()
     if not blocks:
         return "No candidate markets found in candidate_markets.txt"
-
-    results = score_blocks(blocks)
-    filtered = [
-        r for r in results
-        if r.get("ok") and r.get("action") in ["SMALL TEST", "WATCH"]
-    ]
-
+    filtered = filter_results_by_action(score_blocks(blocks), ["SMALL TEST", "WATCH"])
     if not filtered:
         return "No WATCH or SMALL TEST markets found."
+    return format_ranked(filtered)
 
-    ranked = sorted(filtered, key=lambda x: x["best"]["edge_mid"], reverse=True)
-    return format_ranked(ranked)
+def run_smalltest():
+    blocks = load_candidate_markets()
+    if not blocks:
+        return "No candidate markets found in candidate_markets.txt"
+    filtered = filter_results_by_action(score_blocks(blocks), ["SMALL TEST"])
+    if not filtered:
+        return "No SMALL TEST markets found."
+    return format_ranked(filtered)
+
+def run_skip():
+    blocks = load_candidate_markets()
+    if not blocks:
+        return "No candidate markets found in candidate_markets.txt"
+    filtered = filter_results_by_action(score_blocks(blocks), ["SKIP"])
+    if not filtered:
+        return "No SKIP markets found."
+    return format_ranked(filtered)
+
+def run_counts():
+    blocks = load_candidate_markets()
+    if not blocks:
+        return "No candidate markets found in candidate_markets.txt"
+    return format_counts(score_blocks(blocks), "Candidate market counts:")
 
 def run_refresh():
     blocks = load_candidate_markets()
     count = len(blocks)
-
     if count == 0:
         return "Refresh done. No candidate markets found in candidate_markets.txt"
-
     return f"Refresh done. Loaded {count} candidate market blocks from candidate_markets.txt"
+
+def run_alertcheck():
+    blocks = load_candidate_markets()
+    if not blocks:
+        return "No candidate markets found in candidate_markets.txt"
+    filtered = filter_alert_candidates(score_blocks(blocks))
+    if not filtered:
+        return "No alert-ready candidate markets found."
+    return format_ranked(filtered)
 
 def run_inbox():
     blocks = load_incoming_markets()
     if not blocks:
         return "No incoming markets found in incoming_markets.txt"
+    return format_ranked(score_blocks(blocks))
 
-    results = score_blocks(blocks)
-    return format_ranked(results)
+def run_inboxtop():
+    blocks = load_incoming_markets()
+    if not blocks:
+        return "No incoming markets found in incoming_markets.txt"
+    return quick_top_text(score_blocks(blocks), "Top inbox markets:")
+
+def run_inboxwatch():
+    blocks = load_incoming_markets()
+    if not blocks:
+        return "No incoming markets found in incoming_markets.txt"
+    filtered = filter_results_by_action(score_blocks(blocks), ["SMALL TEST", "WATCH"])
+    if not filtered:
+        return "No WATCH or SMALL TEST inbox markets found."
+    return format_ranked(filtered)
+
+def run_inboxcounts():
+    blocks = load_incoming_markets()
+    if not blocks:
+        return "No incoming markets found in incoming_markets.txt"
+    return format_counts(score_blocks(blocks), "Inbox market counts:")
+
+def run_inboxalert():
+    blocks = load_incoming_markets()
+    if not blocks:
+        return "No incoming markets found in incoming_markets.txt"
+    filtered = filter_alert_candidates(score_blocks(blocks))
+    if not filtered:
+        return "No alert-ready inbox markets found."
+    return format_ranked(filtered)
+
+def run_shortlist():
+    blocks = load_shortlist_markets()
+    if not blocks:
+        return "No shortlist markets found in shortlist_markets.txt"
+    return format_ranked(score_blocks(blocks))
+
+def run_shortlisttop():
+    blocks = load_shortlist_markets()
+    if not blocks:
+        return "No shortlist markets found in shortlist_markets.txt"
+    return quick_top_text(score_blocks(blocks), "Top shortlist markets:")
+
+def run_shortlistcounts():
+    blocks = load_shortlist_markets()
+    if not blocks:
+        return "No shortlist markets found in shortlist_markets.txt"
+    return format_counts(score_blocks(blocks), "Shortlist market counts:")
 
 # =====================
 # TELEGRAM SEND
@@ -589,10 +721,32 @@ def webhook():
             reply = run_top()
         elif lower == "/watch":
             reply = run_watch()
+        elif lower == "/smalltest":
+            reply = run_smalltest()
+        elif lower == "/skip":
+            reply = run_skip()
+        elif lower == "/counts":
+            reply = run_counts()
         elif lower == "/refresh":
             reply = run_refresh()
+        elif lower == "/alertcheck":
+            reply = run_alertcheck()
         elif lower == "/inbox":
             reply = run_inbox()
+        elif lower == "/inboxtop":
+            reply = run_inboxtop()
+        elif lower == "/inboxwatch":
+            reply = run_inboxwatch()
+        elif lower == "/inboxcounts":
+            reply = run_inboxcounts()
+        elif lower == "/inboxalert":
+            reply = run_inboxalert()
+        elif lower == "/shortlist":
+            reply = run_shortlist()
+        elif lower == "/shortlisttop":
+            reply = run_shortlisttop()
+        elif lower == "/shortlistcounts":
+            reply = run_shortlistcounts()
         else:
             reply = format_ranked(score_blocks(split_blocks(text)))
 

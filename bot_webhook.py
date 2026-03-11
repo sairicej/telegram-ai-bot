@@ -15,7 +15,9 @@ GOOD_LIQUIDITY = 20000.0
 MAX_SPREAD = 0.03
 GOOD_SPREAD = 0.015
 IGNORE_NEAR_CERTAIN = True
+
 SAMPLE_MARKETS_FILE = "sample_markets.txt"
+CANDIDATE_MARKETS_FILE = "candidate_markets.txt"
 
 # =====================
 # ENV / TOKEN
@@ -312,11 +314,13 @@ def format_one(r):
         f"- Best edge: {fmt_pct(r['best']['edge_mid'])}\n"
         f"- Best verdict: {r['best']['verdict']}\n"
     )
+
     asks = []
     if r["yes_ask"] is not None:
         asks.append(f"Yes ask {fmt_pct(r['yes_ask'])}")
     if r["no_ask"] is not None:
         asks.append(f"No ask {fmt_pct(r['no_ask'])}")
+
     ask_line = ""
     if asks:
         ask_line = "- " + " | ".join(asks) + "\n"
@@ -328,6 +332,7 @@ def format_one(r):
         extras.append(f"Liquidity: {r['liquidity']:.0f}")
     if r["spread"] is not None:
         extras.append(f"Spread: {r['spread']:.2%}")
+
     extra_line = ""
     if extras:
         extra_line = "\n" + " | ".join(extras)
@@ -388,14 +393,34 @@ def format_ranked(results):
     return "\n".join(lines)
 
 # =====================
-# COMMANDS
+# FILE LOADERS
+# =====================
+def load_text_blocks_from_file(filename):
+    if not os.path.exists(filename):
+        return []
+    with open(filename, "r", encoding="utf-8") as f:
+        raw = f.read().strip()
+    if not raw:
+        return []
+    return split_blocks(raw)
+
+def load_sample_markets():
+    return load_text_blocks_from_file(SAMPLE_MARKETS_FILE)
+
+def load_candidate_markets():
+    return load_text_blocks_from_file(CANDIDATE_MARKETS_FILE)
+
+# =====================
+# COMMAND TEXT
 # =====================
 def help_text():
     return (
         "Commands:\n"
         "/help - show commands\n"
         "/format - show the market format\n"
-        "/scan - score the saved sample markets\n\n"
+        "/scan - score sample_markets.txt\n"
+        "/top - show top markets from candidate_markets.txt\n"
+        "/watch - show only WATCH and SMALL TEST from candidate_markets.txt\n\n"
         "You can also paste one or more market blocks directly."
     )
 
@@ -414,33 +439,90 @@ def format_text():
         "Spread 0.01"
     )
 
-def load_sample_markets():
-    if not os.path.exists(SAMPLE_MARKETS_FILE):
-        return []
-    with open(SAMPLE_MARKETS_FILE, "r", encoding="utf-8") as f:
-        raw = f.read().strip()
-    if not raw:
-        return []
-    return split_blocks(raw)
+# =====================
+# COMMAND RUNNERS
+# =====================
+def score_blocks(blocks):
+    results = []
+    for block in blocks:
+        m = extract_inputs(block)
+        results.append(compute_one(m))
+    return results
 
 def run_scan():
     blocks = load_sample_markets()
     if not blocks:
         return "No sample markets found in sample_markets.txt"
+    return format_ranked(score_blocks(blocks))
 
-    results = []
-    for block in blocks:
-        m = extract_inputs(block)
-        results.append(compute_one(m))
+def run_top():
+    blocks = load_candidate_markets()
+    if not blocks:
+        return "No candidate markets found in candidate_markets.txt"
 
-    return format_ranked(results)
+    results = [r for r in score_blocks(blocks) if r["ok"]]
+    if not results:
+        return "No valid candidate markets parsed."
+
+    ranked = sorted(results, key=lambda x: x["best"]["edge_mid"], reverse=True)
+
+    lines = ["Top market candidates:\n"]
+    for i, r in enumerate(ranked[:5], start=1):
+        badge = {"SMALL TEST": "✅", "WATCH": "👀", "SKIP": "⛔"}.get(r["action"], "•")
+        best = r["best"]
+        lines.append(
+            f"{i}. {badge} {r['market']} | {r['action']} | best {best['side']} | edge {fmt_pct(best['edge_mid'])}"
+        )
+
+    return "\n".join(lines)
+
+def run_watch():
+    blocks = load_candidate_markets()
+    if not blocks:
+        return "No candidate markets found in candidate_markets.txt"
+
+    results = score_blocks(blocks)
+    filtered = [
+        r for r in results
+        if r.get("ok") and r.get("action") in ["SMALL TEST", "WATCH"]
+    ]
+
+    if not filtered:
+        return "No WATCH or SMALL TEST markets found."
+
+    ranked = sorted(filtered, key=lambda x: x["best"]["edge_mid"], reverse=True)
+    return format_ranked(ranked)
 
 # =====================
 # TELEGRAM SEND
 # =====================
+def split_message_for_telegram(text, max_len=3500):
+    if len(text) <= max_len:
+        return [text]
+
+    chunks = []
+    remaining = text
+
+    while len(remaining) > max_len:
+        cut = remaining.rfind("\n---\n", 0, max_len)
+        if cut == -1:
+            cut = remaining.rfind("\n\n", 0, max_len)
+        if cut == -1:
+            cut = max_len
+
+        chunk = remaining[:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        remaining = remaining[cut:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks
+
 def send_telegram_message(chat_id: int, text: str):
-    max_len = 3500
-    chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [""]
+    chunks = split_message_for_telegram(text)
 
     for chunk in chunks:
         r = requests.post(
@@ -480,13 +562,12 @@ def webhook():
             reply = format_text()
         elif lower == "/scan":
             reply = run_scan()
+        elif lower == "/top":
+            reply = run_top()
+        elif lower == "/watch":
+            reply = run_watch()
         else:
-            blocks = split_blocks(text)
-            results = []
-            for block in blocks:
-                m = extract_inputs(block)
-                results.append(compute_one(m))
-            reply = format_ranked(results)
+            reply = format_ranked(score_blocks(split_blocks(text)))
 
         send_telegram_message(chat_id, reply)
         return jsonify({"ok": True}), 200

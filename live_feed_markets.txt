@@ -1,0 +1,43 @@
+Market BTC settles above 85000 by May 31
+Mode settle
+Spot 68981
+Strike 85000
+Vol 0.47
+Expiry 45 days
+Yes ask 0.18
+No ask 0.83
+Liquidity 42000
+Spread 0.01
+
+Market ETH hit 4200 by May 15
+Mode touch
+Spot 3550
+Strike 4200
+Vol 0.51
+Expiry 35 days
+Yes ask 0.24
+No ask 0.77
+Liquidity 26000
+Spread 0.02
+
+Market Solana hit 220 by May 31
+Mode touch
+Spot 142
+Strike 220
+Vol 0.64
+Expiry 45 days
+Yes ask 0.15
+No ask 0.86
+Liquidity 14000
+Spread 0.03
+
+Market Nasdaq settles above 20500 by May 30
+Mode settle
+Spot 19850
+Strike 20500
+Vol 0.20
+Expiry 40 days
+Yes ask 0.34
+No ask 0.67
+Liquidity 51000
+Spread 0.01

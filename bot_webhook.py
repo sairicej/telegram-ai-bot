@@ -18,6 +18,7 @@ IGNORE_NEAR_CERTAIN = True
 
 SAMPLE_MARKETS_FILE = "sample_markets.txt"
 CANDIDATE_MARKETS_FILE = "candidate_markets.txt"
+INCOMING_MARKETS_FILE = "incoming_markets.txt"
 
 # =====================
 # ENV / TOKEN
@@ -410,6 +411,9 @@ def load_sample_markets():
 def load_candidate_markets():
     return load_text_blocks_from_file(CANDIDATE_MARKETS_FILE)
 
+def load_incoming_markets():
+    return load_text_blocks_from_file(INCOMING_MARKETS_FILE)
+
 # =====================
 # COMMAND TEXT
 # =====================
@@ -421,7 +425,8 @@ def help_text():
         "/scan - score sample_markets.txt\n"
         "/top - show top markets from candidate_markets.txt\n"
         "/watch - show only WATCH and SMALL TEST from candidate_markets.txt\n"
-        "/refresh - reload candidate_markets.txt and count market blocks\n\n"
+        "/refresh - reload candidate_markets.txt and count market blocks\n"
+        "/inbox - score incoming_markets.txt\n\n"
         "You can also paste one or more market blocks directly."
     )
 
@@ -503,6 +508,14 @@ def run_refresh():
 
     return f"Refresh done. Loaded {count} candidate market blocks from candidate_markets.txt"
 
+def run_inbox():
+    blocks = load_incoming_markets()
+    if not blocks:
+        return "No incoming markets found in incoming_markets.txt"
+
+    results = score_blocks(blocks)
+    return format_ranked(results)
+
 # =====================
 # TELEGRAM SEND
 # =====================
@@ -578,6 +591,8 @@ def webhook():
             reply = run_watch()
         elif lower == "/refresh":
             reply = run_refresh()
+        elif lower == "/inbox":
+            reply = run_inbox()
         else:
             reply = format_ranked(score_blocks(split_blocks(text)))
 

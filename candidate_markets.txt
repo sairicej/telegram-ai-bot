@@ -1,0 +1,54 @@
+Market Oil hit 90 by Mar 31
+Mode touch
+Spot 81.43
+Strike 90
+Vol 0.35
+Expiry 26 days
+Yes ask 0.71
+No ask 0.30
+Liquidity 24760
+Spread 0.01
+
+Market Bitcoin settles above 80000 by Apr 30
+Mode settle
+Spot 68981
+Strike 80000
+Vol 0.45
+Expiry 20 days
+Yes ask 0.22
+No ask 0.79
+Liquidity 31000
+Spread 0.01
+
+Market ETH hit 4500 by Apr 15
+Mode touch
+Spot 3550
+Strike 4500
+Vol 0.52
+Expiry 15 days
+Yes ask 0.18
+No ask 0.84
+Liquidity 4200
+Spread 0.04
+
+Market Solana hit 250 by May 15
+Mode touch
+Spot 142
+Strike 250
+Vol 0.65
+Expiry 35 days
+Yes ask 0.09
+No ask 0.92
+Liquidity 18000
+Spread 0.02
+
+Market Nasdaq settles above 21000 by Jun 30
+Mode settle
+Spot 19850
+Strike 21000
+Vol 0.22
+Expiry 60 days
+Yes ask 0.31
+No ask 0.70
+Liquidity 52000
+Spread 0.01

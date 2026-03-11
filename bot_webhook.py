@@ -15,6 +15,7 @@ GOOD_LIQUIDITY = 20000.0
 MAX_SPREAD = 0.03
 GOOD_SPREAD = 0.015
 IGNORE_NEAR_CERTAIN = True
+SAMPLE_MARKETS_FILE = "sample_markets.txt"
 
 # =====================
 # ENV / TOKEN
@@ -387,22 +388,67 @@ def format_ranked(results):
     return "\n".join(lines)
 
 # =====================
+# COMMANDS
+# =====================
+def help_text():
+    return (
+        "Commands:\n"
+        "/help - show commands\n"
+        "/format - show the market format\n"
+        "/scan - score the saved sample markets\n\n"
+        "You can also paste one or more market blocks directly."
+    )
+
+def format_text():
+    return (
+        "Use this format:\n\n"
+        "Market Oil hit 90 by Mar 31\n"
+        "Mode touch\n"
+        "Spot 81.43\n"
+        "Strike 90\n"
+        "Vol 0.35\n"
+        "Expiry 26 days\n"
+        "Yes ask 0.71\n"
+        "No ask 0.30\n"
+        "Liquidity 24760\n"
+        "Spread 0.01"
+    )
+
+def load_sample_markets():
+    if not os.path.exists(SAMPLE_MARKETS_FILE):
+        return []
+    with open(SAMPLE_MARKETS_FILE, "r", encoding="utf-8") as f:
+        raw = f.read().strip()
+    if not raw:
+        return []
+    return split_blocks(raw)
+
+def run_scan():
+    blocks = load_sample_markets()
+    if not blocks:
+        return "No sample markets found in sample_markets.txt"
+
+    results = []
+    for block in blocks:
+        m = extract_inputs(block)
+        results.append(compute_one(m))
+
+    return format_ranked(results)
+
+# =====================
 # TELEGRAM SEND
 # =====================
 def send_telegram_message(chat_id: int, text: str):
-    max_len = 4000
+    max_len = 3500
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [""]
 
     for chunk in chunks:
         r = requests.post(
             f"{TELEGRAM_API}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": chunk,
-            },
+            json={"chat_id": chat_id, "text": chunk},
             timeout=30,
         )
-        print("TELEGRAM SEND:", r.status_code, r.text, flush=True)
+        print("TELEGRAM SEND:", r.status_code, flush=True)
         r.raise_for_status()
 
 # =====================
@@ -426,16 +472,23 @@ def webhook():
         if not chat_id or not text:
             return jsonify({"ok": True}), 200
 
-        blocks = split_blocks(text)
-        results = []
+        lower = text.lower()
 
-        for block in blocks:
-            m = extract_inputs(block)
-            results.append(compute_one(m))
+        if lower == "/help":
+            reply = help_text()
+        elif lower == "/format":
+            reply = format_text()
+        elif lower == "/scan":
+            reply = run_scan()
+        else:
+            blocks = split_blocks(text)
+            results = []
+            for block in blocks:
+                m = extract_inputs(block)
+                results.append(compute_one(m))
+            reply = format_ranked(results)
 
-        reply = format_ranked(results)
         send_telegram_message(chat_id, reply)
-
         return jsonify({"ok": True}), 200
 
     except Exception as e:

@@ -31,6 +31,10 @@ LIVE_FEED_MARKETS_FILE = "live_feed_markets.txt"
 # ENV / TOKEN
 # =====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+LIVE_FEED_SOURCE_URL = os.environ.get("LIVE_FEED_SOURCE_URL", "").strip()
+SCHEDULER_SECRET = os.environ.get("SCHEDULER_SECRET", "").strip()
+TELEGRAM_ALERT_CHAT_ID = os.environ.get("TELEGRAM_ALERT_CHAT_ID", "").strip()
+
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN environment variable")
 
@@ -439,8 +443,21 @@ def load_incoming_markets():
 def load_shortlist_markets():
     return load_text_blocks_from_file(SHORTLIST_MARKETS_FILE)
 
-def load_live_feed_markets():
+def load_live_feed_markets_local():
     return load_text_blocks_from_file(LIVE_FEED_MARKETS_FILE)
+
+def fetch_live_feed_blocks():
+    if LIVE_FEED_SOURCE_URL:
+        try:
+            r = requests.get(LIVE_FEED_SOURCE_URL, timeout=30)
+            r.raise_for_status()
+            raw = (r.text or "").strip()
+            if raw:
+                return split_blocks(raw), f"Fetched from LIVE_FEED_SOURCE_URL ({len(split_blocks(raw))} blocks)"
+            return [], "LIVE_FEED_SOURCE_URL returned empty text"
+        except Exception as e:
+            return load_live_feed_markets_local(), f"Fetch failed, used local live_feed_markets.txt fallback: {str(e)}"
+    return load_live_feed_markets_local(), "Used local live_feed_markets.txt"
 
 # =====================
 # FILTER HELPERS
@@ -490,6 +507,51 @@ def quick_top_text(results, title, limit=5):
     return "\n".join(lines)
 
 # =====================
+# TELEGRAM SEND
+# =====================
+def split_message_for_telegram(text, max_len=3500):
+    if len(text) <= max_len:
+        return [text]
+
+    chunks = []
+    remaining = text
+
+    while len(remaining) > max_len:
+        cut = remaining.rfind("\n---\n", 0, max_len)
+        if cut == -1:
+            cut = remaining.rfind("\n\n", 0, max_len)
+        if cut == -1:
+            cut = max_len
+
+        chunk = remaining[:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        remaining = remaining[cut:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks
+
+def send_telegram_message(chat_id: int, text: str):
+    chunks = split_message_for_telegram(text)
+    for chunk in chunks:
+        r = requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": chunk},
+            timeout=30,
+        )
+        print("TELEGRAM SEND:", r.status_code, flush=True)
+        r.raise_for_status()
+
+def send_alert_message(text: str):
+    if not TELEGRAM_ALERT_CHAT_ID:
+        return "TELEGRAM_ALERT_CHAT_ID not set"
+    send_telegram_message(int(TELEGRAM_ALERT_CHAT_ID), text)
+    return f"Alert sent to chat {TELEGRAM_ALERT_CHAT_ID}"
+
+# =====================
 # COMMAND TEXT
 # =====================
 def help_text():
@@ -517,11 +579,13 @@ def help_text():
         "/shortlisttop - top shortlist ideas\n"
         "/shortlistcounts - shortlist counts\n\n"
         "Live-feed commands:\n"
+        "/fetchlive - fetch live feed and report source\n"
         "/livefeed - full live-feed scoring\n"
         "/livefeedtop - top live-feed ideas\n"
         "/livefeedwatch - live-feed WATCH and SMALL TEST\n"
         "/livefeedcounts - live-feed counts\n"
-        "/livefeedalert - live-feed alert-ready markets\n\n"
+        "/livefeedalert - live-feed alert-ready markets\n"
+        "/runalertscan - fetch live feed, filter alerts, and send to alert chat\n\n"
         "You can also paste one or more market blocks directly."
     )
 
@@ -658,81 +722,60 @@ def run_shortlistcounts():
         return "No shortlist markets found in shortlist_markets.txt"
     return format_counts(score_blocks(blocks), "Shortlist market counts:")
 
+def run_fetchlive():
+    blocks, source_note = fetch_live_feed_blocks()
+    return f"{source_note}\nLoaded {len(blocks)} live-feed market blocks."
+
 def run_livefeed():
-    blocks = load_live_feed_markets()
+    blocks, _ = fetch_live_feed_blocks()
     if not blocks:
-        return "No live-feed markets found in live_feed_markets.txt"
+        return "No live-feed markets found."
     return format_ranked(score_blocks(blocks))
 
 def run_livefeedtop():
-    blocks = load_live_feed_markets()
+    blocks, _ = fetch_live_feed_blocks()
     if not blocks:
-        return "No live-feed markets found in live_feed_markets.txt"
+        return "No live-feed markets found."
     return quick_top_text(score_blocks(blocks), "Top live-feed markets:")
 
 def run_livefeedwatch():
-    blocks = load_live_feed_markets()
+    blocks, _ = fetch_live_feed_blocks()
     if not blocks:
-        return "No live-feed markets found in live_feed_markets.txt"
+        return "No live-feed markets found."
     filtered = filter_results_by_action(score_blocks(blocks), ["SMALL TEST", "WATCH"])
     if not filtered:
         return "No WATCH or SMALL TEST live-feed markets found."
     return format_ranked(filtered)
 
 def run_livefeedcounts():
-    blocks = load_live_feed_markets()
+    blocks, _ = fetch_live_feed_blocks()
     if not blocks:
-        return "No live-feed markets found in live_feed_markets.txt"
+        return "No live-feed markets found."
     return format_counts(score_blocks(blocks), "Live-feed market counts:")
 
 def run_livefeedalert():
-    blocks = load_live_feed_markets()
+    blocks, _ = fetch_live_feed_blocks()
     if not blocks:
-        return "No live-feed markets found in live_feed_markets.txt"
+        return "No live-feed markets found."
     filtered = filter_alert_candidates(score_blocks(blocks))
     if not filtered:
         return "No alert-ready live-feed markets found."
     return format_ranked(filtered)
 
-# =====================
-# TELEGRAM SEND
-# =====================
-def split_message_for_telegram(text, max_len=3500):
-    if len(text) <= max_len:
-        return [text]
+def run_alert_scan_and_send():
+    blocks, source_note = fetch_live_feed_blocks()
+    if not blocks:
+        return f"{source_note}\nNo live-feed markets found."
 
-    chunks = []
-    remaining = text
+    results = score_blocks(blocks)
+    alerts = filter_alert_candidates(results)
 
-    while len(remaining) > max_len:
-        cut = remaining.rfind("\n---\n", 0, max_len)
-        if cut == -1:
-            cut = remaining.rfind("\n\n", 0, max_len)
-        if cut == -1:
-            cut = max_len
+    if not alerts:
+        return f"{source_note}\nNo alert-ready live-feed markets found."
 
-        chunk = remaining[:cut].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        remaining = remaining[cut:].strip()
-
-    if remaining:
-        chunks.append(remaining)
-
-    return chunks
-
-def send_telegram_message(chat_id: int, text: str):
-    chunks = split_message_for_telegram(text)
-
-    for chunk in chunks:
-        r = requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": chunk},
-            timeout=30,
-        )
-        print("TELEGRAM SEND:", r.status_code, flush=True)
-        r.raise_for_status()
+    alert_text = "LIVE ALERT SCAN\n\n" + format_ranked(alerts)
+    send_result = send_alert_message(alert_text)
+    return f"{source_note}\nFound {len(alerts)} alert-ready market(s).\n{send_result}"
 
 # =====================
 # FLASK ROUTES
@@ -740,6 +783,14 @@ def send_telegram_message(chat_id: int, text: str):
 @app.route("/", methods=["GET"])
 def home():
     return "Market screener bot is running", 200
+
+@app.route("/cron/<secret>", methods=["GET", "POST"])
+def cron_scan(secret):
+    if not SCHEDULER_SECRET or secret != SCHEDULER_SECRET:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    result = run_alert_scan_and_send()
+    return jsonify({"ok": True, "message": result}), 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -793,6 +844,8 @@ def webhook():
             reply = run_shortlisttop()
         elif lower == "/shortlistcounts":
             reply = run_shortlistcounts()
+        elif lower == "/fetchlive":
+            reply = run_fetchlive()
         elif lower == "/livefeed":
             reply = run_livefeed()
         elif lower == "/livefeedtop":
@@ -803,6 +856,8 @@ def webhook():
             reply = run_livefeedcounts()
         elif lower == "/livefeedalert":
             reply = run_livefeedalert()
+        elif lower == "/runalertscan":
+            reply = run_alert_scan_and_send()
         else:
             reply = format_ranked(score_blocks(split_blocks(text)))
 

@@ -304,16 +304,6 @@ def compute_one(m):
 def fmt_pct(x):
     return f"{x:.2%}"
 
-def format_side(side):
-    if side is None:
-        return "n/a"
-    return (
-        f"{side['side']}: fair {fmt_pct(side['fair_prob'])} | "
-        f"ask {fmt_pct(side['ask_price'])} | "
-        f"edge {fmt_pct(side['edge_mid'])} | "
-        f"{side['verdict']}"
-    )
-
 def format_one(r):
     if not r["ok"]:
         return f"❌ {r['reason']}"
@@ -337,18 +327,6 @@ def format_one(r):
     if asks:
         ask_line = "- " + " | ".join(asks) + "\n"
 
-    side_lines = f"- {format_side(r['yes_side'])}\n- {format_side(r['no_side'])}\n"
-
-    extras = []
-    if r["liquidity"] is not None:
-        extras.append(f"Liquidity: {r['liquidity']:.0f}")
-    if r["spread"] is not None:
-        extras.append(f"Spread: {r['spread']:.2%}")
-
-    extra_line = ""
-    if extras:
-        extra_line = "\n" + " | ".join(extras)
-
     best = r["best"]
     sens = (
         f"\nBest-side vol sensitivity:\n"
@@ -362,24 +340,7 @@ def format_one(r):
     if r["warnings"]:
         warn = "\nWarnings: " + ", ".join(r["warnings"])
 
-    checklist = ""
-    if r["action"] == "SMALL TEST":
-        checklist = (
-            "\nChecklist:\n"
-            "- Confirm event type matches model\n"
-            "- Confirm ask is still live\n"
-            "- Use small size only\n"
-            "- Be willing to lose full premium\n"
-        )
-    elif r["action"] == "WATCH":
-        checklist = (
-            "\nChecklist:\n"
-            "- Recheck later\n"
-            "- Watch liquidity and spread\n"
-            "- See if edge improves\n"
-        )
-
-    return hdr + core + ask_line + side_lines + extra_line + sens + warn + checklist
+    return hdr + core + ask_line + sens + warn
 
 def format_ranked(results):
     good = [r for r in results if r["ok"]]
@@ -387,8 +348,8 @@ def format_ranked(results):
         return "No valid markets parsed."
 
     ranked = sorted(good, key=lambda x: x["best"]["edge_mid"], reverse=True)
-
     lines = ["Top screens:\n"]
+
     for i, r in enumerate(ranked[:10], start=1):
         badge = {"SMALL TEST": "✅", "WATCH": "👀", "SKIP": "⛔"}.get(r["action"], "•")
         best = r["best"]
@@ -404,23 +365,8 @@ def format_ranked(results):
 
     return "\n".join(lines)
 
-def format_counts(results, label):
-    ok_results = [r for r in results if r.get("ok")]
-    total = len(ok_results)
-    smalltest = sum(1 for r in ok_results if r["action"] == "SMALL TEST")
-    watch = sum(1 for r in ok_results if r["action"] == "WATCH")
-    skip = sum(1 for r in ok_results if r["action"] == "SKIP")
-
-    return (
-        f"{label}\n"
-        f"- Total valid markets: {total}\n"
-        f"- SMALL TEST: {smalltest}\n"
-        f"- WATCH: {watch}\n"
-        f"- SKIP: {skip}"
-    )
-
 # =====================
-# FILE LOADERS
+# LIVE FEED HELPERS
 # =====================
 def load_text_blocks_from_file(filename):
     if not os.path.exists(filename):
@@ -430,18 +376,6 @@ def load_text_blocks_from_file(filename):
     if not raw:
         return []
     return split_blocks(raw)
-
-def load_sample_markets():
-    return load_text_blocks_from_file(SAMPLE_MARKETS_FILE)
-
-def load_candidate_markets():
-    return load_text_blocks_from_file(CANDIDATE_MARKETS_FILE)
-
-def load_incoming_markets():
-    return load_text_blocks_from_file(INCOMING_MARKETS_FILE)
-
-def load_shortlist_markets():
-    return load_text_blocks_from_file(SHORTLIST_MARKETS_FILE)
 
 def load_live_feed_markets_local():
     return load_text_blocks_from_file(LIVE_FEED_MARKETS_FILE)
@@ -453,28 +387,17 @@ def fetch_live_feed_blocks():
             r.raise_for_status()
             raw = (r.text or "").strip()
             if raw:
-                return split_blocks(raw), f"Fetched from LIVE_FEED_SOURCE_URL ({len(split_blocks(raw))} blocks)"
+                blocks = split_blocks(raw)
+                return blocks, f"Fetched from LIVE_FEED_SOURCE_URL ({len(blocks)} blocks)"
             return [], "LIVE_FEED_SOURCE_URL returned empty text"
         except Exception as e:
-            return load_live_feed_markets_local(), f"Fetch failed, used local live_feed_markets.txt fallback: {str(e)}"
-    return load_live_feed_markets_local(), "Used local live_feed_markets.txt"
+            fallback = load_live_feed_markets_local()
+            return fallback, f"Fetch failed, used local fallback: {str(e)}"
+    fallback = load_live_feed_markets_local()
+    return fallback, "Used local live_feed_markets.txt"
 
-# =====================
-# FILTER HELPERS
-# =====================
 def score_blocks(blocks):
-    results = []
-    for block in blocks:
-        m = extract_inputs(block)
-        results.append(compute_one(m))
-    return results
-
-def filter_results_by_action(results, actions):
-    filtered = [
-        r for r in results
-        if r.get("ok") and r.get("action") in actions
-    ]
-    return sorted(filtered, key=lambda x: x["best"]["edge_mid"], reverse=True)
+    return [compute_one(extract_inputs(block)) for block in blocks]
 
 def filter_alert_candidates(results):
     filtered = []
@@ -490,25 +413,6 @@ def filter_alert_candidates(results):
         filtered.append(r)
     return sorted(filtered, key=lambda x: x["best"]["edge_mid"], reverse=True)
 
-def quick_top_text(results, title, limit=5):
-    ok_results = [r for r in results if r.get("ok")]
-    if not ok_results:
-        return f"No valid markets found for {title.lower()}."
-
-    ranked = sorted(ok_results, key=lambda x: x["best"]["edge_mid"], reverse=True)
-
-    lines = [f"{title}\n"]
-    for i, r in enumerate(ranked[:limit], start=1):
-        badge = {"SMALL TEST": "✅", "WATCH": "👀", "SKIP": "⛔"}.get(r["action"], "•")
-        best = r["best"]
-        lines.append(
-            f"{i}. {badge} {r['market']} | {r['action']} | best {best['side']} | edge {fmt_pct(best['edge_mid'])}"
-        )
-    return "\n".join(lines)
-
-# =====================
-# TELEGRAM SEND
-# =====================
 def split_message_for_telegram(text, max_len=3500):
     if len(text) <= max_len:
         return [text]
@@ -526,7 +430,6 @@ def split_message_for_telegram(text, max_len=3500):
         chunk = remaining[:cut].strip()
         if chunk:
             chunks.append(chunk)
-
         remaining = remaining[cut:].strip()
 
     if remaining:
@@ -542,7 +445,6 @@ def send_telegram_message(chat_id: int, text: str):
             json={"chat_id": chat_id, "text": chunk},
             timeout=30,
         )
-        print("TELEGRAM SEND:", r.status_code, flush=True)
         r.raise_for_status()
 
 def send_alert_message(text: str):
@@ -552,224 +454,44 @@ def send_alert_message(text: str):
     return f"Alert sent to chat {TELEGRAM_ALERT_CHAT_ID}"
 
 # =====================
-# COMMAND TEXT
-# =====================
-def help_text():
-    return (
-        "Commands:\n"
-        "/help - show commands\n"
-        "/format - show the market format\n"
-        "/scan - score sample_markets.txt\n\n"
-        "Candidate commands:\n"
-        "/top - top candidates\n"
-        "/watch - WATCH and SMALL TEST candidates\n"
-        "/smalltest - only SMALL TEST candidates\n"
-        "/skip - only SKIP candidates\n"
-        "/counts - candidate counts\n"
-        "/refresh - reload candidate file count\n"
-        "/alertcheck - candidate alert-ready markets\n\n"
-        "Inbox commands:\n"
-        "/inbox - full inbox scoring\n"
-        "/inboxtop - top inbox ideas\n"
-        "/inboxwatch - inbox WATCH and SMALL TEST\n"
-        "/inboxcounts - inbox counts\n"
-        "/inboxalert - inbox alert-ready markets\n\n"
-        "Shortlist commands:\n"
-        "/shortlist - full shortlist scoring\n"
-        "/shortlisttop - top shortlist ideas\n"
-        "/shortlistcounts - shortlist counts\n\n"
-        "Live-feed commands:\n"
-        "/fetchlive - fetch live feed and report source\n"
-        "/livefeed - full live-feed scoring\n"
-        "/livefeedtop - top live-feed ideas\n"
-        "/livefeedwatch - live-feed WATCH and SMALL TEST\n"
-        "/livefeedcounts - live-feed counts\n"
-        "/livefeedalert - live-feed alert-ready markets\n"
-        "/runalertscan - fetch live feed, filter alerts, and send to alert chat\n\n"
-        "You can also paste one or more market blocks directly."
-    )
-
-def format_text():
-    return (
-        "Use this format:\n\n"
-        "Market Oil hit 90 by Mar 31\n"
-        "Mode touch\n"
-        "Spot 81.43\n"
-        "Strike 90\n"
-        "Vol 0.35\n"
-        "Expiry 26 days\n"
-        "Yes ask 0.71\n"
-        "No ask 0.30\n"
-        "Liquidity 24760\n"
-        "Spread 0.01"
-    )
-
-# =====================
 # COMMAND RUNNERS
 # =====================
-def run_scan():
-    blocks = load_sample_markets()
-    if not blocks:
-        return "No sample markets found in sample_markets.txt"
-    return format_ranked(score_blocks(blocks))
-
-def run_top():
-    blocks = load_candidate_markets()
-    if not blocks:
-        return "No candidate markets found in candidate_markets.txt"
-    return quick_top_text(score_blocks(blocks), "Top candidate markets:")
-
-def run_watch():
-    blocks = load_candidate_markets()
-    if not blocks:
-        return "No candidate markets found in candidate_markets.txt"
-    filtered = filter_results_by_action(score_blocks(blocks), ["SMALL TEST", "WATCH"])
-    if not filtered:
-        return "No WATCH or SMALL TEST markets found."
-    return format_ranked(filtered)
-
-def run_smalltest():
-    blocks = load_candidate_markets()
-    if not blocks:
-        return "No candidate markets found in candidate_markets.txt"
-    filtered = filter_results_by_action(score_blocks(blocks), ["SMALL TEST"])
-    if not filtered:
-        return "No SMALL TEST markets found."
-    return format_ranked(filtered)
-
-def run_skip():
-    blocks = load_candidate_markets()
-    if not blocks:
-        return "No candidate markets found in candidate_markets.txt"
-    filtered = filter_results_by_action(score_blocks(blocks), ["SKIP"])
-    if not filtered:
-        return "No SKIP markets found."
-    return format_ranked(filtered)
-
-def run_counts():
-    blocks = load_candidate_markets()
-    if not blocks:
-        return "No candidate markets found in candidate_markets.txt"
-    return format_counts(score_blocks(blocks), "Candidate market counts:")
-
-def run_refresh():
-    blocks = load_candidate_markets()
-    count = len(blocks)
-    if count == 0:
-        return "Refresh done. No candidate markets found in candidate_markets.txt"
-    return f"Refresh done. Loaded {count} candidate market blocks from candidate_markets.txt"
-
-def run_alertcheck():
-    blocks = load_candidate_markets()
-    if not blocks:
-        return "No candidate markets found in candidate_markets.txt"
-    filtered = filter_alert_candidates(score_blocks(blocks))
-    if not filtered:
-        return "No alert-ready candidate markets found."
-    return format_ranked(filtered)
-
-def run_inbox():
-    blocks = load_incoming_markets()
-    if not blocks:
-        return "No incoming markets found in incoming_markets.txt"
-    return format_ranked(score_blocks(blocks))
-
-def run_inboxtop():
-    blocks = load_incoming_markets()
-    if not blocks:
-        return "No incoming markets found in incoming_markets.txt"
-    return quick_top_text(score_blocks(blocks), "Top inbox markets:")
-
-def run_inboxwatch():
-    blocks = load_incoming_markets()
-    if not blocks:
-        return "No incoming markets found in incoming_markets.txt"
-    filtered = filter_results_by_action(score_blocks(blocks), ["SMALL TEST", "WATCH"])
-    if not filtered:
-        return "No WATCH or SMALL TEST inbox markets found."
-    return format_ranked(filtered)
-
-def run_inboxcounts():
-    blocks = load_incoming_markets()
-    if not blocks:
-        return "No incoming markets found in incoming_markets.txt"
-    return format_counts(score_blocks(blocks), "Inbox market counts:")
-
-def run_inboxalert():
-    blocks = load_incoming_markets()
-    if not blocks:
-        return "No incoming markets found in incoming_markets.txt"
-    filtered = filter_alert_candidates(score_blocks(blocks))
-    if not filtered:
-        return "No alert-ready inbox markets found."
-    return format_ranked(filtered)
-
-def run_shortlist():
-    blocks = load_shortlist_markets()
-    if not blocks:
-        return "No shortlist markets found in shortlist_markets.txt"
-    return format_ranked(score_blocks(blocks))
-
-def run_shortlisttop():
-    blocks = load_shortlist_markets()
-    if not blocks:
-        return "No shortlist markets found in shortlist_markets.txt"
-    return quick_top_text(score_blocks(blocks), "Top shortlist markets:")
-
-def run_shortlistcounts():
-    blocks = load_shortlist_markets()
-    if not blocks:
-        return "No shortlist markets found in shortlist_markets.txt"
-    return format_counts(score_blocks(blocks), "Shortlist market counts:")
+def run_chatid(chat_id: int):
+    return f"Your chat ID is: {chat_id}"
 
 def run_fetchlive():
     blocks, source_note = fetch_live_feed_blocks()
     return f"{source_note}\nLoaded {len(blocks)} live-feed market blocks."
 
-def run_livefeed():
-    blocks, _ = fetch_live_feed_blocks()
-    if not blocks:
-        return "No live-feed markets found."
-    return format_ranked(score_blocks(blocks))
-
-def run_livefeedtop():
-    blocks, _ = fetch_live_feed_blocks()
-    if not blocks:
-        return "No live-feed markets found."
-    return quick_top_text(score_blocks(blocks), "Top live-feed markets:")
-
-def run_livefeedwatch():
-    blocks, _ = fetch_live_feed_blocks()
-    if not blocks:
-        return "No live-feed markets found."
-    filtered = filter_results_by_action(score_blocks(blocks), ["SMALL TEST", "WATCH"])
-    if not filtered:
-        return "No WATCH or SMALL TEST live-feed markets found."
-    return format_ranked(filtered)
-
 def run_livefeedcounts():
-    blocks, _ = fetch_live_feed_blocks()
-    if not blocks:
-        return "No live-feed markets found."
-    return format_counts(score_blocks(blocks), "Live-feed market counts:")
+    blocks, source_note = fetch_live_feed_blocks()
+    results = score_blocks(blocks)
+    ok_results = [r for r in results if r.get('ok')]
+    smalltest = sum(1 for r in ok_results if r["action"] == "SMALL TEST")
+    watch = sum(1 for r in ok_results if r["action"] == "WATCH")
+    skip = sum(1 for r in ok_results if r["action"] == "SKIP")
+    return (
+        f"{source_note}\n"
+        f"Live-feed market counts:\n"
+        f"- Total valid markets: {len(ok_results)}\n"
+        f"- SMALL TEST: {smalltest}\n"
+        f"- WATCH: {watch}\n"
+        f"- SKIP: {skip}"
+    )
 
 def run_livefeedalert():
-    blocks, _ = fetch_live_feed_blocks()
-    if not blocks:
-        return "No live-feed markets found."
-    filtered = filter_alert_candidates(score_blocks(blocks))
-    if not filtered:
-        return "No alert-ready live-feed markets found."
-    return format_ranked(filtered)
+    blocks, source_note = fetch_live_feed_blocks()
+    alerts = filter_alert_candidates(score_blocks(blocks))
+    if not alerts:
+        return f"{source_note}\nNo alert-ready live-feed markets found."
+    return f"{source_note}\n\n" + format_ranked(alerts)
 
 def run_alert_scan_and_send():
     blocks, source_note = fetch_live_feed_blocks()
     if not blocks:
         return f"{source_note}\nNo live-feed markets found."
 
-    results = score_blocks(blocks)
-    alerts = filter_alert_candidates(results)
-
+    alerts = filter_alert_candidates(score_blocks(blocks))
     if not alerts:
         return f"{source_note}\nNo alert-ready live-feed markets found."
 
@@ -796,8 +518,6 @@ def cron_scan(secret):
 def webhook():
     try:
         update = request.get_json(force=True) or {}
-        print("INCOMING UPDATE:", update, flush=True)
-
         message = update.get("message", {})
         chat = message.get("chat", {})
         chat_id = chat.get("id")
@@ -808,50 +528,10 @@ def webhook():
 
         lower = text.lower()
 
-        if lower == "/help":
-            reply = help_text()
-        elif lower == "/format":
-            reply = format_text()
-        elif lower == "/scan":
-            reply = run_scan()
-        elif lower == "/top":
-            reply = run_top()
-        elif lower == "/watch":
-            reply = run_watch()
-        elif lower == "/smalltest":
-            reply = run_smalltest()
-        elif lower == "/skip":
-            reply = run_skip()
-        elif lower == "/counts":
-            reply = run_counts()
-        elif lower == "/refresh":
-            reply = run_refresh()
-        elif lower == "/alertcheck":
-            reply = run_alertcheck()
-        elif lower == "/inbox":
-            reply = run_inbox()
-        elif lower == "/inboxtop":
-            reply = run_inboxtop()
-        elif lower == "/inboxwatch":
-            reply = run_inboxwatch()
-        elif lower == "/inboxcounts":
-            reply = run_inboxcounts()
-        elif lower == "/inboxalert":
-            reply = run_inboxalert()
-        elif lower == "/shortlist":
-            reply = run_shortlist()
-        elif lower == "/shortlisttop":
-            reply = run_shortlisttop()
-        elif lower == "/shortlistcounts":
-            reply = run_shortlistcounts()
+        if lower == "/chatid":
+            reply = run_chatid(chat_id)
         elif lower == "/fetchlive":
             reply = run_fetchlive()
-        elif lower == "/livefeed":
-            reply = run_livefeed()
-        elif lower == "/livefeedtop":
-            reply = run_livefeedtop()
-        elif lower == "/livefeedwatch":
-            reply = run_livefeedwatch()
         elif lower == "/livefeedcounts":
             reply = run_livefeedcounts()
         elif lower == "/livefeedalert":
@@ -859,7 +539,7 @@ def webhook():
         elif lower == "/runalertscan":
             reply = run_alert_scan_and_send()
         else:
-            reply = format_ranked(score_blocks(split_blocks(text)))
+            reply = "Use /chatid, /fetchlive, /livefeedcounts, /livefeedalert, or /runalertscan"
 
         send_telegram_message(chat_id, reply)
         return jsonify({"ok": True}), 200

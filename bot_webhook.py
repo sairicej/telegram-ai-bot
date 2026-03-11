@@ -25,6 +25,7 @@ SAMPLE_MARKETS_FILE = "sample_markets.txt"
 CANDIDATE_MARKETS_FILE = "candidate_markets.txt"
 INCOMING_MARKETS_FILE = "incoming_markets.txt"
 SHORTLIST_MARKETS_FILE = "shortlist_markets.txt"
+LIVE_FEED_MARKETS_FILE = "live_feed_markets.txt"
 
 # =====================
 # ENV / TOKEN
@@ -438,6 +439,9 @@ def load_incoming_markets():
 def load_shortlist_markets():
     return load_text_blocks_from_file(SHORTLIST_MARKETS_FILE)
 
+def load_live_feed_markets():
+    return load_text_blocks_from_file(LIVE_FEED_MARKETS_FILE)
+
 # =====================
 # FILTER HELPERS
 # =====================
@@ -512,6 +516,12 @@ def help_text():
         "/shortlist - full shortlist scoring\n"
         "/shortlisttop - top shortlist ideas\n"
         "/shortlistcounts - shortlist counts\n\n"
+        "Live-feed commands:\n"
+        "/livefeed - full live-feed scoring\n"
+        "/livefeedtop - top live-feed ideas\n"
+        "/livefeedwatch - live-feed WATCH and SMALL TEST\n"
+        "/livefeedcounts - live-feed counts\n"
+        "/livefeedalert - live-feed alert-ready markets\n\n"
         "You can also paste one or more market blocks directly."
     )
 
@@ -648,6 +658,42 @@ def run_shortlistcounts():
         return "No shortlist markets found in shortlist_markets.txt"
     return format_counts(score_blocks(blocks), "Shortlist market counts:")
 
+def run_livefeed():
+    blocks = load_live_feed_markets()
+    if not blocks:
+        return "No live-feed markets found in live_feed_markets.txt"
+    return format_ranked(score_blocks(blocks))
+
+def run_livefeedtop():
+    blocks = load_live_feed_markets()
+    if not blocks:
+        return "No live-feed markets found in live_feed_markets.txt"
+    return quick_top_text(score_blocks(blocks), "Top live-feed markets:")
+
+def run_livefeedwatch():
+    blocks = load_live_feed_markets()
+    if not blocks:
+        return "No live-feed markets found in live_feed_markets.txt"
+    filtered = filter_results_by_action(score_blocks(blocks), ["SMALL TEST", "WATCH"])
+    if not filtered:
+        return "No WATCH or SMALL TEST live-feed markets found."
+    return format_ranked(filtered)
+
+def run_livefeedcounts():
+    blocks = load_live_feed_markets()
+    if not blocks:
+        return "No live-feed markets found in live_feed_markets.txt"
+    return format_counts(score_blocks(blocks), "Live-feed market counts:")
+
+def run_livefeedalert():
+    blocks = load_live_feed_markets()
+    if not blocks:
+        return "No live-feed markets found in live_feed_markets.txt"
+    filtered = filter_alert_candidates(score_blocks(blocks))
+    if not filtered:
+        return "No alert-ready live-feed markets found."
+    return format_ranked(filtered)
+
 # =====================
 # TELEGRAM SEND
 # =====================
@@ -747,6 +793,16 @@ def webhook():
             reply = run_shortlisttop()
         elif lower == "/shortlistcounts":
             reply = run_shortlistcounts()
+        elif lower == "/livefeed":
+            reply = run_livefeed()
+        elif lower == "/livefeedtop":
+            reply = run_livefeedtop()
+        elif lower == "/livefeedwatch":
+            reply = run_livefeedwatch()
+        elif lower == "/livefeedcounts":
+            reply = run_livefeedcounts()
+        elif lower == "/livefeedalert":
+            reply = run_livefeedalert()
         else:
             reply = format_ranked(score_blocks(split_blocks(text)))
 

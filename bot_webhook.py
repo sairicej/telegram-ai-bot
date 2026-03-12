@@ -1,81 +1,140 @@
-import ast
 import os
-import threading
-import time
+import re
+import json
+import math
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-
-# =========================================
-# ENV / SETTINGS
-# =========================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-MARKETS_URL = os.getenv(
-    "MARKETS_URL",
-    "https://raw.githubusercontent.com/sairicej/telegram-ai-bot/main/live_feed_markets.txt",
-).strip()
-
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.15"))
-WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.10"))
-SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "false").lower() == "true"
-
-BASELINE_PROB = float(os.getenv("BASELINE_PROB", "0.50"))
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "50000"))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.15"))
-
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-DEDUP_SECONDS = int(os.getenv("DEDUP_SECONDS", "3600"))
-SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "300"))
-
-# Upgrade: auto-discover many active markets instead of only manual file entries
-AUTO_DISCOVER = os.getenv("AUTO_DISCOVER", "false").lower() == "true"
-DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "200"))
-DISCOVER_PAGE_SIZE = int(os.getenv("DISCOVER_PAGE_SIZE", "100"))
-DISCOVER_MIN_VOLUME = float(os.getenv("DISCOVER_MIN_VOLUME", "100000"))
-DISCOVER_MIN_LIQUIDITY = float(os.getenv("DISCOVER_MIN_LIQUIDITY", "100000"))
-DISCOVER_KEYWORDS = os.getenv(
-    "DISCOVER_KEYWORDS",
-    "bitcoin,btc,ethereum,eth,solana,sol,crypto,iran,regime,election,politics",
-).strip()
-
-GAMMA_BASE = "https://gamma-api.polymarket.com"
-CLOB_BASE = "https://clob.polymarket.com"
-
-sent_cache: Dict[str, float] = {}
-_background_started = False
-_background_lock = threading.Lock()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
-# =========================================
-# BASICS
-# =========================================
-def send_telegram_message(chat_id: str, text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not chat_id:
-        return
+# =========================
+# ENV HELPERS
+# =========================
+def env_str(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+def env_int(name: str, default: int) -> int:
     try:
-        requests.post(
-            f"{TELEGRAM_API_URL}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=REQUEST_TIMEOUT,
-        )
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
+
+
+TELEGRAM_BOT_TOKEN = env_str("TELEGRAM_BOT_TOKEN")
+MARKET_LIST_URL = env_str("MARKET_LIST_URL")
+ALERT_THRESHOLD = env_float("ALERT_THRESHOLD", -0.35)
+WATCH_THRESHOLD = env_float("WATCH_THRESHOLD", -0.20)
+MIN_LIQUIDITY = env_float("MIN_LIQUIDITY", 50000)
+MAX_SPREAD = env_float("MAX_SPREAD", 0.10)
+MAX_MARKETS = env_int("MAX_MARKETS", 100)
+SEND_WATCH_ALERTS = env_bool("SEND_WATCH_ALERTS", False)
+ENABLE_YES_NO_ONLY = env_bool("ENABLE_YES_NO_ONLY", True)
+TEST_MARKET_SLUG = env_str("TEST_MARKET_SLUG")
+MIN_BID = env_float("MIN_BID", 0.01)
+MAX_ASK = env_float("MAX_ASK", 0.99)
+REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 20)
+
+if not TELEGRAM_BOT_TOKEN:
+    logging.warning("TELEGRAM_BOT_TOKEN is missing.")
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+
+
+# =========================
+# TELEGRAM HELPERS
+# =========================
+def send_telegram_message(chat_id: str, text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        logging.error("Cannot send Telegram message. TELEGRAM_BOT_TOKEN missing.")
+        return
+
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    try:
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
     except Exception as e:
-        print(f"Telegram send error: {e}")
+        logging.exception("Telegram send failed: %s", e)
 
 
-def safe_get_json(url: str, params: Optional[dict] = None) -> Any:
-    r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+# =========================
+# SOURCE LIST HELPERS
+# =========================
+def slug_from_line(line: str) -> Optional[str]:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+
+    # full polymarket URL
+    if "polymarket.com" in line:
+        m = re.search(r"/event/([^/?#]+)", line)
+        if m:
+            return m.group(1).strip()
+
+    # assume slug if plain text
+    return line.strip()
 
 
-def to_float(value: Any, default: float = 0.0) -> float:
+def load_market_slugs() -> List[str]:
+    slugs: List[str] = []
+
+    if TEST_MARKET_SLUG:
+        return [TEST_MARKET_SLUG]
+
+    if not MARKET_LIST_URL:
+        logging.warning("MARKET_LIST_URL missing.")
+        return slugs
+
+    try:
+        r = requests.get(MARKET_LIST_URL, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        for raw_line in r.text.splitlines():
+            slug = slug_from_line(raw_line)
+            if slug:
+                slugs.append(slug)
+    except Exception as e:
+        logging.exception("Failed to load market list: %s", e)
+        return []
+
+    # de-dupe while preserving order
+    seen = set()
+    ordered = []
+    for s in slugs:
+        if s not in seen:
+            ordered.append(s)
+            seen.add(s)
+
+    return ordered[:MAX_MARKETS]
+
+
+# =========================
+# MARKET FETCH / NORMALIZE
+# =========================
+def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         if value is None or value == "":
             return default
@@ -84,551 +143,367 @@ def to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def cleanup_cache() -> None:
-    now = time.time()
-    expired = [k for k, v in sent_cache.items() if now - v > DEDUP_SECONDS]
-    for k in expired:
-        del sent_cache[k]
+def normalize_outcomes(raw_market: Dict[str, Any]) -> List[str]:
+    # possible shapes:
+    # outcomes = '["Yes","No"]'
+    # outcomes = ["Yes", "No"]
+    # tokens = [{"outcome":"Yes"}, {"outcome":"No"}]
+    outcomes = raw_market.get("outcomes")
 
-
-def already_sent(key: str) -> bool:
-    cleanup_cache()
-    return key in sent_cache
-
-
-def mark_sent(key: str) -> None:
-    sent_cache[key] = time.time()
-
-
-def parse_jsonish_list(value: Any) -> List[Any]:
-    if value is None:
-        return []
-
-    if isinstance(value, list):
-        return value
-
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return []
-
+    if isinstance(outcomes, str):
         try:
-            parsed = ast.literal_eval(s)
+            parsed = json.loads(outcomes)
             if isinstance(parsed, list):
-                return parsed
+                return [str(x).strip() for x in parsed]
         except Exception:
             pass
 
-        if "," in s:
-            return [x.strip().strip('"').strip("'") for x in s.split(",") if x.strip()]
+    if isinstance(outcomes, list):
+        return [str(x).strip() for x in outcomes]
 
-        return [s]
+    tokens = raw_market.get("tokens", [])
+    if isinstance(tokens, list):
+        token_outcomes = []
+        for t in tokens:
+            outcome = t.get("outcome")
+            if outcome is not None:
+                token_outcomes.append(str(outcome).strip())
+        if token_outcomes:
+            return token_outcomes
 
     return []
 
 
-# =========================================
-# WATCHLIST INPUT
-# =========================================
-def parse_watchlist_line(line: str) -> Optional[Dict[str, Any]]:
-    """
-    Supports:
-      slug
-      slug|0.50
-    """
-    raw = line.strip()
-    if not raw or raw.startswith("#"):
+def is_yes_no_market(raw_market: Dict[str, Any]) -> bool:
+    outcomes = normalize_outcomes(raw_market)
+    cleaned = {o.strip().lower() for o in outcomes if o is not None}
+    return cleaned == {"yes", "no"}
+
+
+def normalize_market(raw_market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if ENABLE_YES_NO_ONLY and not is_yes_no_market(raw_market):
         return None
-
-    parts = [p.strip() for p in raw.split("|")]
-    slug = parts[0]
-    baseline = BASELINE_PROB
-
-    if len(parts) >= 2 and parts[1]:
-        baseline = to_float(parts[1], BASELINE_PROB)
-
-    return {"slug": slug, "baseline_prob": baseline}
-
-
-def fetch_watchlist_file() -> List[Dict[str, Any]]:
-    try:
-        r = requests.get(MARKETS_URL, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        lines = [x.strip() for x in r.text.splitlines() if x.strip()]
-        items = []
-        for line in lines:
-            parsed = parse_watchlist_line(line)
-            if parsed:
-                items.append(parsed)
-        return items
-    except Exception as e:
-        print(f"Watchlist fetch error: {e}")
-        return []
-
-
-def keyword_list() -> List[str]:
-    return [x.strip().lower() for x in DISCOVER_KEYWORDS.split(",") if x.strip()]
-
-
-def matches_keywords(text: str) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    return any(k in t for k in keyword_list())
-
-
-def discover_markets() -> List[Dict[str, Any]]:
-    """
-    Upgrade:
-    Pull many active markets from Gamma, then filter them by simple keywords.
-    """
-    found: List[Dict[str, Any]] = []
-    seen = set()
-    offset = 0
-
-    while len(found) < DISCOVER_LIMIT:
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": DISCOVER_PAGE_SIZE,
-            "offset": offset,
-            "liquidity_num_min": DISCOVER_MIN_LIQUIDITY,
-            "volume_num_min": DISCOVER_MIN_VOLUME,
-        }
-
-        try:
-            batch = safe_get_json(f"{GAMMA_BASE}/markets", params=params)
-        except Exception as e:
-            print(f"Discover markets error: {e}")
-            break
-
-        if not isinstance(batch, list) or not batch:
-            break
-
-        for m in batch:
-            slug = (m.get("slug") or "").strip()
-            question = (m.get("question") or m.get("title") or "").strip()
-
-            if not slug or slug in seen:
-                continue
-
-            if not matches_keywords(f"{slug} {question}"):
-                continue
-
-            seen.add(slug)
-            found.append(
-                {
-                    "slug": slug,
-                    "baseline_prob": BASELINE_PROB,
-                }
-            )
-
-            if len(found) >= DISCOVER_LIMIT:
-                break
-
-        offset += DISCOVER_PAGE_SIZE
-
-    return found
-
-
-def fetch_watchlist() -> List[Dict[str, Any]]:
-    if AUTO_DISCOVER:
-        discovered = discover_markets()
-        if discovered:
-            return discovered
-        # fallback to file if discovery returns nothing
-    return fetch_watchlist_file()
-
-
-# =========================================
-# POLYMARKET LOOKUPS
-# =========================================
-def fetch_market_by_slug(slug: str) -> Optional[Dict[str, Any]]:
-    try:
-        return safe_get_json(f"{GAMMA_BASE}/markets/slug/{slug}")
-    except Exception:
-        return None
-
-
-def fetch_event_by_slug(slug: str) -> Optional[Dict[str, Any]]:
-    try:
-        return safe_get_json(f"{GAMMA_BASE}/events/slug/{slug}")
-    except Exception:
-        return None
-
-
-def pick_best_market_from_event(event_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    markets = event_data.get("markets") or []
-    if not isinstance(markets, list) or not markets:
-        return None
-
-    filtered = []
-    for m in markets:
-        active = bool(m.get("active", True))
-        closed = bool(m.get("closed", False))
-        liquidity = to_float(m.get("liquidityClob", m.get("liquidity", 0.0)), 0.0)
-
-        if active and not closed:
-            filtered.append((liquidity, m))
-
-    if filtered:
-        filtered.sort(key=lambda x: x[0], reverse=True)
-        return filtered[0][1]
-
-    all_markets = [(to_float(m.get("liquidityClob", m.get("liquidity", 0.0)), 0.0), m) for m in markets]
-    all_markets.sort(key=lambda x: x[0], reverse=True)
-    return all_markets[0][1] if all_markets else None
-
-
-def extract_yes_token_id(market_data: Dict[str, Any]) -> Optional[str]:
-    token_ids = parse_jsonish_list(market_data.get("clobTokenIds"))
-    if token_ids:
-        return str(token_ids[0])
-
-    token_id = market_data.get("clobTokenId") or market_data.get("asset_id")
-    if token_id:
-        return str(token_id)
-
-    return None
-
-
-def fetch_order_book(token_id: str) -> Dict[str, Any]:
-    return safe_get_json(f"{CLOB_BASE}/book", params={"token_id": token_id})
-
-
-def resolve_slug_to_market(slug: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    market = fetch_market_by_slug(slug)
-    if market:
-        return market, "market"
-
-    event = fetch_event_by_slug(slug)
-    if event:
-        best_market = pick_best_market_from_event(event)
-        if best_market:
-            return best_market, "event"
-
-    return None, None
-
-
-def choose_live_prob(best_bid: float, best_ask: float, last_trade: float) -> float:
-    spread = round(best_ask - best_bid, 6) if best_bid > 0 and best_ask > 0 else 0.0
-
-    if best_bid > 0 and best_ask > 0:
-        midpoint = round((best_bid + best_ask) / 2, 6)
-        if spread > 0.10 and last_trade > 0:
-            return last_trade
-        return midpoint
-
-    if last_trade > 0:
-        return last_trade
-
-    if best_bid > 0:
-        return best_bid
-
-    if best_ask > 0:
-        return best_ask
-
-    return 0.0
-
-
-def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
-    slug = item["slug"]
-    baseline_prob = to_float(item.get("baseline_prob"), BASELINE_PROB)
-
-    market_data, source_type = resolve_slug_to_market(slug)
-    if not market_data:
-        raise ValueError(f"Slug not found: {slug}")
-
-    token_id = extract_yes_token_id(market_data)
-    if not token_id:
-        raise ValueError(f"No YES token ID found for slug: {slug}")
-
-    book = fetch_order_book(token_id)
-
-    bids = book.get("bids") or []
-    asks = book.get("asks") or []
-
-    best_bid = to_float(bids[0].get("price")) if bids else 0.0
-    best_ask = to_float(asks[0].get("price")) if asks else 0.0
-    last_trade = to_float(book.get("last_trade_price"), 0.0)
-    spread = round(best_ask - best_bid, 6) if best_bid > 0 and best_ask > 0 else 0.0
-    live_prob = choose_live_prob(best_bid, best_ask, last_trade)
-    liquidity = to_float(
-        market_data.get("liquidityClob", market_data.get("liquidity", 0.0)),
-        0.0,
-    )
 
     label = (
-        market_data.get("question")
-        or market_data.get("title")
-        or market_data.get("slug")
-        or slug
+        raw_market.get("question")
+        or raw_market.get("title")
+        or raw_market.get("name")
+        or raw_market.get("slug")
+        or "Unknown market"
     )
 
+    slug = raw_market.get("slug") or raw_market.get("market_slug") or ""
+    market_id = raw_market.get("conditionId") or raw_market.get("id") or slug
+
+    best_bid = (
+        safe_float(raw_market.get("bestBid"))
+        or safe_float(raw_market.get("best_bid"))
+        or safe_float(raw_market.get("bid"))
+        or 0.0
+    )
+
+    best_ask = (
+        safe_float(raw_market.get("bestAsk"))
+        or safe_float(raw_market.get("best_ask"))
+        or safe_float(raw_market.get("ask"))
+        or 0.0
+    )
+
+    last_price = (
+        safe_float(raw_market.get("lastTradePrice"))
+        or safe_float(raw_market.get("last_trade_price"))
+        or safe_float(raw_market.get("lastPrice"))
+        or safe_float(raw_market.get("price"))
+    )
+
+    liquidity = (
+        safe_float(raw_market.get("liquidity"))
+        or safe_float(raw_market.get("liquidityNum"))
+        or safe_float(raw_market.get("volumeNum"))
+        or 0.0
+    )
+
+    active = raw_market.get("active", True)
+    closed = raw_market.get("closed", False)
+    archived = raw_market.get("archived", False)
+
+    if closed or archived or not active:
+        return None
+
+    spread = None
+    if best_bid is not None and best_ask is not None:
+        spread = best_ask - best_bid
+
+    # Use midpoint if bid/ask look usable, otherwise fallback to last price
+    live_prob = None
+    source = None
+
+    if best_bid is not None and best_ask is not None and best_bid > 0 and best_ask > 0 and best_ask >= best_bid:
+        live_prob = (best_bid + best_ask) / 2.0
+        source = "midpoint"
+    elif last_price is not None:
+        live_prob = last_price
+        source = "last_price"
+
+    if live_prob is None:
+        return None
+
     return {
-        "market_id": market_data.get("id", slug),
-        "slug": slug,
-        "source_type": source_type,
-        "label": label,
-        "live_prob": live_prob,
-        "baseline_prob": baseline_prob,
-        "liquidity": liquidity,
-        "best_bid": best_bid,
-        "best_ask": best_ask,
-        "spread": spread,
-        "last_trade_price": last_trade,
-        "token_id": token_id,
+        "market_id": str(market_id),
+        "label": str(label).strip(),
+        "slug": str(slug).strip(),
+        "best_bid": round(best_bid, 6) if best_bid is not None else None,
+        "best_ask": round(best_ask, 6) if best_ask is not None else None,
+        "last_price": round(last_price, 6) if last_price is not None else None,
+        "spread": round(spread, 6) if spread is not None else None,
+        "liquidity": float(liquidity or 0.0),
+        "live_prob": round(live_prob, 6),
+        "source": source,
+        "raw": raw_market,
     }
 
 
-# =========================================
-# CLASSIFICATION
-# =========================================
-def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
-    liquidity = to_float(m.get("liquidity", 0), 0.0)
-    if liquidity < MIN_LIQUIDITY:
-        return "SKIP", "Liquidity too low"
-
-    spread = to_float(m.get("spread", 0), 0.0)
-    if spread > MAX_SPREAD:
-        return "SKIP", "Spread too wide"
-
-    live_prob = to_float(m.get("live_prob", 0.0), 0.0)
-    baseline_prob = to_float(m.get("baseline_prob", BASELINE_PROB), BASELINE_PROB)
-    imbalance = live_prob - baseline_prob
-
-    m["imbalance"] = imbalance
-
-    if imbalance <= ALERT_THRESHOLD:
-        return "ALERT", f"Strong signal: {imbalance:.3f}"
-    if imbalance <= WATCH_THRESHOLD:
-        return "WATCH", f"Watch signal: {imbalance:.3f}"
-    return "SKIP", None
-
-
-# =========================================
-# SCAN
-# =========================================
-def scan_markets() -> Dict[str, Any]:
-    watchlist = fetch_watchlist()
+def fetch_markets_by_slug(slug: str) -> List[Dict[str, Any]]:
+    """
+    Tries both /markets and /events because Polymarket responses can vary
+    depending on endpoint and slug type.
+    """
     results: List[Dict[str, Any]] = []
-    counts = {"total": 0, "alert": 0, "watch": 0, "skip": 0}
 
-    for item in watchlist:
-        counts["total"] += 1
-        try:
-            m = fetch_live_market_data(item)
-            category, reason = classify_market(m)
-            m["category"] = category
-            m["reason"] = reason
-            results.append(m)
+    # Try direct markets lookup
+    try:
+        r = requests.get(GAMMA_MARKETS_URL, params={"slug": slug}, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            for item in data:
+                nm = normalize_market(item)
+                if nm:
+                    results.append(nm)
+            if results:
+                return results
+    except Exception as e:
+        logging.info("Market lookup failed for slug=%s via /markets: %s", slug, e)
 
-            if category == "ALERT":
-                counts["alert"] += 1
-            elif category == "WATCH":
-                counts["watch"] += 1
-            else:
-                counts["skip"] += 1
+    # Try event lookup, then expand event markets
+    try:
+        r = requests.get(GAMMA_EVENTS_URL, params={"slug": slug}, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            for event in data:
+                for item in event.get("markets", []):
+                    nm = normalize_market(item)
+                    if nm:
+                        results.append(nm)
+    except Exception as e:
+        logging.info("Event lookup failed for slug=%s via /events: %s", slug, e)
 
-        except Exception as e:
-            print(f"Market scan error for {item}: {e}")
-            counts["skip"] += 1
-            results.append(
-                {
-                    "market_id": item.get("slug"),
-                    "slug": item.get("slug"),
-                    "label": item.get("slug"),
-                    "category": "SKIP",
-                    "reason": f"Fetch error: {e}",
-                    "live_prob": 0.0,
-                    "baseline_prob": item.get("baseline_prob", BASELINE_PROB),
-                    "liquidity": 0.0,
-                    "best_bid": 0.0,
-                    "best_ask": 0.0,
-                    "spread": 0.0,
-                    "imbalance": 0.0,
-                }
-            )
-
-    results.sort(key=lambda x: x.get("imbalance", 999))
-    return {"counts": counts, "results": results[:20]}
+    return results
 
 
-def format_scan_summary(scan: Dict[str, Any]) -> str:
-    counts = scan["counts"]
-    lines = [
-        "Scan complete",
-        f"Total: {counts['total']}",
-        f"Alerts: {counts['alert']}",
-        f"Watch: {counts['watch']}",
-        f"Skip: {counts['skip']}",
-        "",
-    ]
+# =========================
+# SCORING / FILTERING
+# =========================
+def classify_market(market: Dict[str, Any]) -> Tuple[str, Optional[str], float]:
+    """
+    Current model:
+    - baseline = 0.50 for pure yes/no
+    - diff = live_prob - baseline
+    - strong negative diff = alert/watch
+    """
 
-    top = [r for r in scan["results"] if r["category"] in ("ALERT", "WATCH")]
-    if not top:
-        lines.append("No qualifying markets found.")
-        return "\n".join(lines)
+    live_prob = market["live_prob"]
+    baseline_prob = 0.50
+    diff = live_prob - baseline_prob
 
-    for r in top[:5]:
-        lines.append(
-            f"{r['category']} | {r['label']}\n"
-            f"slug={r.get('slug', '')}\n"
-            f"live={r.get('live_prob', 0):.3f} "
-            f"base={r.get('baseline_prob', 0):.3f} "
-            f"diff={r.get('imbalance', 0):.3f}\n"
-            f"bid={r.get('best_bid', 0):.3f} "
-            f"ask={r.get('best_ask', 0):.3f} "
-            f"spread={r.get('spread', 0):.3f} "
-            f"liq={r.get('liquidity', 0):.0f}"
-        )
+    bid = market.get("best_bid") or 0.0
+    ask = market.get("best_ask") or 0.0
+    spread = market.get("spread")
+    liquidity = market.get("liquidity", 0.0)
 
-    return "\n\n".join(lines)
+    if liquidity < MIN_LIQUIDITY:
+        return "SKIP", "low_liquidity", diff
 
+    if spread is None or spread < 0:
+        return "SKIP", "bad_spread", diff
 
-def format_auto_alert(r: Dict[str, Any]) -> str:
-    return (
-        f"{r['category']} | {r['label']}\n"
-        f"slug={r.get('slug', '')}\n"
-        f"live={r.get('live_prob', 0):.3f} "
-        f"base={r.get('baseline_prob', 0):.3f} "
-        f"diff={r.get('imbalance', 0):.3f}\n"
-        f"bid={r.get('best_bid', 0):.3f} "
-        f"ask={r.get('best_ask', 0):.3f} "
-        f"spread={r.get('spread', 0):.3f} "
-        f"liq={r.get('liquidity', 0):.0f}"
-    )
+    if spread > MAX_SPREAD:
+        return "SKIP", "spread_too_wide", diff
+
+    # Skip broken / unusable quotes
+    if bid <= MIN_BID and ask >= MAX_ASK:
+        return "SKIP", "dead_quotes", diff
+
+    if diff <= ALERT_THRESHOLD:
+        return "ALERT", None, diff
+
+    if diff <= WATCH_THRESHOLD:
+        return "WATCH", None, diff
+
+    return "SKIP", None, diff
 
 
-# =========================================
-# AUTO SCAN LOOP
-# =========================================
-def auto_scan_loop() -> None:
-    if not TELEGRAM_CHAT_ID:
-        print("Auto scan disabled: TELEGRAM_CHAT_ID not set")
-        return
+def run_scan() -> Dict[str, Any]:
+    slugs = load_market_slugs()
+    results: List[Dict[str, Any]] = []
 
-    if SCAN_EVERY_SECONDS <= 0:
-        print("Auto scan disabled: SCAN_EVERY_SECONDS <= 0")
-        return
+    counts = {
+        "total": 0,
+        "alert": 0,
+        "watch": 0,
+        "skip": 0,
+    }
 
-    print(f"Auto scan loop started. Every {SCAN_EVERY_SECONDS} seconds.")
-
-    while True:
-        try:
-            scan = scan_markets()
-            candidates = []
-
-            for r in scan["results"]:
-                if r["category"] == "ALERT":
-                    candidates.append(r)
-                elif r["category"] == "WATCH" and SEND_WATCH_ALERTS:
-                    candidates.append(r)
-
-            for r in candidates:
-                dedupe_key = f"{r.get('slug')}|{r.get('category')}"
-                if already_sent(dedupe_key):
-                    continue
-
-                send_telegram_message(TELEGRAM_CHAT_ID, format_auto_alert(r))
-                mark_sent(dedupe_key)
-
-        except Exception as e:
-            print(f"Auto scan error: {e}")
-
-        time.sleep(SCAN_EVERY_SECONDS)
-
-
-def start_background_worker_once() -> None:
-    global _background_started
-    with _background_lock:
-        if _background_started:
-            return
-        _background_started = True
-
-        t = threading.Thread(target=auto_scan_loop, daemon=True)
-        t.start()
-
-
-start_background_worker_once()
-
-
-# =========================================
-# ROUTES
-# =========================================
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify(
-        {
-            "ok": True,
-            "service": "telegram-market-bot",
-            "webhook_route": "/webhook",
-            "markets_url": MARKETS_URL,
-            "alert_threshold": ALERT_THRESHOLD,
-            "watch_threshold": WATCH_THRESHOLD,
-            "send_watch_alerts": SEND_WATCH_ALERTS,
-            "baseline_prob": BASELINE_PROB,
-            "min_liquidity": MIN_LIQUIDITY,
-            "max_spread": MAX_SPREAD,
-            "scan_every_seconds": SCAN_EVERY_SECONDS,
-            "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
-            "auto_discover": AUTO_DISCOVER,
-            "discover_limit": DISCOVER_LIMIT,
-            "discover_min_volume": DISCOVER_MIN_VOLUME,
-            "discover_min_liquidity": DISCOVER_MIN_LIQUIDITY,
-            "discover_keywords": DISCOVER_KEYWORDS,
+    if not slugs:
+        return {
+            "ok": False,
+            "error": "No market slugs found. Check MARKET_LIST_URL or TEST_MARKET_SLUG.",
+            "counts": counts,
+            "results": [],
         }
-    )
+
+    for slug in slugs:
+        try:
+            markets = fetch_markets_by_slug(slug)
+        except Exception as e:
+            logging.exception("Fetch failed for %s: %s", slug, e)
+            continue
+
+        for market in markets:
+            counts["total"] += 1
+            category, reason, diff = classify_market(market)
+
+            row = {
+                "category": category,
+                "reason": reason,
+                "label": market["label"],
+                "slug": market["slug"],
+                "market_id": market["market_id"],
+                "live_prob": market["live_prob"],
+                "baseline_prob": 0.50,
+                "diff": round(diff, 6),
+                "best_bid": market.get("best_bid"),
+                "best_ask": market.get("best_ask"),
+                "last_price": market.get("last_price"),
+                "spread": market.get("spread"),
+                "liquidity": market.get("liquidity"),
+                "source": market.get("source"),
+            }
+
+            results.append(row)
+            counts[category.lower()] += 1
+
+    # strongest signals first
+    results.sort(key=lambda x: x["diff"])
+
+    return {
+        "ok": True,
+        "counts": counts,
+        "results": results,
+        "top_candidates": results[:10],
+    }
+
+
+def build_scan_message(scan: Dict[str, Any]) -> str:
+    if not scan.get("ok"):
+        return f"Scan error: {scan.get('error', 'Unknown error')}"
+
+    counts = scan["counts"]
+    results = scan["results"]
+
+    lines = []
+    lines.append("Scan complete")
+    lines.append("")
+    lines.append(f"Total: {counts['total']}")
+    lines.append(f"Alerts: {counts['alert']}")
+    lines.append(f"Watch: {counts['watch']}")
+    lines.append(f"Skip: {counts['skip']}")
+    lines.append("")
+
+    shown = 0
+    for item in results:
+        if item["category"] not in {"ALERT", "WATCH"}:
+            continue
+        if item["category"] == "WATCH" and not SEND_WATCH_ALERTS:
+            continue
+
+        lines.append(f"{item['category']} | {item['label']}")
+        lines.append(f"slug={item['slug']}")
+        lines.append(
+            f"live={item['live_prob']:.3f} base={item['baseline_prob']:.3f} diff={item['diff']:.3f}"
+        )
+        lines.append(
+            f"bid={item['best_bid']:.3f} ask={item['best_ask']:.3f} spread={item['spread']:.3f} liq={item['liquidity']:.0f}"
+        )
+        lines.append("")
+        shown += 1
+
+        if shown >= 10:
+            break
+
+    if shown == 0:
+        lines.append("No alert-level markets after filters.")
+
+    return "\n".join(lines).strip()
+
+
+# =========================
+# ROUTES
+# =========================
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"ok": True, "message": "Bot is running"}), 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True}), 200
+
+
+@app.route("/scan", methods=["GET"])
+def scan_http():
+    result = run_scan()
+    return jsonify(result), 200
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(silent=True) or {}
-    message = data.get("message", {})
-    chat = message.get("chat", {})
-    chat_id = str(chat.get("id", "")).strip()
-    text = (message.get("text") or "").strip()
+    try:
+        update = request.get_json(force=True, silent=True) or {}
+        message = update.get("message") or update.get("edited_message") or {}
+        chat = message.get("chat", {})
+        chat_id = str(chat.get("id", "")).strip()
+        text = (message.get("text") or "").strip()
 
-    if not chat_id or not text:
-        return jsonify({"ok": True, "ignored": True})
+        if not chat_id:
+            return jsonify({"ok": True, "message": "No chat id"}), 200
 
-    if text == "/start":
-        send_telegram_message(chat_id, "Bot is live.\nUse /scan or /health")
-        return jsonify({"ok": True})
+        if text.lower() in {"/start", "start"}:
+            send_telegram_message(
+                chat_id,
+                "Bot is live.\n\nUse /scan to run the market scan."
+            )
+            return jsonify({"ok": True}), 200
 
-    if text == "/health":
-        msg = (
-            "Health check\n"
-            f"markets_url={MARKETS_URL}\n"
-            f"alert_threshold={ALERT_THRESHOLD}\n"
-            f"watch_threshold={WATCH_THRESHOLD}\n"
-            f"send_watch_alerts={SEND_WATCH_ALERTS}\n"
-            f"baseline_prob={BASELINE_PROB}\n"
-            f"min_liquidity={MIN_LIQUIDITY}\n"
-            f"max_spread={MAX_SPREAD}\n"
-            f"scan_every_seconds={SCAN_EVERY_SECONDS}\n"
-            f"auto_scan_enabled={bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0)}\n"
-            f"auto_discover={AUTO_DISCOVER}\n"
-            f"discover_limit={DISCOVER_LIMIT}\n"
-            f"discover_min_volume={DISCOVER_MIN_VOLUME}\n"
-            f"discover_min_liquidity={DISCOVER_MIN_LIQUIDITY}\n"
-            f"discover_keywords={DISCOVER_KEYWORDS}"
-        )
-        send_telegram_message(chat_id, msg)
-        return jsonify({"ok": True})
+        if text.lower() in {"/scan", "scan"}:
+            try:
+                scan = run_scan()
+                msg = build_scan_message(scan)
+                send_telegram_message(chat_id, msg)
+            except Exception as e:
+                logging.exception("Scan failed: %s", e)
+                send_telegram_message(chat_id, f"Scan error: {e}")
+            return jsonify({"ok": True}), 200
 
-    if text == "/scan":
-        try:
-            scan = scan_markets()
-            send_telegram_message(chat_id, format_scan_summary(scan))
-        except Exception as e:
-            send_telegram_message(chat_id, f"Scan error: {e}")
-        return jsonify({"ok": True})
+        send_telegram_message(chat_id, "Use /scan")
+        return jsonify({"ok": True}), 200
 
-    send_telegram_message(chat_id, "Unknown command. Use /scan or /health")
-    return jsonify({"ok": True})
+    except Exception as e:
+        logging.exception("Webhook error: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=False)

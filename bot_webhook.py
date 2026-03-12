@@ -337,13 +337,14 @@ def run_scan():
                 elif cat == "WATCH":
                     sent["watch"] += 1
 
-    return {
-        "ok": True,
-        "timestamp_utc": now_utc(),
-        "counts": counts,
-        "sent": sent,
-        "top_candidates": top_candidates
-    }
+return {
+    "ok": True,
+    "timestamp_utc": now_utc(),
+    "counts": counts,
+    "sent": sent,
+    "top_candidates": top_candidates,
+    "results": results
+}
 
 
 # -----------------------------

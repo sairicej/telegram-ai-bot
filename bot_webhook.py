@@ -21,16 +21,15 @@ MARKETS_URL = os.getenv(
 ).strip()
 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
 BOT_LABEL = os.getenv("BOT_LABEL", "telegram-market-bot").strip()
 
-ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.30"))
-WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.20"))
+ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.35"))
+WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.25"))
 SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "false").lower() == "true"
 
 BASELINE_PROB = float(os.getenv("BASELINE_PROB", "0.50"))
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "75000"))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.08"))
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "100000"))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.05"))
 MIN_BID = float(os.getenv("MIN_BID", "0.01"))
 MAX_ASK = float(os.getenv("MAX_ASK", "0.99"))
 
@@ -172,11 +171,6 @@ def is_yes_no_market(market_data: Dict[str, Any]) -> bool:
 # WATCHLIST INPUT
 # =========================================
 def parse_watchlist_line(line: str) -> Optional[Dict[str, Any]]:
-    """
-    Supports:
-      slug
-      slug|0.50
-    """
     raw = line.strip()
     if not raw or raw.startswith("#"):
         return None
@@ -363,12 +357,8 @@ def resolve_slug_to_market(slug: str) -> Tuple[Optional[Dict[str, Any]], Optiona
 
 
 def choose_live_prob(best_bid: float, best_ask: float, last_trade: float) -> Tuple[float, str]:
-    spread = round(best_ask - best_bid, 6) if best_bid > 0 and best_ask > 0 else 0.0
-
-    if best_bid > 0 and best_ask > 0:
+    if best_bid > 0 and best_ask > 0 and best_ask >= best_bid:
         midpoint = round((best_bid + best_ask) / 2, 6)
-        if spread > 0.10 and last_trade > 0:
-            return last_trade, "last_trade"
         return midpoint, "midpoint"
 
     if last_trade > 0:
@@ -448,15 +438,28 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
 
     best_bid = to_float(m.get("best_bid", 0), 0.0)
     best_ask = to_float(m.get("best_ask", 0), 0.0)
+    price_source = (m.get("price_source") or "").strip()
 
+    # Skip incomplete / broken books
+    if best_bid <= 0 or best_ask <= 0:
+        return "SKIP", "Incomplete book"
+
+    # Skip last trade fallback when book is not usable
+    if price_source == "last_trade":
+        return "SKIP", "Last trade only"
+
+    # Skip dead books
     if best_bid <= MIN_BID and best_ask >= MAX_ASK:
         return "SKIP", "Dead quote"
 
     live_prob = to_float(m.get("live_prob", 0.0), 0.0)
     baseline_prob = to_float(m.get("baseline_prob", BASELINE_PROB), BASELINE_PROB)
     imbalance = live_prob - baseline_prob
+    no_prob = 1.0 - live_prob
 
     m["imbalance"] = imbalance
+    m["yes_prob"] = live_prob
+    m["no_prob"] = no_prob
 
     if imbalance <= ALERT_THRESHOLD:
         return "ALERT", f"Strong signal: {imbalance:.3f}"
@@ -500,17 +503,38 @@ def scan_markets() -> Dict[str, Any]:
                     "category": "SKIP",
                     "reason": f"Fetch error: {e}",
                     "live_prob": 0.0,
+                    "yes_prob": 0.0,
+                    "no_prob": 1.0,
                     "baseline_prob": item.get("baseline_prob", BASELINE_PROB),
                     "liquidity": 0.0,
                     "best_bid": 0.0,
                     "best_ask": 0.0,
                     "spread": 0.0,
                     "imbalance": 0.0,
+                    "price_source": "none",
                 }
             )
 
     results.sort(key=lambda x: x.get("imbalance", 999))
     return {"counts": counts, "results": results[:20]}
+
+
+def format_market_block(r: Dict[str, Any]) -> str:
+    yes_prob = to_float(r.get("yes_prob", r.get("live_prob", 0.0)), 0.0)
+    no_prob = to_float(r.get("no_prob", 1.0 - yes_prob), 1.0 - yes_prob)
+
+    return (
+        f"{r['category']} | {r['label']}\n"
+        f"slug={r.get('slug', '')}\n"
+        f"YES={yes_prob:.1%} NO={no_prob:.1%} "
+        f"base={r.get('baseline_prob', 0):.1%} "
+        f"diff={r.get('imbalance', 0):.3f}\n"
+        f"bid={r.get('best_bid', 0):.3f} "
+        f"ask={r.get('best_ask', 0):.3f} "
+        f"spread={r.get('spread', 0):.3f} "
+        f"liq={r.get('liquidity', 0):.0f} "
+        f"src={r.get('price_source', '')}"
+    )
 
 
 def format_scan_summary(scan: Dict[str, Any]) -> str:
@@ -531,36 +555,14 @@ def format_scan_summary(scan: Dict[str, Any]) -> str:
         return "\n".join(lines)
 
     for r in top[:5]:
-        lines.append(
-            f"{r['category']} | {r['label']}\n"
-            f"slug={r.get('slug', '')}\n"
-            f"live={r.get('live_prob', 0):.3f} "
-            f"base={r.get('baseline_prob', 0):.3f} "
-            f"diff={r.get('imbalance', 0):.3f}\n"
-            f"bid={r.get('best_bid', 0):.3f} "
-            f"ask={r.get('best_ask', 0):.3f} "
-            f"spread={r.get('spread', 0):.3f} "
-            f"liq={r.get('liquidity', 0):.0f} "
-            f"src={r.get('price_source', '')}"
-        )
+        lines.append(format_market_block(r))
         lines.append("")
 
     return "\n".join(lines).strip()
 
 
 def format_auto_alert(r: Dict[str, Any]) -> str:
-    return (
-        f"{r['category']} | {r['label']}\n"
-        f"slug={r.get('slug', '')}\n"
-        f"live={r.get('live_prob', 0):.3f} "
-        f"base={r.get('baseline_prob', 0):.3f} "
-        f"diff={r.get('imbalance', 0):.3f}\n"
-        f"bid={r.get('best_bid', 0):.3f} "
-        f"ask={r.get('best_ask', 0):.3f} "
-        f"spread={r.get('spread', 0):.3f} "
-        f"liq={r.get('liquidity', 0):.0f} "
-        f"src={r.get('price_source', '')}"
-    )
+    return format_market_block(r)
 
 
 # =========================================

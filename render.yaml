@@ -1,25 +1,4 @@
-services:
-  - type: web
-    name: telegram-ai-bot
-    env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
-    autoDeploy: true
-    envVars:
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_ID
-        sync: false
-      - key: LIVE_FEED_URL
-        value: https://raw.githubusercontent.com/sairicej/telegram-ai-bot/main/live_feed_markets.txt
-      - key: ALERT_THRESHOLD
-        value: -0.20
-      - key: WATCH_THRESHOLD
-        value: -0.12
-      - key: SEND_WATCH_ALERTS
-        value: false
-      - key: MIN_LIQUIDITY
-        value: 0
-      - key: REQUEST_TIMEOUT
-        value: 20
+MARKETS_URL = os.getenv(
+    "LIVE_FEED_URL",
+    "https://raw.githubusercontent.com/sairicej/telegram-ai-bot/main/live_feed_markets.txt"
+).strip()

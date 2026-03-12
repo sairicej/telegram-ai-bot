@@ -9,48 +9,53 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# =========================
-# Environment / settings
-# =========================
+# =========================================
+# ENV / SETTINGS
+# =========================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-# Keep this aligned with your render.yaml
 MARKETS_URL = os.getenv(
     "MARKETS_URL",
     "https://raw.githubusercontent.com/sairicej/telegram-ai-bot/main/live_feed_markets.txt",
 ).strip()
 
-# Thresholds
-ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.20"))
-WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.12"))
-SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "false").lower() == "true"
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "0"))
-BASELINE_PROB = float(os.getenv("BASELINE_PROB", "0.50"))
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Timing / runtime
+ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.15"))
+WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.10"))
+SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "false").lower() == "true"
+
+BASELINE_PROB = float(os.getenv("BASELINE_PROB", "0.50"))
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "50000"))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.15"))
+
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 DEDUP_SECONDS = int(os.getenv("DEDUP_SECONDS", "3600"))
 SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "300"))
 
-# Optional push-alert target for auto scans
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# Upgrade: auto-discover many active markets instead of only manual file entries
+AUTO_DISCOVER = os.getenv("AUTO_DISCOVER", "false").lower() == "true"
+DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "200"))
+DISCOVER_PAGE_SIZE = int(os.getenv("DISCOVER_PAGE_SIZE", "100"))
+DISCOVER_MIN_VOLUME = float(os.getenv("DISCOVER_MIN_VOLUME", "100000"))
+DISCOVER_MIN_LIQUIDITY = float(os.getenv("DISCOVER_MIN_LIQUIDITY", "100000"))
+DISCOVER_KEYWORDS = os.getenv(
+    "DISCOVER_KEYWORDS",
+    "bitcoin,btc,ethereum,eth,solana,sol,crypto,iran,regime,election,politics",
+).strip()
 
-# Polymarket endpoints
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 
-# In-memory cache for duplicate suppression
 sent_cache: Dict[str, float] = {}
-
-# Background worker guard
 _background_started = False
 _background_lock = threading.Lock()
 
 
-# =========================
-# Helpers
-# =========================
+# =========================================
+# BASICS
+# =========================================
 def send_telegram_message(chat_id: str, text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         return
@@ -70,6 +75,15 @@ def safe_get_json(url: str, params: Optional[dict] = None) -> Any:
     return r.json()
 
 
+def to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
 def cleanup_cache() -> None:
     now = time.time()
     expired = [k for k, v in sent_cache.items() if now - v > DEDUP_SECONDS]
@@ -86,23 +100,7 @@ def mark_sent(key: str) -> None:
     sent_cache[key] = time.time()
 
 
-def to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None or value == "":
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
 def parse_jsonish_list(value: Any) -> List[Any]:
-    """
-    Handles:
-    - real lists
-    - JSON-style strings like '["a","b"]'
-    - Python-style strings like "['a', 'b']"
-    - comma-separated strings
-    """
     if value is None:
         return []
 
@@ -114,7 +112,6 @@ def parse_jsonish_list(value: Any) -> List[Any]:
         if not s:
             return []
 
-        # Try literal parsing first
         try:
             parsed = ast.literal_eval(s)
             if isinstance(parsed, list):
@@ -122,7 +119,6 @@ def parse_jsonish_list(value: Any) -> List[Any]:
         except Exception:
             pass
 
-        # Try basic comma split fallback
         if "," in s:
             return [x.strip().strip('"').strip("'") for x in s.split(",") if x.strip()]
 
@@ -131,6 +127,9 @@ def parse_jsonish_list(value: Any) -> List[Any]:
     return []
 
 
+# =========================================
+# WATCHLIST INPUT
+# =========================================
 def parse_watchlist_line(line: str) -> Optional[Dict[str, Any]]:
     """
     Supports:
@@ -148,13 +147,10 @@ def parse_watchlist_line(line: str) -> Optional[Dict[str, Any]]:
     if len(parts) >= 2 and parts[1]:
         baseline = to_float(parts[1], BASELINE_PROB)
 
-    return {
-        "slug": slug,
-        "baseline_prob": baseline,
-    }
+    return {"slug": slug, "baseline_prob": baseline}
 
 
-def fetch_watchlist() -> List[Dict[str, Any]]:
+def fetch_watchlist_file() -> List[Dict[str, Any]]:
     try:
         r = requests.get(MARKETS_URL, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
@@ -170,9 +166,83 @@ def fetch_watchlist() -> List[Dict[str, Any]]:
         return []
 
 
-# =========================
-# Polymarket live fetch
-# =========================
+def keyword_list() -> List[str]:
+    return [x.strip().lower() for x in DISCOVER_KEYWORDS.split(",") if x.strip()]
+
+
+def matches_keywords(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(k in t for k in keyword_list())
+
+
+def discover_markets() -> List[Dict[str, Any]]:
+    """
+    Upgrade:
+    Pull many active markets from Gamma, then filter them by simple keywords.
+    """
+    found: List[Dict[str, Any]] = []
+    seen = set()
+    offset = 0
+
+    while len(found) < DISCOVER_LIMIT:
+        params = {
+            "active": "true",
+            "closed": "false",
+            "limit": DISCOVER_PAGE_SIZE,
+            "offset": offset,
+            "liquidity_num_min": DISCOVER_MIN_LIQUIDITY,
+            "volume_num_min": DISCOVER_MIN_VOLUME,
+        }
+
+        try:
+            batch = safe_get_json(f"{GAMMA_BASE}/markets", params=params)
+        except Exception as e:
+            print(f"Discover markets error: {e}")
+            break
+
+        if not isinstance(batch, list) or not batch:
+            break
+
+        for m in batch:
+            slug = (m.get("slug") or "").strip()
+            question = (m.get("question") or m.get("title") or "").strip()
+
+            if not slug or slug in seen:
+                continue
+
+            if not matches_keywords(f"{slug} {question}"):
+                continue
+
+            seen.add(slug)
+            found.append(
+                {
+                    "slug": slug,
+                    "baseline_prob": BASELINE_PROB,
+                }
+            )
+
+            if len(found) >= DISCOVER_LIMIT:
+                break
+
+        offset += DISCOVER_PAGE_SIZE
+
+    return found
+
+
+def fetch_watchlist() -> List[Dict[str, Any]]:
+    if AUTO_DISCOVER:
+        discovered = discover_markets()
+        if discovered:
+            return discovered
+        # fallback to file if discovery returns nothing
+    return fetch_watchlist_file()
+
+
+# =========================================
+# POLYMARKET LOOKUPS
+# =========================================
 def fetch_market_by_slug(slug: str) -> Optional[Dict[str, Any]]:
     try:
         return safe_get_json(f"{GAMMA_BASE}/markets/slug/{slug}")
@@ -188,9 +258,6 @@ def fetch_event_by_slug(slug: str) -> Optional[Dict[str, Any]]:
 
 
 def pick_best_market_from_event(event_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    If the watchlist line is an event slug, choose the most liquid active/open child market.
-    """
     markets = event_data.get("markets") or []
     if not isinstance(markets, list) or not markets:
         return None
@@ -199,7 +266,7 @@ def pick_best_market_from_event(event_data: Dict[str, Any]) -> Optional[Dict[str
     for m in markets:
         active = bool(m.get("active", True))
         closed = bool(m.get("closed", False))
-        liquidity = to_float(m.get("liquidity"), 0.0)
+        liquidity = to_float(m.get("liquidityClob", m.get("liquidity", 0.0)), 0.0)
 
         if active and not closed:
             filtered.append((liquidity, m))
@@ -208,21 +275,16 @@ def pick_best_market_from_event(event_data: Dict[str, Any]) -> Optional[Dict[str
         filtered.sort(key=lambda x: x[0], reverse=True)
         return filtered[0][1]
 
-    # fallback: highest liquidity even if status flags are odd
-    all_markets = [(to_float(m.get("liquidity"), 0.0), m) for m in markets]
+    all_markets = [(to_float(m.get("liquidityClob", m.get("liquidity", 0.0)), 0.0), m) for m in markets]
     all_markets.sort(key=lambda x: x[0], reverse=True)
     return all_markets[0][1] if all_markets else None
 
 
 def extract_yes_token_id(market_data: Dict[str, Any]) -> Optional[str]:
-    """
-    Polymarket docs state the first clobTokenIds entry is the Yes token.
-    """
     token_ids = parse_jsonish_list(market_data.get("clobTokenIds"))
     if token_ids:
         return str(token_ids[0])
 
-    # Very defensive fallback
     token_id = market_data.get("clobTokenId") or market_data.get("asset_id")
     if token_id:
         return str(token_id)
@@ -235,10 +297,6 @@ def fetch_order_book(token_id: str) -> Dict[str, Any]:
 
 
 def resolve_slug_to_market(slug: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Tries market slug first, then event slug.
-    Returns (market_data, source_type)
-    """
     market = fetch_market_by_slug(slug)
     if market:
         return market, "market"
@@ -253,10 +311,6 @@ def resolve_slug_to_market(slug: str) -> Tuple[Optional[Dict[str, Any]], Optiona
 
 
 def choose_live_prob(best_bid: float, best_ask: float, last_trade: float) -> float:
-    """
-    Polymarket midpoint is the implied probability, but when spread > 0.10
-    Polymarket displays last traded price instead. We mirror that.
-    """
     spread = round(best_ask - best_bid, 6) if best_bid > 0 and best_ask > 0 else 0.0
 
     if best_bid > 0 and best_ask > 0:
@@ -278,20 +332,16 @@ def choose_live_prob(best_bid: float, best_ask: float, last_trade: float) -> flo
 
 
 def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Watchlist item shape:
-      {"slug": "...", "baseline_prob": 0.50}
-    """
     slug = item["slug"]
     baseline_prob = to_float(item.get("baseline_prob"), BASELINE_PROB)
 
     market_data, source_type = resolve_slug_to_market(slug)
     if not market_data:
-        raise ValueError(f"Slug not found in Gamma API: {slug}")
+        raise ValueError(f"Slug not found: {slug}")
 
     token_id = extract_yes_token_id(market_data)
     if not token_id:
-        raise ValueError(f"No yes token ID found for slug: {slug}")
+        raise ValueError(f"No YES token ID found for slug: {slug}")
 
     book = fetch_order_book(token_id)
 
@@ -301,10 +351,8 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
     best_bid = to_float(bids[0].get("price")) if bids else 0.0
     best_ask = to_float(asks[0].get("price")) if asks else 0.0
     last_trade = to_float(book.get("last_trade_price"), 0.0)
-
     spread = round(best_ask - best_bid, 6) if best_bid > 0 and best_ask > 0 else 0.0
     live_prob = choose_live_prob(best_bid, best_ask, last_trade)
-
     liquidity = to_float(
         market_data.get("liquidityClob", market_data.get("liquidity", 0.0)),
         0.0,
@@ -333,13 +381,17 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# =========================
-# Classification / scan
-# =========================
+# =========================================
+# CLASSIFICATION
+# =========================================
 def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     liquidity = to_float(m.get("liquidity", 0), 0.0)
     if liquidity < MIN_LIQUIDITY:
-        return "SKIP", None
+        return "SKIP", "Liquidity too low"
+
+    spread = to_float(m.get("spread", 0), 0.0)
+    if spread > MAX_SPREAD:
+        return "SKIP", "Spread too wide"
 
     live_prob = to_float(m.get("live_prob", 0.0), 0.0)
     baseline_prob = to_float(m.get("baseline_prob", BASELINE_PROB), BASELINE_PROB)
@@ -354,6 +406,9 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     return "SKIP", None
 
 
+# =========================================
+# SCAN
+# =========================================
 def scan_markets() -> Dict[str, Any]:
     watchlist = fetch_watchlist()
     results: List[Dict[str, Any]] = []
@@ -377,6 +432,7 @@ def scan_markets() -> Dict[str, Any]:
 
         except Exception as e:
             print(f"Market scan error for {item}: {e}")
+            counts["skip"] += 1
             results.append(
                 {
                     "market_id": item.get("slug"),
@@ -393,10 +449,9 @@ def scan_markets() -> Dict[str, Any]:
                     "imbalance": 0.0,
                 }
             )
-            counts["skip"] += 1
 
     results.sort(key=lambda x: x.get("imbalance", 999))
-    return {"counts": counts, "results": results[:10]}
+    return {"counts": counts, "results": results[:20]}
 
 
 def format_scan_summary(scan: Dict[str, Any]) -> str:
@@ -418,9 +473,10 @@ def format_scan_summary(scan: Dict[str, Any]) -> str:
     for r in top[:5]:
         lines.append(
             f"{r['category']} | {r['label']}\n"
+            f"slug={r.get('slug', '')}\n"
             f"live={r.get('live_prob', 0):.3f} "
             f"base={r.get('baseline_prob', 0):.3f} "
-            f"diff={r.get('imbalance', 0):.3f} "
+            f"diff={r.get('imbalance', 0):.3f}\n"
             f"bid={r.get('best_bid', 0):.3f} "
             f"ask={r.get('best_ask', 0):.3f} "
             f"spread={r.get('spread', 0):.3f} "
@@ -444,9 +500,9 @@ def format_auto_alert(r: Dict[str, Any]) -> str:
     )
 
 
-# =========================
-# Background live scanner
-# =========================
+# =========================================
+# AUTO SCAN LOOP
+# =========================================
 def auto_scan_loop() -> None:
     if not TELEGRAM_CHAT_ID:
         print("Auto scan disabled: TELEGRAM_CHAT_ID not set")
@@ -497,9 +553,9 @@ def start_background_worker_once() -> None:
 start_background_worker_once()
 
 
-# =========================
-# Flask routes
-# =========================
+# =========================================
+# ROUTES
+# =========================================
 @app.route("/", methods=["GET"])
 def home():
     return jsonify(
@@ -511,10 +567,16 @@ def home():
             "alert_threshold": ALERT_THRESHOLD,
             "watch_threshold": WATCH_THRESHOLD,
             "send_watch_alerts": SEND_WATCH_ALERTS,
-            "min_liquidity": MIN_LIQUIDITY,
             "baseline_prob": BASELINE_PROB,
+            "min_liquidity": MIN_LIQUIDITY,
+            "max_spread": MAX_SPREAD,
             "scan_every_seconds": SCAN_EVERY_SECONDS,
             "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
+            "auto_discover": AUTO_DISCOVER,
+            "discover_limit": DISCOVER_LIMIT,
+            "discover_min_volume": DISCOVER_MIN_VOLUME,
+            "discover_min_liquidity": DISCOVER_MIN_LIQUIDITY,
+            "discover_keywords": DISCOVER_KEYWORDS,
         }
     )
 
@@ -541,10 +603,16 @@ def webhook():
             f"alert_threshold={ALERT_THRESHOLD}\n"
             f"watch_threshold={WATCH_THRESHOLD}\n"
             f"send_watch_alerts={SEND_WATCH_ALERTS}\n"
-            f"min_liquidity={MIN_LIQUIDITY}\n"
             f"baseline_prob={BASELINE_PROB}\n"
+            f"min_liquidity={MIN_LIQUIDITY}\n"
+            f"max_spread={MAX_SPREAD}\n"
             f"scan_every_seconds={SCAN_EVERY_SECONDS}\n"
-            f"auto_scan_enabled={bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0)}"
+            f"auto_scan_enabled={bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0)}\n"
+            f"auto_discover={AUTO_DISCOVER}\n"
+            f"discover_limit={DISCOVER_LIMIT}\n"
+            f"discover_min_volume={DISCOVER_MIN_VOLUME}\n"
+            f"discover_min_liquidity={DISCOVER_MIN_LIQUIDITY}\n"
+            f"discover_keywords={DISCOVER_KEYWORDS}"
         )
         send_telegram_message(chat_id, msg)
         return jsonify({"ok": True})

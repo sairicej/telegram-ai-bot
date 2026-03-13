@@ -37,6 +37,7 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 DEDUP_SECONDS = int(os.getenv("DEDUP_SECONDS", "3600"))
 SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "300"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "3"))
+ZERO_SUMMARY_EVERY_SECONDS = int(os.getenv("ZERO_SUMMARY_EVERY_SECONDS", "3600"))
 
 AUTO_DISCOVER = os.getenv("AUTO_DISCOVER", "false").lower() == "true"
 DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "100"))
@@ -57,6 +58,10 @@ CLOB_BASE = "https://clob.polymarket.com"
 sent_cache: Dict[str, float] = {}
 _background_started = False
 _background_lock = threading.Lock()
+
+# zero-result tracking for auto-scan only
+zero_scan_count = 0
+zero_window_started_at = time.time()
 
 
 # =========================================
@@ -440,15 +445,12 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     best_ask = to_float(m.get("best_ask", 0), 0.0)
     price_source = (m.get("price_source") or "").strip()
 
-    # Skip incomplete / broken books
     if best_bid <= 0 or best_ask <= 0:
         return "SKIP", "Incomplete book"
 
-    # Skip last trade fallback when book is not usable
     if price_source == "last_trade":
         return "SKIP", "Last trade only"
 
-    # Skip dead books
     if best_bid <= MIN_BID and best_ask >= MAX_ASK:
         return "SKIP", "Dead quote"
 
@@ -565,10 +567,20 @@ def format_auto_alert(r: Dict[str, Any]) -> str:
     return format_market_block(r)
 
 
+def format_zero_summary(zero_count: int, seconds_in_window: int) -> str:
+    minutes = max(1, round(seconds_in_window / 60))
+    return (
+        "No qualifying markets found.\n"
+        f"Empty scans in last {minutes} minutes: {zero_count}"
+    )
+
+
 # =========================================
 # AUTO SCAN LOOP
 # =========================================
 def auto_scan_loop() -> None:
+    global zero_scan_count, zero_window_started_at
+
     if not TELEGRAM_CHAT_ID:
         print("Auto scan disabled: TELEGRAM_CHAT_ID not set")
         return
@@ -591,14 +603,33 @@ def auto_scan_loop() -> None:
                     candidates.append(r)
 
             candidates = candidates[:MAX_ALERTS_PER_SCAN]
+            now = time.time()
 
-            for r in candidates:
-                dedupe_key = f"{r.get('slug')}|{r.get('category')}"
-                if already_sent(dedupe_key):
-                    continue
+            if candidates:
+                # reset zero tracking as soon as one or more markets qualify
+                zero_scan_count = 0
+                zero_window_started_at = now
 
-                send_telegram_message(TELEGRAM_CHAT_ID, format_auto_alert(r))
-                mark_sent(dedupe_key)
+                for r in candidates:
+                    dedupe_key = f"{r.get('slug')}|{r.get('category')}"
+                    if already_sent(dedupe_key):
+                        continue
+
+                    send_telegram_message(TELEGRAM_CHAT_ID, format_auto_alert(r))
+                    mark_sent(dedupe_key)
+
+            else:
+                # no qualifying markets; do not send immediate message
+                zero_scan_count += 1
+                elapsed = now - zero_window_started_at
+
+                if elapsed >= ZERO_SUMMARY_EVERY_SECONDS and zero_scan_count > 0:
+                    send_telegram_message(
+                        TELEGRAM_CHAT_ID,
+                        format_zero_summary(zero_scan_count, int(elapsed)),
+                    )
+                    zero_scan_count = 0
+                    zero_window_started_at = now
 
         except Exception as e:
             print(f"Auto scan error: {e}")
@@ -641,6 +672,7 @@ def home():
             "max_ask": MAX_ASK,
             "scan_every_seconds": SCAN_EVERY_SECONDS,
             "max_alerts_per_scan": MAX_ALERTS_PER_SCAN,
+            "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
             "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
             "auto_discover": AUTO_DISCOVER,
             "discover_limit": DISCOVER_LIMIT,
@@ -664,6 +696,7 @@ def health():
             "enable_yes_no_only": ENABLE_YES_NO_ONLY,
             "test_market_slug": TEST_MARKET_SLUG,
             "scan_every_seconds": SCAN_EVERY_SECONDS,
+            "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
         }
     )
 
@@ -705,6 +738,7 @@ def webhook():
             f"max_ask={MAX_ASK}\n"
             f"scan_every_seconds={SCAN_EVERY_SECONDS}\n"
             f"max_alerts_per_scan={MAX_ALERTS_PER_SCAN}\n"
+            f"zero_summary_every_seconds={ZERO_SUMMARY_EVERY_SECONDS}\n"
             f"auto_scan_enabled={bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0)}\n"
             f"auto_discover={AUTO_DISCOVER}\n"
             f"discover_limit={DISCOVER_LIMIT}\n"

@@ -59,7 +59,6 @@ sent_cache: Dict[str, float] = {}
 _background_started = False
 _background_lock = threading.Lock()
 
-# zero-result tracking for auto-scan only
 zero_scan_count = 0
 zero_window_started_at = time.time()
 
@@ -68,7 +67,7 @@ zero_window_started_at = time.time()
 # BASICS
 # =========================================
 def send_telegram_message(chat_id: str, text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not chat_id:
+    if not TELEGRAM_BOT_TOKEN or not chat_id or not text.strip():
         return
 
     try:
@@ -144,7 +143,7 @@ def parse_jsonish_list(value: Any) -> List[Any]:
 
 
 # =========================================
-# MARKET STRUCTURE HELPERS
+# MARKET HELPERS
 # =========================================
 def normalize_outcomes(market_data: Dict[str, Any]) -> List[str]:
     outcomes = market_data.get("outcomes")
@@ -173,7 +172,7 @@ def is_yes_no_market(market_data: Dict[str, Any]) -> bool:
 
 
 # =========================================
-# WATCHLIST INPUT
+# WATCHLIST
 # =========================================
 def parse_watchlist_line(line: str) -> Optional[Dict[str, Any]]:
     raw = line.strip()
@@ -255,12 +254,7 @@ def discover_markets() -> List[Dict[str, Any]]:
                 continue
 
             seen.add(slug)
-            found.append(
-                {
-                    "slug": slug,
-                    "baseline_prob": BASELINE_PROB,
-                }
-            )
+            found.append({"slug": slug, "baseline_prob": BASELINE_PROB})
 
             if len(found) >= DISCOVER_LIMIT:
                 break
@@ -283,7 +277,7 @@ def fetch_watchlist() -> List[Dict[str, Any]]:
 
 
 # =========================================
-# POLYMARKET LOOKUPS
+# MARKET DATA
 # =========================================
 def fetch_market_by_slug(slug: str) -> Optional[Dict[str, Any]]:
     try:
@@ -400,17 +394,9 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
     last_trade = to_float(book.get("last_trade_price"), 0.0)
     spread = round(best_ask - best_bid, 6) if best_bid > 0 and best_ask > 0 else 0.0
     live_prob, price_source = choose_live_prob(best_bid, best_ask, last_trade)
-    liquidity = to_float(
-        market_data.get("liquidityClob", market_data.get("liquidity", 0.0)),
-        0.0,
-    )
+    liquidity = to_float(market_data.get("liquidityClob", market_data.get("liquidity", 0.0)), 0.0)
 
-    label = (
-        market_data.get("question")
-        or market_data.get("title")
-        or market_data.get("slug")
-        or slug
-    )
+    label = market_data.get("question") or market_data.get("title") or market_data.get("slug") or slug
 
     return {
         "market_id": market_data.get("id", slug),
@@ -457,11 +443,10 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     live_prob = to_float(m.get("live_prob", 0.0), 0.0)
     baseline_prob = to_float(m.get("baseline_prob", BASELINE_PROB), BASELINE_PROB)
     imbalance = live_prob - baseline_prob
-    no_prob = 1.0 - live_prob
 
     m["imbalance"] = imbalance
     m["yes_prob"] = live_prob
-    m["no_prob"] = no_prob
+    m["no_prob"] = 1.0 - live_prob
 
     if imbalance <= ALERT_THRESHOLD:
         return "ALERT", f"Strong signal: {imbalance:.3f}"
@@ -497,28 +482,13 @@ def scan_markets() -> Dict[str, Any]:
         except Exception as e:
             print(f"Market scan error for {item}: {e}")
             counts["skip"] += 1
-            results.append(
-                {
-                    "market_id": item.get("slug"),
-                    "slug": item.get("slug"),
-                    "label": item.get("slug"),
-                    "category": "SKIP",
-                    "reason": f"Fetch error: {e}",
-                    "live_prob": 0.0,
-                    "yes_prob": 0.0,
-                    "no_prob": 1.0,
-                    "baseline_prob": item.get("baseline_prob", BASELINE_PROB),
-                    "liquidity": 0.0,
-                    "best_bid": 0.0,
-                    "best_ask": 0.0,
-                    "spread": 0.0,
-                    "imbalance": 0.0,
-                    "price_source": "none",
-                }
-            )
 
     results.sort(key=lambda x: x.get("imbalance", 999))
     return {"counts": counts, "results": results[:20]}
+
+
+def qualifying_results(scan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [r for r in scan["results"] if r["category"] == "ALERT" or (r["category"] == "WATCH" and SEND_WATCH_ALERTS)]
 
 
 def format_market_block(r: Dict[str, Any]) -> str:
@@ -539,22 +509,20 @@ def format_market_block(r: Dict[str, Any]) -> str:
     )
 
 
-def format_scan_summary(scan: Dict[str, Any]) -> str:
-    counts = scan["counts"]
+def format_zero_summary(zero_count: int, seconds_in_window: int) -> str:
+    minutes = max(1, round(seconds_in_window / 60))
+    return f"No qualifying markets in last {minutes} minutes.\nEmpty scans: {zero_count}"
+
+
+def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
+    top = qualifying_results(scan)
+    if not top:
+        return None
+
     lines = [
-        "Scan complete",
-        "",
-        f"Total: {counts['total']}",
-        f"Alerts: {counts['alert']}",
-        f"Watch: {counts['watch']}",
-        f"Skip: {counts['skip']}",
+        f"Qualifying markets: {len(top)}",
         "",
     ]
-
-    top = [r for r in scan["results"] if r["category"] in ("ALERT", "WATCH")]
-    if not top:
-        lines.append("No qualifying markets found.")
-        return "\n".join(lines)
 
     for r in top[:5]:
         lines.append(format_market_block(r))
@@ -563,20 +531,8 @@ def format_scan_summary(scan: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-def format_auto_alert(r: Dict[str, Any]) -> str:
-    return format_market_block(r)
-
-
-def format_zero_summary(zero_count: int, seconds_in_window: int) -> str:
-    minutes = max(1, round(seconds_in_window / 60))
-    return (
-        "No qualifying markets found.\n"
-        f"Empty scans in last {minutes} minutes: {zero_count}"
-    )
-
-
 # =========================================
-# AUTO SCAN LOOP
+# AUTO LOOP
 # =========================================
 def auto_scan_loop() -> None:
     global zero_scan_count, zero_window_started_at
@@ -594,19 +550,10 @@ def auto_scan_loop() -> None:
     while True:
         try:
             scan = scan_markets()
-            candidates = []
-
-            for r in scan["results"]:
-                if r["category"] == "ALERT":
-                    candidates.append(r)
-                elif r["category"] == "WATCH" and SEND_WATCH_ALERTS:
-                    candidates.append(r)
-
-            candidates = candidates[:MAX_ALERTS_PER_SCAN]
+            candidates = qualifying_results(scan)[:MAX_ALERTS_PER_SCAN]
             now = time.time()
 
             if candidates:
-                # reset zero tracking as soon as one or more markets qualify
                 zero_scan_count = 0
                 zero_window_started_at = now
 
@@ -615,11 +562,9 @@ def auto_scan_loop() -> None:
                     if already_sent(dedupe_key):
                         continue
 
-                    send_telegram_message(TELEGRAM_CHAT_ID, format_auto_alert(r))
+                    send_telegram_message(TELEGRAM_CHAT_ID, format_market_block(r))
                     mark_sent(dedupe_key)
-
             else:
-                # no qualifying markets; do not send immediate message
                 zero_scan_count += 1
                 elapsed = now - zero_window_started_at
 
@@ -643,7 +588,6 @@ def start_background_worker_once() -> None:
         if _background_started:
             return
         _background_started = True
-
         t = threading.Thread(target=auto_scan_loop, daemon=True)
         t.start()
 
@@ -656,49 +600,26 @@ start_background_worker_once()
 # =========================================
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify(
-        {
-            "ok": True,
-            "service": BOT_LABEL,
-            "webhook_route": "/webhook",
-            "markets_url": MARKETS_URL,
-            "alert_threshold": ALERT_THRESHOLD,
-            "watch_threshold": WATCH_THRESHOLD,
-            "send_watch_alerts": SEND_WATCH_ALERTS,
-            "baseline_prob": BASELINE_PROB,
-            "min_liquidity": MIN_LIQUIDITY,
-            "max_spread": MAX_SPREAD,
-            "min_bid": MIN_BID,
-            "max_ask": MAX_ASK,
-            "scan_every_seconds": SCAN_EVERY_SECONDS,
-            "max_alerts_per_scan": MAX_ALERTS_PER_SCAN,
-            "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
-            "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
-            "auto_discover": AUTO_DISCOVER,
-            "discover_limit": DISCOVER_LIMIT,
-            "discover_min_volume": DISCOVER_MIN_VOLUME,
-            "discover_min_liquidity": DISCOVER_MIN_LIQUIDITY,
-            "discover_keywords": DISCOVER_KEYWORDS,
-            "enable_yes_no_only": ENABLE_YES_NO_ONLY,
-            "test_market_slug": TEST_MARKET_SLUG,
-        }
-    )
+    return jsonify({
+        "ok": True,
+        "service": BOT_LABEL,
+        "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
+        "scan_every_seconds": SCAN_EVERY_SECONDS,
+        "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
+    })
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify(
-        {
-            "ok": True,
-            "service": BOT_LABEL,
-            "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
-            "auto_discover": AUTO_DISCOVER,
-            "enable_yes_no_only": ENABLE_YES_NO_ONLY,
-            "test_market_slug": TEST_MARKET_SLUG,
-            "scan_every_seconds": SCAN_EVERY_SECONDS,
-            "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
-        }
-    )
+    return jsonify({
+        "ok": True,
+        "service": BOT_LABEL,
+        "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
+        "auto_discover": AUTO_DISCOVER,
+        "enable_yes_no_only": ENABLE_YES_NO_ONLY,
+        "scan_every_seconds": SCAN_EVERY_SECONDS,
+        "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
+    })
 
 
 @app.route("/scan", methods=["GET"])
@@ -731,20 +652,10 @@ def webhook():
             f"alert_threshold={ALERT_THRESHOLD}\n"
             f"watch_threshold={WATCH_THRESHOLD}\n"
             f"send_watch_alerts={SEND_WATCH_ALERTS}\n"
-            f"baseline_prob={BASELINE_PROB}\n"
-            f"min_liquidity={MIN_LIQUIDITY}\n"
-            f"max_spread={MAX_SPREAD}\n"
-            f"min_bid={MIN_BID}\n"
-            f"max_ask={MAX_ASK}\n"
             f"scan_every_seconds={SCAN_EVERY_SECONDS}\n"
-            f"max_alerts_per_scan={MAX_ALERTS_PER_SCAN}\n"
             f"zero_summary_every_seconds={ZERO_SUMMARY_EVERY_SECONDS}\n"
             f"auto_scan_enabled={bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0)}\n"
             f"auto_discover={AUTO_DISCOVER}\n"
-            f"discover_limit={DISCOVER_LIMIT}\n"
-            f"discover_min_volume={DISCOVER_MIN_VOLUME}\n"
-            f"discover_min_liquidity={DISCOVER_MIN_LIQUIDITY}\n"
-            f"discover_keywords={DISCOVER_KEYWORDS}\n"
             f"enable_yes_no_only={ENABLE_YES_NO_ONLY}\n"
             f"test_market_slug={TEST_MARKET_SLUG or 'none'}"
         )
@@ -754,14 +665,15 @@ def webhook():
     if text == "/scan":
         try:
             scan = scan_markets()
-            send_telegram_message(chat_id, format_scan_summary(scan))
+            msg = format_manual_scan(scan)
+            if msg:
+                send_telegram_message(chat_id, msg)
         except Exception as e:
             send_telegram_message(chat_id, f"Scan error: {e}")
         return jsonify({"ok": True})
 
-    send_telegram_message(chat_id, "Unknown command. Use /scan or /health")
     return jsonify({"ok": True})
-
+    
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))

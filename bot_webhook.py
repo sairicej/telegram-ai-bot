@@ -66,6 +66,10 @@ zero_window_started_at = time.time()
 # =========================================
 # BASICS
 # =========================================
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def send_telegram_message(chat_id: str, text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not chat_id or not text.strip():
         return
@@ -81,8 +85,9 @@ def send_telegram_message(chat_id: str, text: str) -> None:
             timeout=REQUEST_TIMEOUT,
         )
         r.raise_for_status()
+        print(f"[{now_str()}] Telegram message sent.")
     except Exception as e:
-        print(f"Telegram send error: {e}")
+        print(f"[{now_str()}] Telegram send error: {e}")
 
 
 def safe_get_json(url: str, params: Optional[dict] = None) -> Any:
@@ -202,7 +207,7 @@ def fetch_watchlist_file() -> List[Dict[str, Any]]:
                 items.append(parsed)
         return items
     except Exception as e:
-        print(f"Watchlist fetch error: {e}")
+        print(f"[{now_str()}] Watchlist fetch error: {e}")
         return []
 
 
@@ -235,7 +240,7 @@ def discover_markets() -> List[Dict[str, Any]]:
         try:
             batch = safe_get_json(f"{GAMMA_BASE}/markets", params=params)
         except Exception as e:
-            print(f"Discover markets error: {e}")
+            print(f"[{now_str()}] Discover markets error: {e}")
             break
 
         if not isinstance(batch, list) or not batch:
@@ -484,7 +489,7 @@ def scan_markets() -> Dict[str, Any]:
                 counts["skip"] += 1
 
         except Exception as e:
-            print(f"Market scan error for {item}: {e}")
+            print(f"[{now_str()}] Market scan error for {item}: {e}")
             counts["skip"] += 1
 
     results.sort(key=lambda x: x.get("imbalance", 999))
@@ -542,28 +547,40 @@ def auto_scan_loop() -> None:
     global zero_scan_count, zero_window_started_at
 
     if not TELEGRAM_CHAT_ID:
-        print("Auto scan disabled: TELEGRAM_CHAT_ID not set")
+        print(f"[{now_str()}] Auto scan disabled: TELEGRAM_CHAT_ID not set")
         return
 
     if SCAN_EVERY_SECONDS <= 0:
-        print("Auto scan disabled: SCAN_EVERY_SECONDS <= 0")
+        print(f"[{now_str()}] Auto scan disabled: SCAN_EVERY_SECONDS <= 0")
         return
 
-    print(f"Auto scan loop started. Every {SCAN_EVERY_SECONDS} seconds.")
+    print(f"[{now_str()}] Auto scan loop started. Every {SCAN_EVERY_SECONDS} seconds.")
 
     while True:
         try:
+            print(f"[{now_str()}] Auto scan tick")
             scan = scan_markets()
+
+            print(
+                f"[{now_str()}] Scan result | "
+                f"total={scan['counts']['total']} "
+                f"alert={scan['counts']['alert']} "
+                f"watch={scan['counts']['watch']} "
+                f"skip={scan['counts']['skip']}"
+            )
+
             candidates = qualifying_results(scan)[:MAX_ALERTS_PER_SCAN]
             now = time.time()
 
             if candidates:
                 zero_scan_count = 0
                 zero_window_started_at = now
+                print(f"[{now_str()}] Qualifying candidates found: {len(candidates)}")
 
                 for r in candidates:
                     dedupe_key = f"{r.get('slug')}|{r.get('category')}"
                     if already_sent(dedupe_key):
+                        print(f"[{now_str()}] Deduped signal: {dedupe_key}")
                         continue
 
                     send_telegram_message(TELEGRAM_CHAT_ID, format_market_block(r))
@@ -572,7 +589,18 @@ def auto_scan_loop() -> None:
                 zero_scan_count += 1
                 elapsed = now - zero_window_started_at
 
+                print(
+                    f"[{now_str()}] No qualifying markets | "
+                    f"elapsed_seconds={int(elapsed)} "
+                    f"empty_scans={zero_scan_count}"
+                )
+
                 if elapsed >= ZERO_SUMMARY_EVERY_SECONDS and zero_scan_count > 0:
+                    print(
+                        f"[{now_str()}] Zero summary trigger | "
+                        f"elapsed_seconds={int(elapsed)} "
+                        f"empty_scans={zero_scan_count}"
+                    )
                     send_telegram_message(
                         TELEGRAM_CHAT_ID,
                         format_zero_summary(zero_scan_count, int(elapsed)),
@@ -581,7 +609,7 @@ def auto_scan_loop() -> None:
                     zero_window_started_at = now
 
         except Exception as e:
-            print(f"Auto scan error: {e}")
+            print(f"[{now_str()}] Auto scan error: {e}")
 
         time.sleep(SCAN_EVERY_SECONDS)
 
@@ -594,11 +622,11 @@ def start_background_worker_once() -> None:
         _background_started = True
         t = threading.Thread(target=auto_scan_loop, daemon=True)
         t.start()
+        print(f"[{now_str()}] Background worker started.")
 
 
-@app.before_request
-def ensure_worker_started():
-    start_background_worker_once()
+# Start worker at boot
+start_background_worker_once()
 
 
 # =========================================
@@ -640,7 +668,7 @@ def scan_route():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
-    print("WEBHOOK HIT:", data)
+    print(f"[{now_str()}] WEBHOOK HIT: {data}")
 
     message = data.get("message", {})
     chat = message.get("chat", {})

@@ -23,30 +23,30 @@ MARKETS_URL = os.getenv(
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 BOT_LABEL = os.getenv("BOT_LABEL", "telegram-market-bot").strip()
 
-ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.35"))
-WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.25"))
+ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.20"))
+WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.12"))
 SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "false").lower() == "true"
 
 BASELINE_PROB = float(os.getenv("BASELINE_PROB", "0.50"))
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "100000"))
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "50000"))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.05"))
 MIN_BID = float(os.getenv("MIN_BID", "0.01"))
 MAX_ASK = float(os.getenv("MAX_ASK", "0.99"))
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 DEDUP_SECONDS = int(os.getenv("DEDUP_SECONDS", "3600"))
-SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "300"))
+SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "240"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "3"))
-ZERO_SUMMARY_EVERY_SECONDS = int(os.getenv("ZERO_SUMMARY_EVERY_SECONDS", "3600"))
+ZERO_SUMMARY_EVERY_SECONDS = int(os.getenv("ZERO_SUMMARY_EVERY_SECONDS", "7200"))
 
-AUTO_DISCOVER = os.getenv("AUTO_DISCOVER", "false").lower() == "true"
-DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "100"))
+AUTO_DISCOVER = os.getenv("AUTO_DISCOVER", "true").lower() == "true"
+DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "250"))
 DISCOVER_PAGE_SIZE = int(os.getenv("DISCOVER_PAGE_SIZE", "100"))
-DISCOVER_MIN_VOLUME = float(os.getenv("DISCOVER_MIN_VOLUME", "250000"))
-DISCOVER_MIN_LIQUIDITY = float(os.getenv("DISCOVER_MIN_LIQUIDITY", "100000"))
+DISCOVER_MIN_VOLUME = float(os.getenv("DISCOVER_MIN_VOLUME", "100000"))
+DISCOVER_MIN_LIQUIDITY = float(os.getenv("DISCOVER_MIN_LIQUIDITY", "50000"))
 DISCOVER_KEYWORDS = os.getenv(
     "DISCOVER_KEYWORDS",
-    "bitcoin,btc,ethereum,eth,solana,sol,crypto,election,politics,president,primary,senate,house",
+    "bitcoin,btc,ethereum,eth,crypto,stocks,market,fed,rate,inflation,oil,sp500,nasdaq,election,president,politics",
 ).strip()
 
 ENABLE_YES_NO_ONLY = os.getenv("ENABLE_YES_NO_ONLY", "true").lower() == "true"
@@ -71,7 +71,7 @@ def send_telegram_message(chat_id: str, text: str) -> None:
         return
 
     try:
-        requests.post(
+        r = requests.post(
             f"{TELEGRAM_API_URL}/sendMessage",
             json={
                 "chat_id": chat_id,
@@ -80,6 +80,7 @@ def send_telegram_message(chat_id: str, text: str) -> None:
             },
             timeout=REQUEST_TIMEOUT,
         )
+        r.raise_for_status()
     except Exception as e:
         print(f"Telegram send error: {e}")
 
@@ -172,7 +173,7 @@ def is_yes_no_market(market_data: Dict[str, Any]) -> bool:
 
 
 # =========================================
-# WATCHLIST
+# WATCHLIST / DISCOVERY
 # =========================================
 def parse_watchlist_line(line: str) -> Optional[Dict[str, Any]]:
     raw = line.strip()
@@ -394,7 +395,10 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
     last_trade = to_float(book.get("last_trade_price"), 0.0)
     spread = round(best_ask - best_bid, 6) if best_bid > 0 and best_ask > 0 else 0.0
     live_prob, price_source = choose_live_prob(best_bid, best_ask, last_trade)
-    liquidity = to_float(market_data.get("liquidityClob", market_data.get("liquidity", 0.0)), 0.0)
+    liquidity = to_float(
+        market_data.get("liquidityClob", market_data.get("liquidity", 0.0)),
+        0.0,
+    )
 
     label = market_data.get("question") or market_data.get("title") or market_data.get("slug") or slug
 
@@ -488,7 +492,10 @@ def scan_markets() -> Dict[str, Any]:
 
 
 def qualifying_results(scan: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return [r for r in scan["results"] if r["category"] == "ALERT" or (r["category"] == "WATCH" and SEND_WATCH_ALERTS)]
+    return [
+        r for r in scan["results"]
+        if r["category"] == "ALERT" or (r["category"] == "WATCH" and SEND_WATCH_ALERTS)
+    ]
 
 
 def format_market_block(r: Dict[str, Any]) -> str:
@@ -519,10 +526,7 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
     if not top:
         return None
 
-    lines = [
-        f"Qualifying markets: {len(top)}",
-        "",
-    ]
+    lines = [f"Qualifying markets: {len(top)}", ""]
 
     for r in top[:5]:
         lines.append(format_market_block(r))
@@ -592,7 +596,9 @@ def start_background_worker_once() -> None:
         t.start()
 
 
-start_background_worker_once()
+@app.before_request
+def ensure_worker_started():
+    start_background_worker_once()
 
 
 # =========================================
@@ -634,6 +640,8 @@ def scan_route():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
+    print("WEBHOOK HIT:", data)
+
     message = data.get("message", {})
     chat = message.get("chat", {})
     chat_id = str(chat.get("id", "")).strip()
@@ -673,8 +681,8 @@ def webhook():
         return jsonify({"ok": True})
 
     return jsonify({"ok": True})
-    
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)

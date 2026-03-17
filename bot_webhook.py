@@ -27,6 +27,7 @@ BOT_LABEL = os.getenv("BOT_LABEL", "telegram-market-bot").strip()
 ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.08"))
 WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.03"))
 SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "true").lower() == "true"
+DEBUG_SCAN_OUTPUT = os.getenv("DEBUG_SCAN_OUTPUT", "false").lower() == "true"
 
 BASELINE_PROB = float(os.getenv("BASELINE_PROB", "0.40"))
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "25000"))
@@ -34,14 +35,14 @@ MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))
 MIN_BID = float(os.getenv("MIN_BID", "0.01"))
 MAX_ASK = float(os.getenv("MAX_ASK", "0.99"))
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 DEDUP_SECONDS = int(os.getenv("DEDUP_SECONDS", "3600"))
 SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "0"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "5"))
 ZERO_SUMMARY_EVERY_SECONDS = int(os.getenv("ZERO_SUMMARY_EVERY_SECONDS", "21600"))
 
 AUTO_DISCOVER = os.getenv("AUTO_DISCOVER", "true").lower() == "true"
-DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "250"))
+DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "100"))
 DISCOVER_PAGE_SIZE = int(os.getenv("DISCOVER_PAGE_SIZE", "100"))
 DISCOVER_MIN_VOLUME = float(os.getenv("DISCOVER_MIN_VOLUME", "100000"))
 DISCOVER_MIN_LIQUIDITY = float(os.getenv("DISCOVER_MIN_LIQUIDITY", "50000"))
@@ -539,20 +540,27 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =========================================
-# CLASSIFICATION
+# CLASSIFICATION / SCORING
 # =========================================
 def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     liquidity = to_float(m.get("liquidity", 0), 0.0)
-    if liquidity < MIN_LIQUIDITY:
-        return "SKIP", "Liquidity too low"
-
     spread = to_float(m.get("spread", 0), 0.0)
-    if spread > MAX_SPREAD:
-        return "SKIP", "Spread too wide"
-
     best_bid = to_float(m.get("best_bid", 0), 0.0)
     best_ask = to_float(m.get("best_ask", 0), 0.0)
     price_source = (m.get("price_source") or "").strip()
+    live_prob = to_float(m.get("live_prob", 0.0), 0.0)
+    baseline_prob = to_float(m.get("baseline_prob", BASELINE_PROB), BASELINE_PROB)
+    imbalance = live_prob - baseline_prob
+
+    m["imbalance"] = imbalance
+    m["yes_prob"] = live_prob
+    m["no_prob"] = 1.0 - live_prob
+
+    if liquidity < MIN_LIQUIDITY:
+        return "SKIP", "Liquidity too low"
+
+    if spread > MAX_SPREAD:
+        return "SKIP", "Spread too wide"
 
     if best_bid <= 0 or best_ask <= 0:
         return "SKIP", "Incomplete book"
@@ -563,19 +571,29 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     if best_bid <= MIN_BID and best_ask >= MAX_ASK:
         return "SKIP", "Dead quote"
 
-    live_prob = to_float(m.get("live_prob", 0.0), 0.0)
-    baseline_prob = to_float(m.get("baseline_prob", BASELINE_PROB), BASELINE_PROB)
-    imbalance = live_prob - baseline_prob
+    # Baseline is secondary, not primary.
+    # Score is driven more by tradability and quote structure.
+    spread_score = max(0.0, MAX_SPREAD - spread) / max(MAX_SPREAD, 1e-9)
+    liquidity_score = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 2.0)
+    book_score = 1.0 if best_bid >= MIN_BID and best_ask < MAX_ASK else 0.0
+    imbalance_score = abs(imbalance)
 
-    m["imbalance"] = imbalance
-    m["yes_prob"] = live_prob
-    m["no_prob"] = 1.0 - live_prob
+    composite = (
+        (spread_score * 0.35)
+        + (min(liquidity_score, 1.0) * 0.25)
+        + (book_score * 0.15)
+        + (imbalance_score * 0.25)
+    )
 
-    if imbalance <= ALERT_THRESHOLD:
-        return "ALERT", f"Strong signal: {imbalance:.3f}"
-    if imbalance <= WATCH_THRESHOLD:
-        return "WATCH", f"Watch signal: {imbalance:.3f}"
-    return "SKIP", None
+    m["composite_score"] = round(composite, 4)
+
+    if imbalance <= ALERT_THRESHOLD and composite >= 0.55:
+        return "ALERT", f"Signal score={composite:.3f} diff={imbalance:.3f}"
+
+    if imbalance <= WATCH_THRESHOLD and composite >= 0.40:
+        return "WATCH", f"Watch score={composite:.3f} diff={imbalance:.3f}"
+
+    return "SKIP", "No qualifying signal"
 
 
 # =========================================
@@ -608,7 +626,14 @@ def scan_markets() -> Dict[str, Any]:
             print(f"[{now_str()}] Market scan error for {item}: {e}")
             counts["skip"] += 1
 
-    results.sort(key=lambda x: x.get("imbalance", 999))
+    results.sort(
+        key=lambda x: (
+            0 if x.get("category") == "ALERT" else 1 if x.get("category") == "WATCH" else 2,
+            -to_float(x.get("composite_score"), 0.0),
+            x.get("imbalance", 999),
+        )
+    )
+
     print(
         f"[{now_str()}] Scan complete | "
         f"total={counts['total']} alert={counts['alert']} "
@@ -636,7 +661,8 @@ def format_market_block(r: Dict[str, Any]) -> str:
         f"slug={r.get('slug', '')}{end_line}\n"
         f"YES={yes_prob:.1%} NO={no_prob:.1%} "
         f"base={r.get('baseline_prob', 0):.1%} "
-        f"diff={r.get('imbalance', 0):.3f}\n"
+        f"diff={r.get('imbalance', 0):.3f} "
+        f"score={r.get('composite_score', 0):.3f}\n"
         f"bid={r.get('best_bid', 0):.3f} "
         f"ask={r.get('best_ask', 0):.3f} "
         f"spread={r.get('spread', 0):.3f} "
@@ -652,27 +678,58 @@ def format_zero_summary(zero_count: int, seconds_in_window: int) -> str:
 
 def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
     top = qualifying_results(scan)
-    if not top:
-        return None
-
     counts = scan.get("counts", {})
-    lines = [
-        "Scan complete",
-        "",
-        f"Total: {counts.get('total', 0)}",
-        f"Alerts: {counts.get('alert', 0)}",
-        f"Watch: {counts.get('watch', 0)}",
-        f"Skip: {counts.get('skip', 0)}",
-        "",
-        f"Qualifying markets: {len(top)}",
-        "",
-    ]
+    results = scan.get("results", [])
 
-    for r in top[:5]:
-        lines.append(format_market_block(r))
-        lines.append("")
+    if top:
+        lines = [
+            "Scan complete",
+            "",
+            f"Total: {counts.get('total', 0)}",
+            f"Alerts: {counts.get('alert', 0)}",
+            f"Watch: {counts.get('watch', 0)}",
+            f"Skip: {counts.get('skip', 0)}",
+            "",
+            f"Qualifying markets: {len(top)}",
+            "",
+        ]
 
-    return "\n".join(lines).strip()
+        for r in top[:5]:
+            lines.append(format_market_block(r))
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
+    if DEBUG_SCAN_OUTPUT:
+        lines = [
+            "Scan finished. No qualifying markets.",
+            "",
+            f"Total: {counts.get('total', 0)}",
+            f"Alerts: {counts.get('alert', 0)}",
+            f"Watch: {counts.get('watch', 0)}",
+            f"Skip: {counts.get('skip', 0)}",
+        ]
+
+        fallback = results[:3]
+        if fallback:
+            lines.extend(["", "Top candidates:", ""])
+            for r in fallback:
+                lines.append(
+                    f"{r.get('category', 'SKIP')} | {r.get('label', '')}\n"
+                    f"slug={r.get('slug', '')}\n"
+                    f"reason={r.get('reason') or 'No qualifying signal'}\n"
+                    f"ends={r.get('end_dt', '') or 'unknown'}\n"
+                    f"score={r.get('composite_score', 0):.3f} "
+                    f"bid={r.get('best_bid', 0):.3f} "
+                    f"ask={r.get('best_ask', 0):.3f} "
+                    f"spread={r.get('spread', 0):.3f} "
+                    f"liq={r.get('liquidity', 0):.0f}"
+                )
+                lines.append("")
+
+        return "\n".join(lines).strip()
+
+    return None
 
 
 def run_manual_scan_async(chat_id: str) -> None:
@@ -709,9 +766,7 @@ def auto_scan_loop() -> None:
 
     while True:
         try:
-            print(f"[{now_str()}] Auto scan tick")
             scan = scan_markets()
-
             candidates = qualifying_results(scan)[:MAX_ALERTS_PER_SCAN]
             now = time.time()
 
@@ -779,8 +834,8 @@ def health():
     return jsonify({
         "ok": True,
         "service": BOT_LABEL,
-        "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
         "auto_discover": AUTO_DISCOVER,
+        "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
         "enable_yes_no_only": ENABLE_YES_NO_ONLY,
         "scan_every_seconds": SCAN_EVERY_SECONDS,
         "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
@@ -794,6 +849,7 @@ def health():
         "alert_threshold": ALERT_THRESHOLD,
         "watch_threshold": WATCH_THRESHOLD,
         "send_watch_alerts": SEND_WATCH_ALERTS,
+        "debug_scan_output": DEBUG_SCAN_OUTPUT,
         "manual_scan_in_progress": manual_scan_in_progress,
     })
 
@@ -835,6 +891,7 @@ def webhook():
             f"alert_threshold={ALERT_THRESHOLD}\n"
             f"watch_threshold={WATCH_THRESHOLD}\n"
             f"send_watch_alerts={SEND_WATCH_ALERTS}\n"
+            f"debug_scan_output={DEBUG_SCAN_OUTPUT}\n"
             f"scan_every_seconds={SCAN_EVERY_SECONDS}\n"
             f"short_term_only={SHORT_TERM_ONLY}\n"
             f"max_days_to_end={MAX_DAYS_TO_END}\n"

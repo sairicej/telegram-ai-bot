@@ -30,10 +30,10 @@ SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "true").lower() == "true"
 DEBUG_SCAN_OUTPUT = os.getenv("DEBUG_SCAN_OUTPUT", "false").lower() == "true"
 
 BASELINE_PROB = float(os.getenv("BASELINE_PROB", "0.40"))
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "25000"))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))
-MIN_BID = float(os.getenv("MIN_BID", "0.01"))
-MAX_ASK = float(os.getenv("MAX_ASK", "0.99"))
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "50000"))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.08"))
+MIN_BID = float(os.getenv("MIN_BID", "0.02"))
+MAX_ASK = float(os.getenv("MAX_ASK", "0.98"))
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 DEDUP_SECONDS = int(os.getenv("DEDUP_SECONDS", "3600"))
@@ -56,6 +56,10 @@ TEST_MARKET_SLUG = os.getenv("TEST_MARKET_SLUG", "").strip()
 
 SHORT_TERM_ONLY = os.getenv("SHORT_TERM_ONLY", "true").lower() == "true"
 MAX_DAYS_TO_END = int(os.getenv("MAX_DAYS_TO_END", "60"))
+
+# Tiny test-position intent: use execution-friendly proxies.
+TARGET_MIN_TEST_POSITION_USD = float(os.getenv("TARGET_MIN_TEST_POSITION_USD", "1"))
+TARGET_MAX_TEST_POSITION_USD = float(os.getenv("TARGET_MAX_TEST_POSITION_USD", "5"))
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
@@ -236,7 +240,6 @@ def is_within_short_term_window(market_data: Dict[str, Any]) -> bool:
 
     now = datetime.now(timezone.utc)
     max_dt = now + timedelta(days=MAX_DAYS_TO_END)
-
     return now <= end_dt <= max_dt
 
 
@@ -355,13 +358,10 @@ def discover_markets() -> List[Dict[str, Any]]:
 
             if not slug or slug in seen:
                 continue
-
             if ENABLE_YES_NO_ONLY and not is_yes_no_market(m):
                 continue
-
             if SHORT_TERM_ONLY and not is_within_short_term_window(m):
                 continue
-
             if not matches_keywords(f"{slug} {question}"):
                 continue
 
@@ -420,10 +420,8 @@ def pick_best_market_from_event(event_data: Dict[str, Any]) -> Optional[Dict[str
 
         if ENABLE_YES_NO_ONLY and not is_yes_no_market(m):
             continue
-
         if SHORT_TERM_ONLY and not is_within_short_term_window(m):
             continue
-
         if active and not closed:
             filtered.append((liquidity, m))
 
@@ -481,14 +479,40 @@ def choose_live_prob(best_bid: float, best_ask: float, last_trade: float) -> Tup
 
     if last_trade > 0:
         return last_trade, "last_trade"
-
     if best_bid > 0:
         return best_bid, "best_bid"
-
     if best_ask > 0:
         return best_ask, "best_ask"
 
     return 0.0, "none"
+
+
+def estimate_test_position_quality(best_bid: float, best_ask: float, liquidity: float) -> Tuple[float, str]:
+    """
+    Proxy for small $1-$5 entries.
+    We do not have full depth sizing here, so use execution-friendly book structure.
+    """
+    if best_bid <= 0 or best_ask <= 0:
+        return 0.0, "no-two-sided-book"
+
+    if best_ask >= 0.995:
+        return 0.0, "ask-pinned"
+    if best_bid <= 0.001:
+        return 0.0, "bid-dead"
+
+    spread = max(0.0, best_ask - best_bid)
+
+    spread_component = max(0.0, 0.10 - spread) / 0.10
+    liquidity_component = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 1.0)
+
+    score = (spread_component * 0.65) + (liquidity_component * 0.35)
+
+    if score >= 0.75:
+        return round(score, 4), "small-size-friendly"
+    if score >= 0.45:
+        return round(score, 4), "small-size-possible"
+
+    return round(score, 4), "small-size-weak"
 
 
 def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -513,10 +537,9 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
     last_trade = to_float(book.get("last_trade_price"), 0.0)
     spread = round(best_ask - best_bid, 6) if best_bid > 0 and best_ask > 0 else 0.0
     live_prob, price_source = choose_live_prob(best_bid, best_ask, last_trade)
-    liquidity = to_float(
-        market_data.get("liquidityClob", market_data.get("liquidity", 0.0)),
-        0.0,
-    )
+    liquidity = to_float(market_data.get("liquidityClob", market_data.get("liquidity", 0.0)), 0.0)
+
+    tiny_position_score, tiny_position_note = estimate_test_position_quality(best_bid, best_ask, liquidity)
 
     label = market_data.get("question") or market_data.get("title") or market_data.get("slug") or slug
     end_dt = extract_end_datetime(market_data)
@@ -536,6 +559,8 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
         "last_trade_price": last_trade,
         "token_id": token_id,
         "end_dt": end_dt.isoformat() if end_dt else "",
+        "tiny_position_score": tiny_position_score,
+        "tiny_position_note": tiny_position_note,
     }
 
 
@@ -551,6 +576,7 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     live_prob = to_float(m.get("live_prob", 0.0), 0.0)
     baseline_prob = to_float(m.get("baseline_prob", BASELINE_PROB), BASELINE_PROB)
     imbalance = live_prob - baseline_prob
+    tiny_position_score = to_float(m.get("tiny_position_score", 0.0), 0.0)
 
     m["imbalance"] = imbalance
     m["yes_prob"] = live_prob
@@ -559,38 +585,43 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     if liquidity < MIN_LIQUIDITY:
         return "SKIP", "Liquidity too low"
 
-    if spread > MAX_SPREAD:
-        return "SKIP", "Spread too wide"
-
     if best_bid <= 0 or best_ask <= 0:
         return "SKIP", "Incomplete book"
+
+    if best_bid < MIN_BID:
+        return "SKIP", "Bid too low"
+
+    if best_ask >= MAX_ASK:
+        return "SKIP", "Ask too high"
+
+    if spread > MAX_SPREAD:
+        return "SKIP", "Spread too wide"
 
     if price_source == "last_trade":
         return "SKIP", "Last trade only"
 
-    if best_bid <= MIN_BID and best_ask >= MAX_ASK:
-        return "SKIP", "Dead quote"
+    if tiny_position_score < 0.45:
+        return "SKIP", f"Small-size weak ({m.get('tiny_position_note', 'weak')})"
 
-    # Baseline is secondary, not primary.
-    # Score is driven more by tradability and quote structure.
+    # Execution/tradability first. Baseline diff is secondary.
     spread_score = max(0.0, MAX_SPREAD - spread) / max(MAX_SPREAD, 1e-9)
-    liquidity_score = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 2.0)
-    book_score = 1.0 if best_bid >= MIN_BID and best_ask < MAX_ASK else 0.0
-    imbalance_score = abs(imbalance)
+    liquidity_score = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 1.0)
+    book_score = 1.0
+    imbalance_score = min(abs(imbalance), 0.5) / 0.5
 
     composite = (
-        (spread_score * 0.35)
-        + (min(liquidity_score, 1.0) * 0.25)
-        + (book_score * 0.15)
-        + (imbalance_score * 0.25)
+        (spread_score * 0.30)
+        + (liquidity_score * 0.20)
+        + (book_score * 0.10)
+        + (tiny_position_score * 0.25)
+        + (imbalance_score * 0.15)
     )
-
     m["composite_score"] = round(composite, 4)
 
-    if imbalance <= ALERT_THRESHOLD and composite >= 0.55:
+    if imbalance <= ALERT_THRESHOLD and composite >= 0.62:
         return "ALERT", f"Signal score={composite:.3f} diff={imbalance:.3f}"
 
-    if imbalance <= WATCH_THRESHOLD and composite >= 0.40:
+    if imbalance <= WATCH_THRESHOLD and composite >= 0.50:
         return "WATCH", f"Watch score={composite:.3f} diff={imbalance:.3f}"
 
     return "SKIP", "No qualifying signal"
@@ -663,6 +694,8 @@ def format_market_block(r: Dict[str, Any]) -> str:
         f"base={r.get('baseline_prob', 0):.1%} "
         f"diff={r.get('imbalance', 0):.3f} "
         f"score={r.get('composite_score', 0):.3f}\n"
+        f"tiny_size={r.get('tiny_position_note', '')} "
+        f"tiny_score={r.get('tiny_position_score', 0):.3f}\n"
         f"bid={r.get('best_bid', 0):.3f} "
         f"ask={r.get('best_ask', 0):.3f} "
         f"spread={r.get('spread', 0):.3f} "
@@ -719,6 +752,8 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
                     f"slug={r.get('slug', '')}\n"
                     f"reason={r.get('reason') or 'No qualifying signal'}\n"
                     f"ends={r.get('end_dt', '') or 'unknown'}\n"
+                    f"tiny_size={r.get('tiny_position_note', '')} "
+                    f"tiny_score={r.get('tiny_position_score', 0):.3f}\n"
                     f"score={r.get('composite_score', 0):.3f} "
                     f"bid={r.get('best_bid', 0):.3f} "
                     f"ask={r.get('best_ask', 0):.3f} "
@@ -851,6 +886,8 @@ def health():
         "send_watch_alerts": SEND_WATCH_ALERTS,
         "debug_scan_output": DEBUG_SCAN_OUTPUT,
         "manual_scan_in_progress": manual_scan_in_progress,
+        "target_min_test_position_usd": TARGET_MIN_TEST_POSITION_USD,
+        "target_max_test_position_usd": TARGET_MAX_TEST_POSITION_USD,
     })
 
 
@@ -903,6 +940,8 @@ def webhook():
             f"auto_discover={AUTO_DISCOVER}\n"
             f"enable_yes_no_only={ENABLE_YES_NO_ONLY}\n"
             f"manual_scan_in_progress={manual_scan_in_progress}\n"
+            f"target_min_test_position_usd={TARGET_MIN_TEST_POSITION_USD}\n"
+            f"target_max_test_position_usd={TARGET_MAX_TEST_POSITION_USD}\n"
             f"test_market_slug={TEST_MARKET_SLUG or 'none'}"
         )
         send_telegram_message(chat_id, msg)
@@ -913,7 +952,6 @@ def webhook():
             if manual_scan_in_progress:
                 send_telegram_message(chat_id, "Scan already running. Wait for result.")
                 return jsonify({"ok": True})
-
             manual_scan_in_progress = True
 
         send_telegram_message(chat_id, "Running scan...")

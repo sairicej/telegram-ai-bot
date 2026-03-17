@@ -31,9 +31,9 @@ DEBUG_SCAN_OUTPUT = os.getenv("DEBUG_SCAN_OUTPUT", "false").lower() == "true"
 
 BASELINE_PROB = float(os.getenv("BASELINE_PROB", "0.40"))
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "50000"))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.08"))
-MIN_BID = float(os.getenv("MIN_BID", "0.02"))
-MAX_ASK = float(os.getenv("MAX_ASK", "0.98"))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.06"))
+MIN_BID = float(os.getenv("MIN_BID", "0.03"))
+MAX_ASK = float(os.getenv("MAX_ASK", "0.95"))
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 DEDUP_SECONDS = int(os.getenv("DEDUP_SECONDS", "3600"))
@@ -42,7 +42,7 @@ MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "5"))
 ZERO_SUMMARY_EVERY_SECONDS = int(os.getenv("ZERO_SUMMARY_EVERY_SECONDS", "21600"))
 
 AUTO_DISCOVER = os.getenv("AUTO_DISCOVER", "true").lower() == "true"
-DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "100"))
+DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "75"))
 DISCOVER_PAGE_SIZE = int(os.getenv("DISCOVER_PAGE_SIZE", "100"))
 DISCOVER_MIN_VOLUME = float(os.getenv("DISCOVER_MIN_VOLUME", "100000"))
 DISCOVER_MIN_LIQUIDITY = float(os.getenv("DISCOVER_MIN_LIQUIDITY", "50000"))
@@ -55,9 +55,8 @@ ENABLE_YES_NO_ONLY = os.getenv("ENABLE_YES_NO_ONLY", "true").lower() == "true"
 TEST_MARKET_SLUG = os.getenv("TEST_MARKET_SLUG", "").strip()
 
 SHORT_TERM_ONLY = os.getenv("SHORT_TERM_ONLY", "true").lower() == "true"
-MAX_DAYS_TO_END = int(os.getenv("MAX_DAYS_TO_END", "60"))
+MAX_DAYS_TO_END = int(os.getenv("MAX_DAYS_TO_END", "45"))
 
-# Tiny test-position intent: use execution-friendly proxies.
 TARGET_MIN_TEST_POSITION_USD = float(os.getenv("TARGET_MIN_TEST_POSITION_USD", "1"))
 TARGET_MAX_TEST_POSITION_USD = float(os.getenv("TARGET_MAX_TEST_POSITION_USD", "5"))
 
@@ -272,6 +271,18 @@ def is_yes_no_market(market_data: Dict[str, Any]) -> bool:
     return cleaned == {"yes", "no"}
 
 
+def is_dead_book(best_bid: float, best_ask: float) -> Tuple[bool, str]:
+    if best_bid <= 0:
+        return True, "no-bid"
+    if best_ask <= 0:
+        return True, "no-ask"
+    if best_ask >= 0.995:
+        return True, "ask-pinned"
+    if best_ask - best_bid <= 0:
+        return True, "no-spread"
+    return False, ""
+
+
 # =========================================
 # WATCHLIST / DISCOVERY
 # =========================================
@@ -476,32 +487,24 @@ def choose_live_prob(best_bid: float, best_ask: float, last_trade: float) -> Tup
     if best_bid > 0 and best_ask > 0 and best_ask >= best_bid:
         midpoint = round((best_bid + best_ask) / 2, 6)
         return midpoint, "midpoint"
-
     if last_trade > 0:
         return last_trade, "last_trade"
     if best_bid > 0:
         return best_bid, "best_bid"
     if best_ask > 0:
         return best_ask, "best_ask"
-
     return 0.0, "none"
 
 
 def estimate_test_position_quality(best_bid: float, best_ask: float, liquidity: float) -> Tuple[float, str]:
-    """
-    Proxy for small $1-$5 entries.
-    We do not have full depth sizing here, so use execution-friendly book structure.
-    """
     if best_bid <= 0 or best_ask <= 0:
         return 0.0, "no-two-sided-book"
-
     if best_ask >= 0.995:
         return 0.0, "ask-pinned"
     if best_bid <= 0.001:
         return 0.0, "bid-dead"
 
     spread = max(0.0, best_ask - best_bid)
-
     spread_component = max(0.0, 0.10 - spread) / 0.10
     liquidity_component = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 1.0)
 
@@ -511,7 +514,6 @@ def estimate_test_position_quality(best_bid: float, best_ask: float, liquidity: 
         return round(score, 4), "small-size-friendly"
     if score >= 0.45:
         return round(score, 4), "small-size-possible"
-
     return round(score, 4), "small-size-weak"
 
 
@@ -535,6 +537,9 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
     best_bid = to_float(bids[0].get("price")) if bids else 0.0
     best_ask = to_float(asks[0].get("price")) if asks else 0.0
     last_trade = to_float(book.get("last_trade_price"), 0.0)
+
+    dead_book, dead_reason = is_dead_book(best_bid, best_ask)
+
     spread = round(best_ask - best_bid, 6) if best_bid > 0 and best_ask > 0 else 0.0
     live_prob, price_source = choose_live_prob(best_bid, best_ask, last_trade)
     liquidity = to_float(market_data.get("liquidityClob", market_data.get("liquidity", 0.0)), 0.0)
@@ -561,6 +566,8 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
         "end_dt": end_dt.isoformat() if end_dt else "",
         "tiny_position_score": tiny_position_score,
         "tiny_position_note": tiny_position_note,
+        "dead_book": dead_book,
+        "dead_reason": dead_reason,
     }
 
 
@@ -581,6 +588,9 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     m["imbalance"] = imbalance
     m["yes_prob"] = live_prob
     m["no_prob"] = 1.0 - live_prob
+
+    if m.get("dead_book"):
+        return "SKIP", f"Dead book ({m.get('dead_reason')})"
 
     if liquidity < MIN_LIQUIDITY:
         return "SKIP", "Liquidity too low"
@@ -603,7 +613,6 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     if tiny_position_score < 0.45:
         return "SKIP", f"Small-size weak ({m.get('tiny_position_note', 'weak')})"
 
-    # Execution/tradability first. Baseline diff is secondary.
     spread_score = max(0.0, MAX_SPREAD - spread) / max(MAX_SPREAD, 1e-9)
     liquidity_score = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 1.0)
     book_score = 1.0
@@ -743,14 +752,17 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
             f"Skip: {counts.get('skip', 0)}",
         ]
 
-        fallback = results[:3]
+        fallback = [r for r in results if not r.get("dead_book")][:3]
+        if not fallback:
+            fallback = results[:3]
+
         if fallback:
             lines.extend(["", "Top candidates:", ""])
             for r in fallback:
                 lines.append(
                     f"{r.get('category', 'SKIP')} | {r.get('label', '')}\n"
                     f"slug={r.get('slug', '')}\n"
-                    f"reason={r.get('reason') or 'No qualifying signal'}\n"
+                    f"reason={r.get('reason') or r.get('dead_reason') or 'No qualifying signal'}\n"
                     f"ends={r.get('end_dt', '') or 'unknown'}\n"
                     f"tiny_size={r.get('tiny_position_note', '')} "
                     f"tiny_score={r.get('tiny_position_score', 0):.3f}\n"

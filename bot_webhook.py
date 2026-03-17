@@ -71,6 +71,15 @@ MAX_DAYS_TO_END = int(os.getenv("MAX_DAYS_TO_END", "30"))
 TARGET_MIN_TEST_POSITION_USD = float(os.getenv("TARGET_MIN_TEST_POSITION_USD", "1"))
 TARGET_MAX_TEST_POSITION_USD = float(os.getenv("TARGET_MAX_TEST_POSITION_USD", "5"))
 
+# Stronger book quality filters
+EARLY_MIN_BID = float(os.getenv("EARLY_MIN_BID", "0.03"))
+EARLY_MAX_ASK = float(os.getenv("EARLY_MAX_ASK", "0.97"))
+EARLY_MAX_SPREAD = float(os.getenv("EARLY_MAX_SPREAD", "0.20"))
+MID_PRICE_MIN = float(os.getenv("MID_PRICE_MIN", "0.05"))
+MID_PRICE_MAX = float(os.getenv("MID_PRICE_MAX", "0.95"))
+
+BLOCK_CRYPTO_LADDERS = os.getenv("BLOCK_CRYPTO_LADDERS", "true").lower() == "true"
+
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 
@@ -300,6 +309,34 @@ def is_allowed_topic(text: str) -> bool:
     return any(k in t for k in CATEGORY_WHITELIST)
 
 
+def looks_like_crypto_ladder_market(text: str) -> bool:
+    if not BLOCK_CRYPTO_LADDERS:
+        return False
+
+    t = (text or "").lower()
+    crypto_hit = any(k in t for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol"])
+    if not crypto_hit:
+        return False
+
+    ladder_phrases = [
+        "price of bitcoin be above",
+        "price of bitcoin be below",
+        "price of ethereum be above",
+        "price of ethereum be below",
+        "price of solana be above",
+        "price of solana be below",
+        "will bitcoin reach",
+        "will ethereum reach",
+        "will solana reach",
+        "will bitcoin hit",
+        "will ethereum hit",
+        "will solana hit",
+        "above $",
+        "below $",
+    ]
+    return any(p in t for p in ladder_phrases)
+
+
 # =========================================
 # MARKET HELPERS
 # =========================================
@@ -334,10 +371,22 @@ def is_dead_book(best_bid: float, best_ask: float) -> Tuple[bool, str]:
         return True, "no-bid"
     if best_ask <= 0:
         return True, "no-ask"
-    if best_ask >= 0.995:
-        return True, "ask-pinned"
-    if best_ask - best_bid <= 0:
+
+    spread = best_ask - best_bid
+    if spread <= 0:
         return True, "no-spread"
+
+    if best_bid < EARLY_MIN_BID:
+        return True, "bid-too-low-early"
+    if best_ask > EARLY_MAX_ASK:
+        return True, "ask-too-high-early"
+    if spread > EARLY_MAX_SPREAD:
+        return True, "spread-too-wide-early"
+
+    midpoint = (best_bid + best_ask) / 2.0
+    if midpoint < MID_PRICE_MIN or midpoint > MID_PRICE_MAX:
+        return True, "one-sided-midpoint"
+
     return False, ""
 
 
@@ -373,6 +422,8 @@ def fetch_watchlist_file() -> List[Dict[str, Any]]:
 
             slug_text = parsed["slug"].lower()
             if is_blocked_topic(slug_text):
+                continue
+            if looks_like_crypto_ladder_market(slug_text):
                 continue
             if not is_allowed_topic(slug_text):
                 continue
@@ -444,6 +495,8 @@ def discover_markets() -> List[Dict[str, Any]]:
             if SHORT_TERM_ONLY and not is_within_short_term_window(m):
                 continue
             if is_blocked_topic(combined):
+                continue
+            if looks_like_crypto_ladder_market(combined):
                 continue
             if not is_allowed_topic(combined):
                 continue
@@ -524,6 +577,8 @@ def pick_best_market_from_event(event_data: Dict[str, Any]) -> Optional[Dict[str
             continue
         if is_blocked_topic(text):
             continue
+        if looks_like_crypto_ladder_market(text):
+            continue
         if not is_allowed_topic(text):
             continue
         if active and not closed:
@@ -568,6 +623,8 @@ def resolve_slug_to_market(slug: str) -> Tuple[Optional[Dict[str, Any]], Optiona
             return None, None
         if is_blocked_topic(text):
             return None, None
+        if looks_like_crypto_ladder_market(text):
+            return None, None
         if not is_allowed_topic(text):
             return None, None
         return market, "market"
@@ -597,12 +654,19 @@ def choose_live_prob(best_bid: float, best_ask: float, last_trade: float) -> Tup
 def estimate_test_position_quality(best_bid: float, best_ask: float, liquidity: float) -> Tuple[float, str]:
     if best_bid <= 0 or best_ask <= 0:
         return 0.0, "no-two-sided-book"
-    if best_ask >= 0.995:
-        return 0.0, "ask-pinned"
-    if best_bid <= 0.001:
-        return 0.0, "bid-dead"
 
     spread = max(0.0, best_ask - best_bid)
+    midpoint = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
+
+    if best_bid < EARLY_MIN_BID:
+        return 0.0, "bid-dead"
+    if best_ask > EARLY_MAX_ASK:
+        return 0.0, "ask-pinned"
+    if spread > EARLY_MAX_SPREAD:
+        return 0.0, "spread-dead"
+    if midpoint < MID_PRICE_MIN or midpoint > MID_PRICE_MAX:
+        return 0.0, "one-sided-mid"
+
     spread_component = max(0.0, 0.10 - spread) / 0.10
     liquidity_component = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 1.0)
 
@@ -711,7 +775,6 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     if tiny_position_score < 0.45:
         return "SKIP", f"Small-size weak ({m.get('tiny_position_note', 'weak')})"
 
-    # Evaluate both sides
     yes_edge = baseline_prob - live_prob
     no_edge = live_prob - baseline_prob
 
@@ -741,7 +804,7 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         (spread_score * 0.35)
         + (liquidity_score * 0.20)
         + (tiny_position_score * 0.30)
-        + (0.15)  # book quality already filtered, give fixed bonus
+        + 0.15
     )
 
     yes_composite = tradability_core * (0.70 + 0.30 * yes_strength) * category_bonus
@@ -814,8 +877,10 @@ def scan_markets() -> Dict[str, Any]:
         key=lambda x: (
             0 if x.get("category") == "ALERT" else 1 if x.get("category") == "WATCH" else 2,
             CATEGORY_PRIORITY.get(x.get("topic_category", "other"), 9),
+            0 if not x.get("dead_book") else 1,
+            -to_float(x.get("tiny_position_score"), 0.0),
             -to_float(x.get("composite_score"), 0.0),
-            -to_float(x.get("edge"), 0.0),
+            -abs(to_float(x.get("edge"), 0.0)),
         )
     )
 
@@ -897,7 +962,19 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
             f"Skip: {counts.get('skip', 0)}",
         ]
 
-        fallback = [r for r in results if not r.get("dead_book")][:3]
+        fallback = [
+            r for r in results
+            if not r.get("dead_book")
+            and r.get("reason") not in {
+                "Bid too low",
+                "Ask too high",
+                "Spread too wide",
+            }
+        ][:3]
+
+        if not fallback:
+            fallback = [r for r in results if not r.get("dead_book")][:3]
+
         if not fallback:
             fallback = results[:3]
 
@@ -1040,6 +1117,14 @@ def health():
         "discover_min_liquidity": DISCOVER_MIN_LIQUIDITY,
         "min_liquidity": MIN_LIQUIDITY,
         "max_spread": MAX_SPREAD,
+        "min_bid": MIN_BID,
+        "max_ask": MAX_ASK,
+        "early_min_bid": EARLY_MIN_BID,
+        "early_max_ask": EARLY_MAX_ASK,
+        "early_max_spread": EARLY_MAX_SPREAD,
+        "mid_price_min": MID_PRICE_MIN,
+        "mid_price_max": MID_PRICE_MAX,
+        "block_crypto_ladders": BLOCK_CRYPTO_LADDERS,
         "alert_threshold": ALERT_THRESHOLD,
         "watch_threshold": WATCH_THRESHOLD,
         "no_alert_threshold": NO_ALERT_THRESHOLD,
@@ -1100,6 +1185,14 @@ def webhook():
             f"discover_min_liquidity={DISCOVER_MIN_LIQUIDITY}\n"
             f"min_liquidity={MIN_LIQUIDITY}\n"
             f"max_spread={MAX_SPREAD}\n"
+            f"min_bid={MIN_BID}\n"
+            f"max_ask={MAX_ASK}\n"
+            f"early_min_bid={EARLY_MIN_BID}\n"
+            f"early_max_ask={EARLY_MAX_ASK}\n"
+            f"early_max_spread={EARLY_MAX_SPREAD}\n"
+            f"mid_price_min={MID_PRICE_MIN}\n"
+            f"mid_price_max={MID_PRICE_MAX}\n"
+            f"block_crypto_ladders={BLOCK_CRYPTO_LADDERS}\n"
             f"auto_discover={AUTO_DISCOVER}\n"
             f"enable_yes_no_only={ENABLE_YES_NO_ONLY}\n"
             f"manual_scan_in_progress={manual_scan_in_progress}\n"

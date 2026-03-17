@@ -63,6 +63,9 @@ sent_cache: Dict[str, float] = {}
 _background_started = False
 _background_lock = threading.Lock()
 
+manual_scan_lock = threading.Lock()
+manual_scan_in_progress = False
+
 zero_scan_count = 0
 zero_window_started_at = time.time()
 
@@ -173,7 +176,6 @@ def parse_dt(value: Any) -> Optional[datetime]:
 
     if isinstance(value, (int, float)):
         try:
-            # Assume unix seconds if it looks like a timestamp
             return datetime.fromtimestamp(float(value), tz=timezone.utc)
         except Exception:
             return None
@@ -182,11 +184,9 @@ def parse_dt(value: Any) -> Optional[datetime]:
     if not s:
         return None
 
-    # Normalize Z suffix
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
 
-    # Try common ISO forms
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
@@ -195,7 +195,6 @@ def parse_dt(value: Any) -> Optional[datetime]:
     except Exception:
         pass
 
-    # Try simple date only
     for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
         try:
             dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
@@ -697,6 +696,21 @@ def format_manual_scan(scan: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def run_manual_scan_async(chat_id: str) -> None:
+    global manual_scan_in_progress
+
+    try:
+        scan = scan_markets()
+        msg = format_manual_scan(scan)
+        send_telegram_message(chat_id, msg)
+    except Exception as e:
+        print(f"[{now_str()}] Manual scan error: {e}")
+        send_telegram_message(chat_id, f"Scan error: {e}")
+    finally:
+        with manual_scan_lock:
+            manual_scan_in_progress = False
+
+
 # =========================================
 # AUTO LOOP
 # =========================================
@@ -815,6 +829,7 @@ def health():
         "max_spread": MAX_SPREAD,
         "alert_threshold": ALERT_THRESHOLD,
         "watch_threshold": WATCH_THRESHOLD,
+        "manual_scan_in_progress": manual_scan_in_progress,
     })
 
 
@@ -829,6 +844,8 @@ def scan_route():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    global manual_scan_in_progress
+
     data = request.get_json(silent=True) or {}
     print(f"[{now_str()}] WEBHOOK HIT: {data}")
 
@@ -863,20 +880,22 @@ def webhook():
             f"max_spread={MAX_SPREAD}\n"
             f"auto_discover={AUTO_DISCOVER}\n"
             f"enable_yes_no_only={ENABLE_YES_NO_ONLY}\n"
+            f"manual_scan_in_progress={manual_scan_in_progress}\n"
             f"test_market_slug={TEST_MARKET_SLUG or 'none'}"
         )
         send_telegram_message(chat_id, msg)
         return jsonify({"ok": True})
 
     if command == "/scan":
-        try:
-            send_telegram_message(chat_id, "Running scan...")
-            scan = scan_markets()
-            msg = format_manual_scan(scan)
-            send_telegram_message(chat_id, msg)
-        except Exception as e:
-            print(f"[{now_str()}] Manual scan error: {e}")
-            send_telegram_message(chat_id, f"Scan error: {e}")
+        with manual_scan_lock:
+            if manual_scan_in_progress:
+                send_telegram_message(chat_id, "Scan already running. Wait for result.")
+                return jsonify({"ok": True})
+
+            manual_scan_in_progress = True
+
+        send_telegram_message(chat_id, "Running scan...")
+        threading.Thread(target=run_manual_scan_async, args=(chat_id,), daemon=True).start()
         return jsonify({"ok": True})
 
     return jsonify({"ok": True})

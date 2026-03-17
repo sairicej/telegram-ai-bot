@@ -72,6 +72,7 @@ def now_str() -> str:
 
 def send_telegram_message(chat_id: str, text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not chat_id or not text.strip():
+        print(f"[{now_str()}] Telegram send skipped | missing token/chat_id/text")
         return
 
     try:
@@ -148,6 +149,17 @@ def parse_jsonish_list(value: Any) -> List[Any]:
     return []
 
 
+def normalize_command(text: str) -> str:
+    t = (text or "").strip()
+    if not t.startswith("/"):
+        return t
+
+    first = t.split()[0].strip().lower()
+    if "@" in first:
+        first = first.split("@")[0]
+    return first
+
+
 # =========================================
 # MARKET HELPERS
 # =========================================
@@ -205,6 +217,7 @@ def fetch_watchlist_file() -> List[Dict[str, Any]]:
             parsed = parse_watchlist_line(line)
             if parsed:
                 items.append(parsed)
+        print(f"[{now_str()}] Watchlist file loaded | items={len(items)}")
         return items
     except Exception as e:
         print(f"[{now_str()}] Watchlist fetch error: {e}")
@@ -212,7 +225,10 @@ def fetch_watchlist_file() -> List[Dict[str, Any]]:
 
 
 def keyword_list() -> List[str]:
-    return [x.strip().lower() for x in DISCOVER_KEYWORDS.split(",") if x.strip()]
+    raw = (DISCOVER_KEYWORDS or "").strip().strip('"').strip("'")
+    if raw.lower().startswith("discover_keywords="):
+        raw = raw.split("=", 1)[1].strip()
+    return [x.strip().lower() for x in raw.split(",") if x.strip()]
 
 
 def matches_keywords(text: str) -> bool:
@@ -226,6 +242,12 @@ def discover_markets() -> List[Dict[str, Any]]:
     found: List[Dict[str, Any]] = []
     seen = set()
     offset = 0
+
+    print(
+        f"[{now_str()}] Discover start | "
+        f"limit={DISCOVER_LIMIT} page_size={DISCOVER_PAGE_SIZE} "
+        f"min_volume={DISCOVER_MIN_VOLUME} min_liquidity={DISCOVER_MIN_LIQUIDITY}"
+    )
 
     while len(found) < DISCOVER_LIMIT:
         params = {
@@ -267,11 +289,13 @@ def discover_markets() -> List[Dict[str, Any]]:
 
         offset += DISCOVER_PAGE_SIZE
 
+    print(f"[{now_str()}] Discover complete | found={len(found)}")
     return found
 
 
 def fetch_watchlist() -> List[Dict[str, Any]]:
     if TEST_MARKET_SLUG:
+        print(f"[{now_str()}] Using TEST_MARKET_SLUG={TEST_MARKET_SLUG}")
         return [{"slug": TEST_MARKET_SLUG, "baseline_prob": BASELINE_PROB}]
 
     if AUTO_DISCOVER:
@@ -472,6 +496,8 @@ def scan_markets() -> Dict[str, Any]:
     results: List[Dict[str, Any]] = []
     counts = {"total": 0, "alert": 0, "watch": 0, "skip": 0}
 
+    print(f"[{now_str()}] Scan start | watchlist_items={len(watchlist)}")
+
     for item in watchlist:
         counts["total"] += 1
         try:
@@ -493,6 +519,11 @@ def scan_markets() -> Dict[str, Any]:
             counts["skip"] += 1
 
     results.sort(key=lambda x: x.get("imbalance", 999))
+    print(
+        f"[{now_str()}] Scan complete | "
+        f"total={counts['total']} alert={counts['alert']} "
+        f"watch={counts['watch']} skip={counts['skip']}"
+    )
     return {"counts": counts, "results": results[:20]}
 
 
@@ -526,16 +557,47 @@ def format_zero_summary(zero_count: int, seconds_in_window: int) -> str:
     return f"No qualifying markets in last {minutes} minutes.\nEmpty scans: {zero_count}"
 
 
-def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
+def format_manual_scan(scan: Dict[str, Any]) -> str:
     top = qualifying_results(scan)
-    if not top:
-        return None
+    counts = scan.get("counts", {})
+    results = scan.get("results", [])
 
-    lines = [f"Qualifying markets: {len(top)}", ""]
+    lines = [
+        "Scan complete",
+        "",
+        f"Total: {counts.get('total', 0)}",
+        f"Alerts: {counts.get('alert', 0)}",
+        f"Watch: {counts.get('watch', 0)}",
+        f"Skip: {counts.get('skip', 0)}",
+        "",
+    ]
 
-    for r in top[:5]:
-        lines.append(format_market_block(r))
+    if top:
+        lines.append(f"Qualifying markets: {len(top)}")
         lines.append("")
+        for r in top[:5]:
+            lines.append(format_market_block(r))
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    lines.append("No qualifying markets found.")
+    fallback = results[:3]
+
+    if fallback:
+        lines.append("")
+        lines.append("Top candidates:")
+        lines.append("")
+        for r in fallback:
+            lines.append(
+                f"{r.get('category', 'SKIP')} | {r.get('label', '')}\n"
+                f"slug={r.get('slug', '')}\n"
+                f"reason={r.get('reason') or 'No qualifying signal'}\n"
+                f"bid={r.get('best_bid', 0):.3f} "
+                f"ask={r.get('best_ask', 0):.3f} "
+                f"spread={r.get('spread', 0):.3f} "
+                f"liq={r.get('liquidity', 0):.0f}"
+            )
+            lines.append("")
 
     return "\n".join(lines).strip()
 
@@ -674,15 +736,18 @@ def webhook():
     chat = message.get("chat", {})
     chat_id = str(chat.get("id", "")).strip()
     text = (message.get("text") or "").strip()
+    command = normalize_command(text)
+
+    print(f"[{now_str()}] Command received | raw_text={text} normalized={command} chat_id={chat_id}")
 
     if not chat_id or not text:
         return jsonify({"ok": True, "ignored": True})
 
-    if text == "/start":
+    if command == "/start":
         send_telegram_message(chat_id, "Bot is live.\nUse /scan or /health")
         return jsonify({"ok": True})
 
-    if text == "/health":
+    if command == "/health":
         msg = (
             "Health check\n"
             f"alert_threshold={ALERT_THRESHOLD}\n"
@@ -698,13 +763,14 @@ def webhook():
         send_telegram_message(chat_id, msg)
         return jsonify({"ok": True})
 
-    if text == "/scan":
+    if command == "/scan":
         try:
+            send_telegram_message(chat_id, "Running scan...")
             scan = scan_markets()
             msg = format_manual_scan(scan)
-            if msg:
-                send_telegram_message(chat_id, msg)
+            send_telegram_message(chat_id, msg)
         except Exception as e:
+            print(f"[{now_str()}] Manual scan error: {e}")
             send_telegram_message(chat_id, f"Scan error: {e}")
         return jsonify({"ok": True})
 

@@ -123,6 +123,9 @@ zero_window_started_at = time.time()
 
 last_skip_counts: Counter = Counter()
 last_pipeline_stats: Dict[str, Any] = {}
+last_preflight_reason_counts: Dict[str, Any] = {}
+
+CANDIDATE_CACHE_TTL_SECONDS = 90
 
 # =========================================
 # BASICS
@@ -538,7 +541,7 @@ def preflight_book_check(market_data: Dict[str, Any], token_id: str) -> Optional
     try:
         book = fetch_order_book(token_id)
     except Exception:
-        return None
+        return {"ok": False, "reason": "book_fetch_failed"}
 
     bids = book.get("bids") or []
     asks = book.get("asks") or []
@@ -546,31 +549,37 @@ def preflight_book_check(market_data: Dict[str, Any], token_id: str) -> Optional
     best_bid = to_float(bids[0].get("price")) if bids else 0.0
     best_ask = to_float(asks[0].get("price")) if asks else 0.0
 
-    if best_bid <= 0 or best_ask <= 0:
-        return None
+    if best_bid <= 0:
+        return {"ok": False, "reason": "preflight_no_bid"}
+    if best_ask <= 0:
+        return {"ok": False, "reason": "preflight_no_ask"}
 
     spread = best_ask - best_bid
     if spread <= 0:
-        return None
+        return {"ok": False, "reason": "preflight_no_spread"}
     if best_bid < PREFLIGHT_MIN_BID:
-        return None
+        return {"ok": False, "reason": "preflight_bid_too_low", "best_bid": round(best_bid, 6), "best_ask": round(best_ask, 6), "spread": round(spread, 6)}
     if best_ask > PREFLIGHT_MAX_ASK:
-        return None
+        return {"ok": False, "reason": "preflight_ask_too_high", "best_bid": round(best_bid, 6), "best_ask": round(best_ask, 6), "spread": round(spread, 6)}
     if spread > PREFLIGHT_MAX_SPREAD:
-        return None
+        return {"ok": False, "reason": "preflight_spread_too_wide", "best_bid": round(best_bid, 6), "best_ask": round(best_ask, 6), "spread": round(spread, 6)}
 
     bid_depth = top_depth(bids, BOOK_LEVELS)
     ask_depth = top_depth(asks, BOOK_LEVELS)
-    if bid_depth < MIN_TOP_DEPTH or ask_depth < MIN_TOP_DEPTH:
-        return None
+    if bid_depth < MIN_TOP_DEPTH:
+        return {"ok": False, "reason": "preflight_bid_depth_thin", "bid_depth": round(bid_depth, 6), "ask_depth": round(ask_depth, 6)}
+    if ask_depth < MIN_TOP_DEPTH:
+        return {"ok": False, "reason": "preflight_ask_depth_thin", "bid_depth": round(bid_depth, 6), "ask_depth": round(ask_depth, 6)}
 
     midpoint = (best_bid + best_ask) / 2.0
     if midpoint < MID_PRICE_MIN or midpoint > MID_PRICE_MAX:
-        return None
+        return {"ok": False, "reason": "preflight_midpoint_outside", "midpoint": round(midpoint, 6)}
 
     resolved_text = f"{market_data.get('slug', '')} {market_data.get('question', '')} {market_data.get('title', '')}".lower()
 
     return {
+        "ok": True,
+        "reason": "ok",
         "book": book,
         "best_bid": round(best_bid, 6),
         "best_ask": round(best_ask, 6),
@@ -609,20 +618,29 @@ def build_candidate_from_slug(
     baseline_prob: float,
     discovery_priority_value: float,
     source_bucket: str,
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any]:
     market_data, source_type = resolve_slug_to_market(slug)
     if not market_data:
-        return None
+        return {"ok": False, "reason": "resolve_failed", "slug": slug}
 
     token_id = extract_yes_token_id(market_data)
     if not token_id:
-        return None
+        return {"ok": False, "reason": "token_missing", "slug": slug, "market_data": market_data, "source_type": source_type}
 
     micro = preflight_book_check(market_data, token_id)
-    if not micro:
-        return None
+    if not micro.get("ok"):
+        return {
+            "ok": False,
+            "reason": micro.get("reason", "preflight_failed"),
+            "slug": slug,
+            "market_data": market_data,
+            "source_type": source_type,
+            "token_id": token_id,
+            "micro": micro,
+        }
 
     return {
+        "ok": True,
         "slug": slug,
         "baseline_prob": baseline_prob,
         "discovery_priority": discovery_priority_value,
@@ -636,6 +654,7 @@ def build_candidate_from_slug(
         "cached_market_data": market_data,
         "cached_token_id": token_id,
         "cached_book": micro["book"],
+        "cached_book_ts": time.time(),
         "cached_label": micro["label"],
         "cached_resolved_text": micro["resolved_text"],
     }
@@ -652,6 +671,7 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "discover_kept": 0,
         "discover_resolve_failures": 0,
         "discover_preflight_failures": 0,
+        "discover_preflight_reason_counts": {},
     }
 
     print(
@@ -726,13 +746,14 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             discovery_priority_value=to_float(item.get("discovery_priority"), 0.0),
             source_bucket="discover",
         )
-        if not candidate:
-            # split failure roughly
-            market_data, _ = resolve_slug_to_market(item["slug"])
-            if not market_data:
+        if not candidate.get("ok"):
+            reason = candidate.get("reason", "unknown")
+            if reason in {"resolve_failed", "token_missing"}:
                 stats["discover_resolve_failures"] += 1
             else:
                 stats["discover_preflight_failures"] += 1
+                reason_counts = stats.setdefault("discover_preflight_reason_counts", {})
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
             continue
 
         kept.append(candidate)
@@ -788,6 +809,7 @@ def build_prefiltered_fallback_candidates() -> Tuple[List[Dict[str, Any]], Dict[
         "fallback_kept": 0,
         "fallback_resolve_failures": 0,
         "fallback_preflight_failures": 0,
+        "fallback_preflight_reason_counts": {},
         "fallback_used": False,
     }
 
@@ -800,12 +822,14 @@ def build_prefiltered_fallback_candidates() -> Tuple[List[Dict[str, Any]], Dict[
             discovery_priority_value=0.50,
             source_bucket="fallback",
         )
-        if not candidate:
-            market_data, _ = resolve_slug_to_market(item["slug"])
-            if not market_data:
+        if not candidate.get("ok"):
+            reason = candidate.get("reason", "unknown")
+            if reason in {"resolve_failed", "token_missing"}:
                 stats["fallback_resolve_failures"] += 1
             else:
                 stats["fallback_preflight_failures"] += 1
+                reason_counts = stats.setdefault("fallback_preflight_reason_counts", {})
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
             continue
         kept.append(candidate)
 
@@ -837,11 +861,13 @@ def fetch_watchlist() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             "discover_kept": 0,
             "discover_resolve_failures": 0,
             "discover_preflight_failures": 0,
+            "discover_preflight_reason_counts": {},
             "fallback_items": 0,
             "fallback_checked": 0,
             "fallback_kept": 0,
             "fallback_resolve_failures": 0,
             "fallback_preflight_failures": 0,
+            "fallback_preflight_reason_counts": {},
             "fallback_used": False,
             "watchlist_source": "test",
         }
@@ -853,6 +879,7 @@ def fetch_watchlist() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "discover_kept": 0,
         "discover_resolve_failures": 0,
         "discover_preflight_failures": 0,
+        "discover_preflight_reason_counts": {},
     }
 
     if AUTO_DISCOVER:
@@ -864,6 +891,7 @@ def fetch_watchlist() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 "fallback_kept": 0,
                 "fallback_resolve_failures": 0,
                 "fallback_preflight_failures": 0,
+                "fallback_preflight_reason_counts": {},
                 "fallback_used": False,
                 "watchlist_source": "discover",
             })
@@ -1006,7 +1034,7 @@ def midpoint_zone_score(midpoint: float) -> float:
     return 0.0
 
 
-def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
+def fetch_live_market_data(item: Dict[str, Any], pipeline_stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     slug = item["slug"]
     baseline_prob = to_float(item.get("baseline_prob"), BASELINE_PROB)
 
@@ -1014,12 +1042,52 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
     token_id = item.get("cached_token_id")
     source_type = item.get("source_type", "unknown")
     book = item.get("cached_book")
+    cached_book_ts = to_float(item.get("cached_book_ts"), 0.0)
 
     if not market_data or not token_id:
         raise ValueError("Cached candidate missing market/token")
 
+    cache_source = "candidate_cache"
+    cache_age_seconds = round(max(0.0, time.time() - cached_book_ts), 3) if cached_book_ts else None
+    stale_cache = bool(cached_book_ts and cache_age_seconds is not None and cache_age_seconds > CANDIDATE_CACHE_TTL_SECONDS)
+
+    if pipeline_stats is not None:
+        pipeline_stats.setdefault("cache_used", 0)
+        pipeline_stats.setdefault("cache_refetched", 0)
+        pipeline_stats.setdefault("cache_missing", 0)
+        pipeline_stats.setdefault("cache_fetch_failures", 0)
+        pipeline_stats.setdefault("cache_stale", 0)
+
     if not isinstance(book, dict):
-        book = fetch_order_book(token_id)
+        cache_source = "fresh_fetch_missing_cache"
+        if pipeline_stats is not None:
+            pipeline_stats["cache_missing"] += 1
+        try:
+            book = fetch_order_book(token_id)
+            item["cached_book"] = book
+            item["cached_book_ts"] = time.time()
+            cache_age_seconds = 0.0
+        except Exception:
+            if pipeline_stats is not None:
+                pipeline_stats["cache_fetch_failures"] += 1
+            raise
+    elif stale_cache:
+        cache_source = "fresh_fetch_stale_cache"
+        if pipeline_stats is not None:
+            pipeline_stats["cache_stale"] += 1
+            pipeline_stats["cache_refetched"] += 1
+        try:
+            book = fetch_order_book(token_id)
+            item["cached_book"] = book
+            item["cached_book_ts"] = time.time()
+            cache_age_seconds = 0.0
+        except Exception:
+            if pipeline_stats is not None:
+                pipeline_stats["cache_fetch_failures"] += 1
+            raise
+    else:
+        if pipeline_stats is not None:
+            pipeline_stats["cache_used"] += 1
 
     bids = book.get("bids") or []
     asks = book.get("asks") or []
@@ -1092,6 +1160,8 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
         "time_score": time_to_event_score(end_iso),
         "midpoint_zone_score": midpoint_zone_score(micro["midpoint"]),
         "discovery_priority": to_float(item.get("discovery_priority"), 0.0),
+        "cache_source": cache_source,
+        "cache_age_seconds": cache_age_seconds,
     }
 
 
@@ -1267,7 +1337,7 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
 # SCAN
 # =========================================
 def scan_markets() -> Dict[str, Any]:
-    global last_skip_counts, last_pipeline_stats
+    global last_skip_counts, last_pipeline_stats, last_preflight_reason_counts
 
     watchlist, pipeline_stats = fetch_watchlist()
     results: List[Dict[str, Any]] = []
@@ -1280,7 +1350,7 @@ def scan_markets() -> Dict[str, Any]:
     for item in watchlist:
         counts["total"] += 1
         try:
-            m = fetch_live_market_data(item)
+            m = fetch_live_market_data(item, pipeline_stats=pipeline_stats)
             category, reason = classify_market(m)
             m["category"] = category
             m["reason"] = reason
@@ -1301,7 +1371,13 @@ def scan_markets() -> Dict[str, Any]:
             skip_counter["Fetch/resolve error"] += 1
 
     pipeline_stats["scan_resolve_failures"] = resolve_failures
+    pipeline_stats.setdefault("discover_preflight_reason_counts", {})
+    pipeline_stats.setdefault("fallback_preflight_reason_counts", {})
     last_pipeline_stats = pipeline_stats
+    last_preflight_reason_counts = {
+        "discover": dict(pipeline_stats.get("discover_preflight_reason_counts", {})),
+        "fallback": dict(pipeline_stats.get("fallback_preflight_reason_counts", {})),
+    }
     last_skip_counts = skip_counter
 
     results.sort(
@@ -1370,6 +1446,15 @@ def near_miss_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def format_pipeline_stats(pipeline: Dict[str, Any]) -> str:
+    discover_reasons = pipeline.get("discover_preflight_reason_counts", {}) or {}
+    fallback_reasons = pipeline.get("fallback_preflight_reason_counts", {}) or {}
+
+    def top_reason(reason_counts: Dict[str, Any]) -> str:
+        if not reason_counts:
+            return "none"
+        top_key = max(reason_counts, key=lambda k: reason_counts.get(k, 0))
+        return f"{top_key}:{reason_counts.get(top_key, 0)}"
+
     return (
         f"Pipeline: source={pipeline.get('watchlist_source', 'unknown')} | "
         f"discover_prelim={pipeline.get('discover_prelim', 0)} | "
@@ -1378,7 +1463,11 @@ def format_pipeline_stats(pipeline: Dict[str, Any]) -> str:
         f"fallback_items={pipeline.get('fallback_items', 0)} | "
         f"fallback_checked={pipeline.get('fallback_checked', 0)} | "
         f"fallback_kept={pipeline.get('fallback_kept', 0)} | "
-        f"resolve_failures={pipeline.get('scan_resolve_failures', 0)}"
+        f"cache_used={pipeline.get('cache_used', 0)} | "
+        f"cache_refetched={pipeline.get('cache_refetched', 0)} | "
+        f"resolve_failures={pipeline.get('scan_resolve_failures', 0)} | "
+        f"top_preflight_discover={top_reason(discover_reasons)} | "
+        f"top_preflight_fallback={top_reason(fallback_reasons)}"
     )
 
 
@@ -1407,7 +1496,8 @@ def format_market_block(r: Dict[str, Any]) -> str:
         f"ask={r.get('best_ask', 0):.3f} "
         f"spread={r.get('spread', 0):.3f} "
         f"liq={r.get('liquidity', 0):.0f} "
-        f"src={r.get('price_source', '')}"
+        f"src={r.get('price_source', '')} "
+        f"cache={r.get('cache_source', '')}"
     )
 
 
@@ -1478,6 +1568,7 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
                 "",
                 "No tradable near-misses found.",
                 "Most candidates failed preflight, depth, fill confidence, or cached candidate resolution.",
+                f"Preflight detail: discover={pipeline.get('discover_preflight_reason_counts', {})} fallback={pipeline.get('fallback_preflight_reason_counts', {})}",
             ])
 
         return "\n".join(lines).strip()
@@ -1620,6 +1711,8 @@ def health():
         "target_max_test_position_usd": TARGET_MAX_TEST_POSITION_USD,
         "test_market_slug": TEST_MARKET_SLUG or "none",
         "last_pipeline_stats": last_pipeline_stats,
+        "last_preflight_reason_counts": last_preflight_reason_counts,
+        "candidate_cache_ttl_seconds": CANDIDATE_CACHE_TTL_SECONDS,
     })
 
 
@@ -1692,7 +1785,9 @@ def webhook():
             f"target_min_test_position_usd={TARGET_MIN_TEST_POSITION_USD}\n"
             f"target_max_test_position_usd={TARGET_MAX_TEST_POSITION_USD}\n"
             f"test_market_slug={TEST_MARKET_SLUG or 'none'}\n"
-            f"last_pipeline_stats={last_pipeline_stats}"
+            f"candidate_cache_ttl_seconds={CANDIDATE_CACHE_TTL_SECONDS}\n"
+            f"last_pipeline_stats={last_pipeline_stats}\n"
+            f"last_preflight_reason_counts={last_preflight_reason_counts}"
         )
         send_telegram_message(chat_id, msg)
         return jsonify({"ok": True})

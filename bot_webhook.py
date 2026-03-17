@@ -79,7 +79,6 @@ MIN_FILL_CONFIDENCE = float(os.getenv("MIN_FILL_CONFIDENCE", "0.45"))
 MICRO_ALERT_SCORE = float(os.getenv("MICRO_ALERT_SCORE", "0.62"))
 MICRO_WATCH_SCORE = float(os.getenv("MICRO_WATCH_SCORE", "0.52"))
 
-# New preflight controls
 PREFLIGHT_MAX_SPREAD = float(os.getenv("PREFLIGHT_MAX_SPREAD", "0.12"))
 PREFLIGHT_MIN_BID = float(os.getenv("PREFLIGHT_MIN_BID", "0.03"))
 PREFLIGHT_MAX_ASK = float(os.getenv("PREFLIGHT_MAX_ASK", "0.97"))
@@ -123,7 +122,7 @@ zero_scan_count = 0
 zero_window_started_at = time.time()
 
 last_skip_counts: Counter = Counter()
-
+last_pipeline_stats: Dict[str, Any] = {}
 
 # =========================================
 # BASICS
@@ -442,53 +441,8 @@ def best_level_size(levels: List[Dict[str, Any]]) -> float:
 
 
 # =========================================
-# DISCOVERY
+# DISCOVERY / RESOLUTION
 # =========================================
-def fetch_watchlist_file() -> List[Dict[str, Any]]:
-    try:
-        r = requests.get(MARKETS_URL, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        lines = [x.strip() for x in r.text.splitlines() if x.strip()]
-        items = []
-        for line in lines:
-            parsed = parse_watchlist_line(line)
-            if not parsed:
-                continue
-            slug_text = parsed["slug"].lower()
-            if is_blocked_topic(slug_text):
-                continue
-            if looks_like_crypto_ladder_market(slug_text):
-                continue
-            if not is_allowed_topic(slug_text):
-                continue
-            items.append(parsed)
-        print(f"[{now_str()}] Watchlist file loaded | items={len(items)}")
-        return items
-    except Exception as e:
-        print(f"[{now_str()}] Watchlist fetch error: {e}")
-        return []
-
-
-def discovery_priority(combined: str) -> float:
-    topic = classify_topic(combined)
-    base = {
-        "crypto": 1.00,
-        "macro": 0.95,
-        "index_commodity": 0.90,
-        "politics_event": 0.82,
-        "other": 0.70,
-    }.get(topic, 0.70)
-
-    if any(k in combined for k in ["approval", "decision", "announce", "launch", "meeting", "by date", "end of"]):
-        base += 0.08
-    if "weekly" in combined or "monthly" in combined:
-        base += 0.03
-    if looks_like_crypto_ladder_market(combined):
-        base -= 0.50
-
-    return round(base, 4)
-
-
 def fetch_market_by_slug(slug: str) -> Optional[Dict[str, Any]]:
     try:
         return safe_get_json(f"{GAMMA_BASE}/markets/slug/{slug}")
@@ -615,7 +569,9 @@ def preflight_book_check(market_data: Dict[str, Any], token_id: str) -> Optional
         return None
 
     resolved_text = f"{market_data.get('slug', '')} {market_data.get('question', '')} {market_data.get('title', '')}".lower()
+
     return {
+        "book": book,
         "best_bid": round(best_bid, 6),
         "best_ask": round(best_ask, 6),
         "spread": round(spread, 6),
@@ -628,10 +584,75 @@ def preflight_book_check(market_data: Dict[str, Any], token_id: str) -> Optional
     }
 
 
-def discover_markets() -> List[Dict[str, Any]]:
+def discovery_priority(combined: str) -> float:
+    topic = classify_topic(combined)
+    base = {
+        "crypto": 1.00,
+        "macro": 0.95,
+        "index_commodity": 0.90,
+        "politics_event": 0.82,
+        "other": 0.70,
+    }.get(topic, 0.70)
+
+    if any(k in combined for k in ["approval", "decision", "announce", "launch", "meeting", "by date", "end of"]):
+        base += 0.08
+    if "weekly" in combined or "monthly" in combined:
+        base += 0.03
+    if looks_like_crypto_ladder_market(combined):
+        base -= 0.50
+
+    return round(base, 4)
+
+
+def build_candidate_from_slug(
+    slug: str,
+    baseline_prob: float,
+    discovery_priority_value: float,
+    source_bucket: str,
+) -> Optional[Dict[str, Any]]:
+    market_data, source_type = resolve_slug_to_market(slug)
+    if not market_data:
+        return None
+
+    token_id = extract_yes_token_id(market_data)
+    if not token_id:
+        return None
+
+    micro = preflight_book_check(market_data, token_id)
+    if not micro:
+        return None
+
+    return {
+        "slug": slug,
+        "baseline_prob": baseline_prob,
+        "discovery_priority": discovery_priority_value,
+        "source_bucket": source_bucket,
+        "source_type": source_type,
+        "topic_category": micro["topic_category"],
+        "preflight_spread": micro["spread"],
+        "preflight_midpoint": micro["midpoint"],
+        "preflight_bid_depth": micro["bid_depth"],
+        "preflight_ask_depth": micro["ask_depth"],
+        "cached_market_data": market_data,
+        "cached_token_id": token_id,
+        "cached_book": micro["book"],
+        "cached_label": micro["label"],
+        "cached_resolved_text": micro["resolved_text"],
+    }
+
+
+def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     prelim: List[Dict[str, Any]] = []
     seen = set()
     offset = 0
+
+    stats = {
+        "discover_prelim": 0,
+        "discover_checked": 0,
+        "discover_kept": 0,
+        "discover_resolve_failures": 0,
+        "discover_preflight_failures": 0,
+    }
 
     print(
         f"[{now_str()}] Discover start | "
@@ -685,42 +706,38 @@ def discover_markets() -> List[Dict[str, Any]]:
                 "baseline_prob": BASELINE_PROB,
                 "discovery_priority": discovery_priority(combined),
             })
-
             if len(prelim) >= DISCOVER_LIMIT:
                 break
 
         offset += DISCOVER_PAGE_SIZE
 
+    stats["discover_prelim"] = len(prelim)
     prelim.sort(key=lambda x: -to_float(x.get("discovery_priority"), 0.0))
 
-    # Preflight gating: only keep books that already look tradable
     kept: List[Dict[str, Any]] = []
-    checked = 0
     for item in prelim:
-        if checked >= PREFLIGHT_MAX_CANDIDATES:
+        if stats["discover_checked"] >= PREFLIGHT_MAX_CANDIDATES:
             break
 
-        slug = item["slug"]
-        market_data, source_type = resolve_slug_to_market(slug)
-        if not market_data:
+        stats["discover_checked"] += 1
+        candidate = build_candidate_from_slug(
+            slug=item["slug"],
+            baseline_prob=to_float(item.get("baseline_prob"), BASELINE_PROB),
+            discovery_priority_value=to_float(item.get("discovery_priority"), 0.0),
+            source_bucket="discover",
+        )
+        if not candidate:
+            # split failure roughly
+            market_data, _ = resolve_slug_to_market(item["slug"])
+            if not market_data:
+                stats["discover_resolve_failures"] += 1
+            else:
+                stats["discover_preflight_failures"] += 1
             continue
 
-        token_id = extract_yes_token_id(market_data)
-        if not token_id:
-            continue
+        kept.append(candidate)
 
-        checked += 1
-        micro = preflight_book_check(market_data, token_id)
-        if not micro:
-            continue
-
-        item["topic_category"] = micro["topic_category"]
-        item["preflight_spread"] = micro["spread"]
-        item["preflight_midpoint"] = micro["midpoint"]
-        item["preflight_bid_depth"] = micro["bid_depth"]
-        item["preflight_ask_depth"] = micro["ask_depth"]
-        item["source_type"] = source_type
-        kept.append(item)
+    stats["discover_kept"] = len(kept)
 
     kept.sort(
         key=lambda x: (
@@ -731,20 +748,133 @@ def discover_markets() -> List[Dict[str, Any]]:
         )
     )
 
-    print(f"[{now_str()}] Discover complete | prelim={len(prelim)} checked={checked} kept={len(kept)}")
-    return kept
+    print(
+        f"[{now_str()}] Discover complete | prelim={stats['discover_prelim']} "
+        f"checked={stats['discover_checked']} kept={stats['discover_kept']}"
+    )
+    return kept, stats
 
 
-def fetch_watchlist() -> List[Dict[str, Any]]:
+def fetch_watchlist_file() -> List[Dict[str, Any]]:
+    try:
+        r = requests.get(MARKETS_URL, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        lines = [x.strip() for x in r.text.splitlines() if x.strip()]
+        items = []
+        for line in lines:
+            parsed = parse_watchlist_line(line)
+            if not parsed:
+                continue
+            slug_text = parsed["slug"].lower()
+            if is_blocked_topic(slug_text):
+                continue
+            if looks_like_crypto_ladder_market(slug_text):
+                continue
+            if not is_allowed_topic(slug_text):
+                continue
+            items.append(parsed)
+        print(f"[{now_str()}] Watchlist file loaded | items={len(items)}")
+        return items
+    except Exception as e:
+        print(f"[{now_str()}] Watchlist fetch error: {e}")
+        return []
+
+
+def build_prefiltered_fallback_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    file_items = fetch_watchlist_file()
+    stats = {
+        "fallback_items": len(file_items),
+        "fallback_checked": 0,
+        "fallback_kept": 0,
+        "fallback_resolve_failures": 0,
+        "fallback_preflight_failures": 0,
+        "fallback_used": False,
+    }
+
+    kept: List[Dict[str, Any]] = []
+    for item in file_items[:PREFLIGHT_MAX_CANDIDATES]:
+        stats["fallback_checked"] += 1
+        candidate = build_candidate_from_slug(
+            slug=item["slug"],
+            baseline_prob=to_float(item.get("baseline_prob"), BASELINE_PROB),
+            discovery_priority_value=0.50,
+            source_bucket="fallback",
+        )
+        if not candidate:
+            market_data, _ = resolve_slug_to_market(item["slug"])
+            if not market_data:
+                stats["fallback_resolve_failures"] += 1
+            else:
+                stats["fallback_preflight_failures"] += 1
+            continue
+        kept.append(candidate)
+
+    stats["fallback_kept"] = len(kept)
+    if kept:
+        stats["fallback_used"] = True
+
+    kept.sort(
+        key=lambda x: (
+            CATEGORY_PRIORITY.get(x.get("topic_category", "other"), 9),
+            to_float(x.get("preflight_spread"), 9.0),
+            -min(to_float(x.get("preflight_bid_depth"), 0.0), to_float(x.get("preflight_ask_depth"), 0.0)),
+        )
+    )
+    return kept, stats
+
+
+def fetch_watchlist() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     if TEST_MARKET_SLUG:
-        return [{"slug": TEST_MARKET_SLUG, "baseline_prob": BASELINE_PROB, "discovery_priority": 1.0}]
+        candidate = build_candidate_from_slug(
+            slug=TEST_MARKET_SLUG,
+            baseline_prob=BASELINE_PROB,
+            discovery_priority_value=1.0,
+            source_bucket="test",
+        )
+        stats = {
+            "discover_prelim": 0,
+            "discover_checked": 0,
+            "discover_kept": 0,
+            "discover_resolve_failures": 0,
+            "discover_preflight_failures": 0,
+            "fallback_items": 0,
+            "fallback_checked": 0,
+            "fallback_kept": 0,
+            "fallback_resolve_failures": 0,
+            "fallback_preflight_failures": 0,
+            "fallback_used": False,
+            "watchlist_source": "test",
+        }
+        return ([candidate] if candidate else []), stats
+
+    discover_stats = {
+        "discover_prelim": 0,
+        "discover_checked": 0,
+        "discover_kept": 0,
+        "discover_resolve_failures": 0,
+        "discover_preflight_failures": 0,
+    }
 
     if AUTO_DISCOVER:
-        discovered = discover_markets()
+        discovered, discover_stats = discover_markets()
         if discovered:
-            return discovered
+            discover_stats.update({
+                "fallback_items": 0,
+                "fallback_checked": 0,
+                "fallback_kept": 0,
+                "fallback_resolve_failures": 0,
+                "fallback_preflight_failures": 0,
+                "fallback_used": False,
+                "watchlist_source": "discover",
+            })
+            return discovered, discover_stats
 
-    return fetch_watchlist_file()
+    fallback, fallback_stats = build_prefiltered_fallback_candidates()
+    combined = {}
+    combined.update(discover_stats)
+    combined.update(fallback_stats)
+    combined["watchlist_source"] = "fallback" if fallback else "none"
+    return fallback, combined
 
 
 # =========================================
@@ -807,11 +937,7 @@ def estimate_fill_confidence(entry_price: float, top_side_depth: float, spread: 
 
     depth_score = clamp(depth_ratio / 3.0, 0.0, 1.0)
     spread_score = clamp((0.10 - spread) / 0.10, 0.0, 1.0)
-
-    if MID_PRICE_MIN <= midpoint <= MID_PRICE_MAX:
-        midpoint_score = 1.0
-    else:
-        midpoint_score = 0.0
+    midpoint_score = 1.0 if MID_PRICE_MIN <= midpoint <= MID_PRICE_MAX else 0.0
 
     score = (depth_score * 0.45) + (spread_score * 0.35) + (midpoint_score * 0.20)
 
@@ -836,7 +962,6 @@ def estimate_test_position_quality(best_bid: float, best_ask: float, liquidity: 
     spread = max(0.0, best_ask - best_bid)
     spread_component = clamp((0.10 - spread) / 0.10, 0.0, 1.0)
     liquidity_component = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 1.0)
-
     midpoint_component = 1.0 if MID_PRICE_MIN <= midpoint <= MID_PRICE_MAX else 0.0
 
     score = (spread_component * 0.45) + (liquidity_component * 0.25) + (midpoint_component * 0.30)
@@ -885,15 +1010,17 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
     slug = item["slug"]
     baseline_prob = to_float(item.get("baseline_prob"), BASELINE_PROB)
 
-    market_data, source_type = resolve_slug_to_market(slug)
-    if not market_data:
-        raise ValueError(f"Slug not found or not allowed short-term clean yes/no: {slug}")
+    market_data = item.get("cached_market_data")
+    token_id = item.get("cached_token_id")
+    source_type = item.get("source_type", "unknown")
+    book = item.get("cached_book")
 
-    token_id = extract_yes_token_id(market_data)
-    if not token_id:
-        raise ValueError(f"No YES token ID found for slug: {slug}")
+    if not market_data or not token_id:
+        raise ValueError("Cached candidate missing market/token")
 
-    book = fetch_order_book(token_id)
+    if not isinstance(book, dict):
+        book = fetch_order_book(token_id)
+
     bids = book.get("bids") or []
     asks = book.get("asks") or []
 
@@ -932,6 +1059,7 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
         "market_id": market_data.get("id", slug),
         "slug": slug,
         "source_type": source_type,
+        "source_bucket": item.get("source_bucket", "unknown"),
         "topic_category": topic_category,
         "price_source": price_source,
         "label": label,
@@ -1139,14 +1267,15 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
 # SCAN
 # =========================================
 def scan_markets() -> Dict[str, Any]:
-    global last_skip_counts
+    global last_skip_counts, last_pipeline_stats
 
-    watchlist = fetch_watchlist()
+    watchlist, pipeline_stats = fetch_watchlist()
     results: List[Dict[str, Any]] = []
     counts = {"total": 0, "alert": 0, "watch": 0, "skip": 0}
     skip_counter = Counter()
+    resolve_failures = 0
 
-    print(f"[{now_str()}] Scan start | watchlist_items={len(watchlist)}")
+    print(f"[{now_str()}] Scan start | watchlist_items={len(watchlist)} source={pipeline_stats.get('watchlist_source')}")
 
     for item in watchlist:
         counts["total"] += 1
@@ -1166,10 +1295,13 @@ def scan_markets() -> Dict[str, Any]:
                 skip_counter[reason or "Unknown"] += 1
 
         except Exception as e:
-            print(f"[{now_str()}] Market scan error for {item}: {e}")
+            print(f"[{now_str()}] Market scan error for {item.get('slug')}: {e}")
             counts["skip"] += 1
+            resolve_failures += 1
             skip_counter["Fetch/resolve error"] += 1
 
+    pipeline_stats["scan_resolve_failures"] = resolve_failures
+    last_pipeline_stats = pipeline_stats
     last_skip_counts = skip_counter
 
     results.sort(
@@ -1190,7 +1322,7 @@ def scan_markets() -> Dict[str, Any]:
         f"total={counts['total']} alert={counts['alert']} "
         f"watch={counts['watch']} skip={counts['skip']}"
     )
-    return {"counts": counts, "results": results[:30]}
+    return {"counts": counts, "results": results[:30], "pipeline": pipeline_stats}
 
 
 def qualifying_results(scan: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1223,6 +1355,7 @@ def near_miss_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "Bid depth too thin",
             "Ask depth too thin",
             "Chosen side depth too thin",
+            "Fetch/resolve error",
         }
     ]
     usable.sort(
@@ -1234,6 +1367,19 @@ def near_miss_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         )
     )
     return usable[:3]
+
+
+def format_pipeline_stats(pipeline: Dict[str, Any]) -> str:
+    return (
+        f"Pipeline: source={pipeline.get('watchlist_source', 'unknown')} | "
+        f"discover_prelim={pipeline.get('discover_prelim', 0)} | "
+        f"discover_checked={pipeline.get('discover_checked', 0)} | "
+        f"discover_kept={pipeline.get('discover_kept', 0)} | "
+        f"fallback_items={pipeline.get('fallback_items', 0)} | "
+        f"fallback_checked={pipeline.get('fallback_checked', 0)} | "
+        f"fallback_kept={pipeline.get('fallback_kept', 0)} | "
+        f"resolve_failures={pipeline.get('scan_resolve_failures', 0)}"
+    )
 
 
 def format_market_block(r: Dict[str, Any]) -> str:
@@ -1274,6 +1420,7 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
     top = qualifying_results(scan)
     counts = scan.get("counts", {})
     results = scan.get("results", [])
+    pipeline = scan.get("pipeline", {})
 
     if top:
         lines = [
@@ -1283,6 +1430,7 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
             f"Alerts: {counts.get('alert', 0)}",
             f"Watch: {counts.get('watch', 0)}",
             f"Skip: {counts.get('skip', 0)}",
+            format_pipeline_stats(pipeline),
             "",
             f"Qualifying markets: {len(top)}",
             "",
@@ -1300,6 +1448,7 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
             f"Alerts: {counts.get('alert', 0)}",
             f"Watch: {counts.get('watch', 0)}",
             f"Skip: {counts.get('skip', 0)}",
+            format_pipeline_stats(pipeline),
             "",
             f"Near-miss summary: {summarize_skip_reasons(results)}",
         ]
@@ -1328,7 +1477,7 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
             lines.extend([
                 "",
                 "No tradable near-misses found.",
-                "Most candidates failed preflight book checks, depth checks, or fill confidence.",
+                "Most candidates failed preflight, depth, fill confidence, or cached candidate resolution.",
             ])
 
         return "\n".join(lines).strip()
@@ -1470,6 +1619,7 @@ def health():
         "target_min_test_position_usd": TARGET_MIN_TEST_POSITION_USD,
         "target_max_test_position_usd": TARGET_MAX_TEST_POSITION_USD,
         "test_market_slug": TEST_MARKET_SLUG or "none",
+        "last_pipeline_stats": last_pipeline_stats,
     })
 
 
@@ -1541,7 +1691,8 @@ def webhook():
             f"manual_scan_in_progress={manual_scan_in_progress}\n"
             f"target_min_test_position_usd={TARGET_MIN_TEST_POSITION_USD}\n"
             f"target_max_test_position_usd={TARGET_MAX_TEST_POSITION_USD}\n"
-            f"test_market_slug={TEST_MARKET_SLUG or 'none'}"
+            f"test_market_slug={TEST_MARKET_SLUG or 'none'}\n"
+            f"last_pipeline_stats={last_pipeline_stats}"
         )
         send_telegram_message(chat_id, msg)
         return jsonify({"ok": True})

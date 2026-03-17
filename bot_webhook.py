@@ -2,6 +2,7 @@ import ast
 import os
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -23,21 +24,21 @@ MARKETS_URL = os.getenv(
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 BOT_LABEL = os.getenv("BOT_LABEL", "telegram-market-bot").strip()
 
-ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.20"))
-WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.12"))
-SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "false").lower() == "true"
+ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.08"))
+WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.03"))
+SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "true").lower() == "true"
 
-BASELINE_PROB = float(os.getenv("BASELINE_PROB", "0.50"))
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "50000"))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.05"))
+BASELINE_PROB = float(os.getenv("BASELINE_PROB", "0.40"))
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "25000"))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))
 MIN_BID = float(os.getenv("MIN_BID", "0.01"))
 MAX_ASK = float(os.getenv("MAX_ASK", "0.99"))
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 DEDUP_SECONDS = int(os.getenv("DEDUP_SECONDS", "3600"))
-SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "240"))
-MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "3"))
-ZERO_SUMMARY_EVERY_SECONDS = int(os.getenv("ZERO_SUMMARY_EVERY_SECONDS", "7200"))
+SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "0"))
+MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "5"))
+ZERO_SUMMARY_EVERY_SECONDS = int(os.getenv("ZERO_SUMMARY_EVERY_SECONDS", "21600"))
 
 AUTO_DISCOVER = os.getenv("AUTO_DISCOVER", "true").lower() == "true"
 DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "250"))
@@ -46,11 +47,14 @@ DISCOVER_MIN_VOLUME = float(os.getenv("DISCOVER_MIN_VOLUME", "100000"))
 DISCOVER_MIN_LIQUIDITY = float(os.getenv("DISCOVER_MIN_LIQUIDITY", "50000"))
 DISCOVER_KEYWORDS = os.getenv(
     "DISCOVER_KEYWORDS",
-    "bitcoin,btc,ethereum,eth,crypto,stocks,market,fed,rate,inflation,oil,sp500,nasdaq,election,president,politics",
+    "march,april,this month,by april,by march,end of march,end of april,price,hit,close,higher,lower,fed,rates,cpi,inflation,bitcoin,btc,ethereum,eth,oil,crude,sp500,nasdaq",
 ).strip()
 
 ENABLE_YES_NO_ONLY = os.getenv("ENABLE_YES_NO_ONLY", "true").lower() == "true"
 TEST_MARKET_SLUG = os.getenv("TEST_MARKET_SLUG", "").strip()
+
+SHORT_TERM_ONLY = os.getenv("SHORT_TERM_ONLY", "true").lower() == "true"
+MAX_DAYS_TO_END = int(os.getenv("MAX_DAYS_TO_END", "60"))
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
@@ -58,6 +62,9 @@ CLOB_BASE = "https://clob.polymarket.com"
 sent_cache: Dict[str, float] = {}
 _background_started = False
 _background_lock = threading.Lock()
+
+manual_scan_lock = threading.Lock()
+manual_scan_in_progress = False
 
 zero_scan_count = 0
 zero_window_started_at = time.time()
@@ -161,6 +168,78 @@ def normalize_command(text: str) -> str:
 
 
 # =========================================
+# DATE / SHORT-TERM FILTERS
+# =========================================
+def parse_dt(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            continue
+
+    return None
+
+
+def extract_end_datetime(market_data: Dict[str, Any]) -> Optional[datetime]:
+    candidates = [
+        market_data.get("endDate"),
+        market_data.get("end_date"),
+        market_data.get("expirationDate"),
+        market_data.get("expiration_date"),
+        market_data.get("closeDate"),
+        market_data.get("close_date"),
+        market_data.get("endTime"),
+        market_data.get("closeTime"),
+    ]
+
+    for c in candidates:
+        dt = parse_dt(c)
+        if dt:
+            return dt
+
+    return None
+
+
+def is_within_short_term_window(market_data: Dict[str, Any]) -> bool:
+    if not SHORT_TERM_ONLY:
+        return True
+
+    end_dt = extract_end_datetime(market_data)
+    if not end_dt:
+        return False
+
+    now = datetime.now(timezone.utc)
+    max_dt = now + timedelta(days=MAX_DAYS_TO_END)
+
+    return now <= end_dt <= max_dt
+
+
+# =========================================
 # MARKET HELPERS
 # =========================================
 def normalize_outcomes(market_data: Dict[str, Any]) -> List[str]:
@@ -246,7 +325,8 @@ def discover_markets() -> List[Dict[str, Any]]:
     print(
         f"[{now_str()}] Discover start | "
         f"limit={DISCOVER_LIMIT} page_size={DISCOVER_PAGE_SIZE} "
-        f"min_volume={DISCOVER_MIN_VOLUME} min_liquidity={DISCOVER_MIN_LIQUIDITY}"
+        f"min_volume={DISCOVER_MIN_VOLUME} min_liquidity={DISCOVER_MIN_LIQUIDITY} "
+        f"short_term_only={SHORT_TERM_ONLY} max_days_to_end={MAX_DAYS_TO_END}"
     )
 
     while len(found) < DISCOVER_LIMIT:
@@ -276,6 +356,9 @@ def discover_markets() -> List[Dict[str, Any]]:
                 continue
 
             if ENABLE_YES_NO_ONLY and not is_yes_no_market(m):
+                continue
+
+            if SHORT_TERM_ONLY and not is_within_short_term_window(m):
                 continue
 
             if not matches_keywords(f"{slug} {question}"):
@@ -337,6 +420,9 @@ def pick_best_market_from_event(event_data: Dict[str, Any]) -> Optional[Dict[str
         if ENABLE_YES_NO_ONLY and not is_yes_no_market(m):
             continue
 
+        if SHORT_TERM_ONLY and not is_within_short_term_window(m):
+            continue
+
         if active and not closed:
             filtered.append((liquidity, m))
 
@@ -374,6 +460,8 @@ def resolve_slug_to_market(slug: str) -> Tuple[Optional[Dict[str, Any]], Optiona
     if market:
         if ENABLE_YES_NO_ONLY and not is_yes_no_market(market):
             return None, None
+        if SHORT_TERM_ONLY and not is_within_short_term_window(market):
+            return None, None
         return market, "market"
 
     event = fetch_event_by_slug(slug)
@@ -408,7 +496,7 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
 
     market_data, source_type = resolve_slug_to_market(slug)
     if not market_data:
-        raise ValueError(f"Slug not found or not clean yes/no: {slug}")
+        raise ValueError(f"Slug not found or not short-term clean yes/no: {slug}")
 
     token_id = extract_yes_token_id(market_data)
     if not token_id:
@@ -430,6 +518,7 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     label = market_data.get("question") or market_data.get("title") or market_data.get("slug") or slug
+    end_dt = extract_end_datetime(market_data)
 
     return {
         "market_id": market_data.get("id", slug),
@@ -445,6 +534,7 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
         "spread": spread,
         "last_trade_price": last_trade,
         "token_id": token_id,
+        "end_dt": end_dt.isoformat() if end_dt else "",
     }
 
 
@@ -538,9 +628,12 @@ def format_market_block(r: Dict[str, Any]) -> str:
     yes_prob = to_float(r.get("yes_prob", r.get("live_prob", 0.0)), 0.0)
     no_prob = to_float(r.get("no_prob", 1.0 - yes_prob), 1.0 - yes_prob)
 
+    end_text = r.get("end_dt", "")
+    end_line = f"\nends={end_text}" if end_text else ""
+
     return (
         f"{r['category']} | {r['label']}\n"
-        f"slug={r.get('slug', '')}\n"
+        f"slug={r.get('slug', '')}{end_line}\n"
         f"YES={yes_prob:.1%} NO={no_prob:.1%} "
         f"base={r.get('baseline_prob', 0):.1%} "
         f"diff={r.get('imbalance', 0):.3f}\n"
@@ -557,11 +650,12 @@ def format_zero_summary(zero_count: int, seconds_in_window: int) -> str:
     return f"No qualifying markets in last {minutes} minutes.\nEmpty scans: {zero_count}"
 
 
-def format_manual_scan(scan: Dict[str, Any]) -> str:
+def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
     top = qualifying_results(scan)
-    counts = scan.get("counts", {})
-    results = scan.get("results", [])
+    if not top:
+        return None
 
+    counts = scan.get("counts", {})
     lines = [
         "Scan complete",
         "",
@@ -570,36 +664,31 @@ def format_manual_scan(scan: Dict[str, Any]) -> str:
         f"Watch: {counts.get('watch', 0)}",
         f"Skip: {counts.get('skip', 0)}",
         "",
+        f"Qualifying markets: {len(top)}",
+        "",
     ]
 
-    if top:
-        lines.append(f"Qualifying markets: {len(top)}")
+    for r in top[:5]:
+        lines.append(format_market_block(r))
         lines.append("")
-        for r in top[:5]:
-            lines.append(format_market_block(r))
-            lines.append("")
-        return "\n".join(lines).strip()
-
-    lines.append("No qualifying markets found.")
-    fallback = results[:3]
-
-    if fallback:
-        lines.append("")
-        lines.append("Top candidates:")
-        lines.append("")
-        for r in fallback:
-            lines.append(
-                f"{r.get('category', 'SKIP')} | {r.get('label', '')}\n"
-                f"slug={r.get('slug', '')}\n"
-                f"reason={r.get('reason') or 'No qualifying signal'}\n"
-                f"bid={r.get('best_bid', 0):.3f} "
-                f"ask={r.get('best_ask', 0):.3f} "
-                f"spread={r.get('spread', 0):.3f} "
-                f"liq={r.get('liquidity', 0):.0f}"
-            )
-            lines.append("")
 
     return "\n".join(lines).strip()
+
+
+def run_manual_scan_async(chat_id: str) -> None:
+    global manual_scan_in_progress
+
+    try:
+        scan = scan_markets()
+        msg = format_manual_scan(scan)
+        if msg:
+            send_telegram_message(chat_id, msg)
+    except Exception as e:
+        print(f"[{now_str()}] Manual scan error: {e}")
+        send_telegram_message(chat_id, f"Scan error: {e}")
+    finally:
+        with manual_scan_lock:
+            manual_scan_in_progress = False
 
 
 # =========================================
@@ -623,26 +712,16 @@ def auto_scan_loop() -> None:
             print(f"[{now_str()}] Auto scan tick")
             scan = scan_markets()
 
-            print(
-                f"[{now_str()}] Scan result | "
-                f"total={scan['counts']['total']} "
-                f"alert={scan['counts']['alert']} "
-                f"watch={scan['counts']['watch']} "
-                f"skip={scan['counts']['skip']}"
-            )
-
             candidates = qualifying_results(scan)[:MAX_ALERTS_PER_SCAN]
             now = time.time()
 
             if candidates:
                 zero_scan_count = 0
                 zero_window_started_at = now
-                print(f"[{now_str()}] Qualifying candidates found: {len(candidates)}")
 
                 for r in candidates:
                     dedupe_key = f"{r.get('slug')}|{r.get('category')}"
                     if already_sent(dedupe_key):
-                        print(f"[{now_str()}] Deduped signal: {dedupe_key}")
                         continue
 
                     send_telegram_message(TELEGRAM_CHAT_ID, format_market_block(r))
@@ -651,18 +730,7 @@ def auto_scan_loop() -> None:
                 zero_scan_count += 1
                 elapsed = now - zero_window_started_at
 
-                print(
-                    f"[{now_str()}] No qualifying markets | "
-                    f"elapsed_seconds={int(elapsed)} "
-                    f"empty_scans={zero_scan_count}"
-                )
-
                 if elapsed >= ZERO_SUMMARY_EVERY_SECONDS and zero_scan_count > 0:
-                    print(
-                        f"[{now_str()}] Zero summary trigger | "
-                        f"elapsed_seconds={int(elapsed)} "
-                        f"empty_scans={zero_scan_count}"
-                    )
                     send_telegram_message(
                         TELEGRAM_CHAT_ID,
                         format_zero_summary(zero_scan_count, int(elapsed)),
@@ -687,7 +755,6 @@ def start_background_worker_once() -> None:
         print(f"[{now_str()}] Background worker started.")
 
 
-# Start worker at boot
 start_background_worker_once()
 
 
@@ -702,6 +769,8 @@ def home():
         "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
         "scan_every_seconds": SCAN_EVERY_SECONDS,
         "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
+        "short_term_only": SHORT_TERM_ONLY,
+        "max_days_to_end": MAX_DAYS_TO_END,
     })
 
 
@@ -715,6 +784,17 @@ def health():
         "enable_yes_no_only": ENABLE_YES_NO_ONLY,
         "scan_every_seconds": SCAN_EVERY_SECONDS,
         "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
+        "short_term_only": SHORT_TERM_ONLY,
+        "max_days_to_end": MAX_DAYS_TO_END,
+        "discover_limit": DISCOVER_LIMIT,
+        "discover_min_volume": DISCOVER_MIN_VOLUME,
+        "discover_min_liquidity": DISCOVER_MIN_LIQUIDITY,
+        "min_liquidity": MIN_LIQUIDITY,
+        "max_spread": MAX_SPREAD,
+        "alert_threshold": ALERT_THRESHOLD,
+        "watch_threshold": WATCH_THRESHOLD,
+        "send_watch_alerts": SEND_WATCH_ALERTS,
+        "manual_scan_in_progress": manual_scan_in_progress,
     })
 
 
@@ -729,6 +809,8 @@ def scan_route():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    global manual_scan_in_progress
+
     data = request.get_json(silent=True) or {}
     print(f"[{now_str()}] WEBHOOK HIT: {data}")
 
@@ -754,24 +836,31 @@ def webhook():
             f"watch_threshold={WATCH_THRESHOLD}\n"
             f"send_watch_alerts={SEND_WATCH_ALERTS}\n"
             f"scan_every_seconds={SCAN_EVERY_SECONDS}\n"
-            f"zero_summary_every_seconds={ZERO_SUMMARY_EVERY_SECONDS}\n"
-            f"auto_scan_enabled={bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0)}\n"
+            f"short_term_only={SHORT_TERM_ONLY}\n"
+            f"max_days_to_end={MAX_DAYS_TO_END}\n"
+            f"discover_limit={DISCOVER_LIMIT}\n"
+            f"discover_min_volume={DISCOVER_MIN_VOLUME}\n"
+            f"discover_min_liquidity={DISCOVER_MIN_LIQUIDITY}\n"
+            f"min_liquidity={MIN_LIQUIDITY}\n"
+            f"max_spread={MAX_SPREAD}\n"
             f"auto_discover={AUTO_DISCOVER}\n"
             f"enable_yes_no_only={ENABLE_YES_NO_ONLY}\n"
+            f"manual_scan_in_progress={manual_scan_in_progress}\n"
             f"test_market_slug={TEST_MARKET_SLUG or 'none'}"
         )
         send_telegram_message(chat_id, msg)
         return jsonify({"ok": True})
 
     if command == "/scan":
-        try:
-            send_telegram_message(chat_id, "Running scan...")
-            scan = scan_markets()
-            msg = format_manual_scan(scan)
-            send_telegram_message(chat_id, msg)
-        except Exception as e:
-            print(f"[{now_str()}] Manual scan error: {e}")
-            send_telegram_message(chat_id, f"Scan error: {e}")
+        with manual_scan_lock:
+            if manual_scan_in_progress:
+                send_telegram_message(chat_id, "Scan already running. Wait for result.")
+                return jsonify({"ok": True})
+
+            manual_scan_in_progress = True
+
+        send_telegram_message(chat_id, "Running scan...")
+        threading.Thread(target=run_manual_scan_async, args=(chat_id,), daemon=True).start()
         return jsonify({"ok": True})
 
     return jsonify({"ok": True})

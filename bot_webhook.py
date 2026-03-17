@@ -1,5 +1,4 @@
 import ast
-import math
 import os
 import threading
 import time
@@ -80,6 +79,12 @@ MIN_FILL_CONFIDENCE = float(os.getenv("MIN_FILL_CONFIDENCE", "0.45"))
 MICRO_ALERT_SCORE = float(os.getenv("MICRO_ALERT_SCORE", "0.62"))
 MICRO_WATCH_SCORE = float(os.getenv("MICRO_WATCH_SCORE", "0.52"))
 
+# New preflight controls
+PREFLIGHT_MAX_SPREAD = float(os.getenv("PREFLIGHT_MAX_SPREAD", "0.12"))
+PREFLIGHT_MIN_BID = float(os.getenv("PREFLIGHT_MIN_BID", "0.03"))
+PREFLIGHT_MAX_ASK = float(os.getenv("PREFLIGHT_MAX_ASK", "0.97"))
+PREFLIGHT_MAX_CANDIDATES = int(os.getenv("PREFLIGHT_MAX_CANDIDATES", "60"))
+
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 
@@ -116,6 +121,8 @@ manual_scan_in_progress = False
 
 zero_scan_count = 0
 zero_window_started_at = time.time()
+
+last_skip_counts: Counter = Counter()
 
 
 # =========================================
@@ -417,6 +424,23 @@ def parse_watchlist_line(line: str) -> Optional[Dict[str, Any]]:
     return {"slug": slug, "baseline_prob": baseline}
 
 
+def level_size(level: Dict[str, Any]) -> float:
+    for key in ("size", "amount", "quantity"):
+        if key in level:
+            return to_float(level.get(key), 0.0)
+    return 0.0
+
+
+def top_depth(levels: List[Dict[str, Any]], count: int) -> float:
+    return round(sum(level_size(x) for x in levels[:count]), 6)
+
+
+def best_level_size(levels: List[Dict[str, Any]]) -> float:
+    if not levels:
+        return 0.0
+    return round(level_size(levels[0]), 6)
+
+
 # =========================================
 # DISCOVERY
 # =========================================
@@ -465,89 +489,6 @@ def discovery_priority(combined: str) -> float:
     return round(base, 4)
 
 
-def discover_markets() -> List[Dict[str, Any]]:
-    found: List[Dict[str, Any]] = []
-    seen = set()
-    offset = 0
-
-    print(
-        f"[{now_str()}] Discover start | "
-        f"limit={DISCOVER_LIMIT} page_size={DISCOVER_PAGE_SIZE} "
-        f"min_volume={DISCOVER_MIN_VOLUME} min_liquidity={DISCOVER_MIN_LIQUIDITY} "
-        f"short_term_only={SHORT_TERM_ONLY} max_days_to_end={MAX_DAYS_TO_END}"
-    )
-
-    while len(found) < DISCOVER_LIMIT:
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": DISCOVER_PAGE_SIZE,
-            "offset": offset,
-            "liquidity_num_min": DISCOVER_MIN_LIQUIDITY,
-            "volume_num_min": DISCOVER_MIN_VOLUME,
-        }
-
-        try:
-            batch = safe_get_json(f"{GAMMA_BASE}/markets", params=params)
-        except Exception as e:
-            print(f"[{now_str()}] Discover markets error: {e}")
-            break
-
-        if not isinstance(batch, list) or not batch:
-            break
-
-        for m in batch:
-            slug = (m.get("slug") or "").strip()
-            question = (m.get("question") or m.get("title") or "").strip()
-            combined = f"{slug} {question}".lower()
-
-            if not slug or slug in seen:
-                continue
-            if ENABLE_YES_NO_ONLY and not is_yes_no_market(m):
-                continue
-            if SHORT_TERM_ONLY and not is_within_short_term_window(m):
-                continue
-            if is_blocked_topic(combined):
-                continue
-            if looks_like_crypto_ladder_market(combined):
-                continue
-            if not is_allowed_topic(combined):
-                continue
-            if not matches_keywords(combined):
-                continue
-
-            seen.add(slug)
-            found.append({
-                "slug": slug,
-                "baseline_prob": BASELINE_PROB,
-                "discovery_priority": discovery_priority(combined),
-            })
-
-            if len(found) >= DISCOVER_LIMIT:
-                break
-
-        offset += DISCOVER_PAGE_SIZE
-
-    found.sort(key=lambda x: -to_float(x.get("discovery_priority"), 0.0))
-    print(f"[{now_str()}] Discover complete | found={len(found)}")
-    return found
-
-
-def fetch_watchlist() -> List[Dict[str, Any]]:
-    if TEST_MARKET_SLUG:
-        return [{"slug": TEST_MARKET_SLUG, "baseline_prob": BASELINE_PROB, "discovery_priority": 1.0}]
-
-    if AUTO_DISCOVER:
-        discovered = discover_markets()
-        if discovered:
-            return discovered
-
-    return fetch_watchlist_file()
-
-
-# =========================================
-# MARKET DATA
-# =========================================
 def fetch_market_by_slug(slug: str) -> Optional[Dict[str, Any]]:
     try:
         return safe_get_json(f"{GAMMA_BASE}/markets/slug/{slug}")
@@ -639,6 +580,176 @@ def resolve_slug_to_market(slug: str) -> Tuple[Optional[Dict[str, Any]], Optiona
     return None, None
 
 
+def preflight_book_check(market_data: Dict[str, Any], token_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        book = fetch_order_book(token_id)
+    except Exception:
+        return None
+
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+
+    best_bid = to_float(bids[0].get("price")) if bids else 0.0
+    best_ask = to_float(asks[0].get("price")) if asks else 0.0
+
+    if best_bid <= 0 or best_ask <= 0:
+        return None
+
+    spread = best_ask - best_bid
+    if spread <= 0:
+        return None
+    if best_bid < PREFLIGHT_MIN_BID:
+        return None
+    if best_ask > PREFLIGHT_MAX_ASK:
+        return None
+    if spread > PREFLIGHT_MAX_SPREAD:
+        return None
+
+    bid_depth = top_depth(bids, BOOK_LEVELS)
+    ask_depth = top_depth(asks, BOOK_LEVELS)
+    if bid_depth < MIN_TOP_DEPTH or ask_depth < MIN_TOP_DEPTH:
+        return None
+
+    midpoint = (best_bid + best_ask) / 2.0
+    if midpoint < MID_PRICE_MIN or midpoint > MID_PRICE_MAX:
+        return None
+
+    resolved_text = f"{market_data.get('slug', '')} {market_data.get('question', '')} {market_data.get('title', '')}".lower()
+    return {
+        "best_bid": round(best_bid, 6),
+        "best_ask": round(best_ask, 6),
+        "spread": round(spread, 6),
+        "bid_depth": round(bid_depth, 6),
+        "ask_depth": round(ask_depth, 6),
+        "midpoint": round(midpoint, 6),
+        "topic_category": classify_topic(resolved_text),
+        "label": market_data.get("question") or market_data.get("title") or market_data.get("slug") or "",
+        "resolved_text": resolved_text,
+    }
+
+
+def discover_markets() -> List[Dict[str, Any]]:
+    prelim: List[Dict[str, Any]] = []
+    seen = set()
+    offset = 0
+
+    print(
+        f"[{now_str()}] Discover start | "
+        f"limit={DISCOVER_LIMIT} page_size={DISCOVER_PAGE_SIZE} "
+        f"min_volume={DISCOVER_MIN_VOLUME} min_liquidity={DISCOVER_MIN_LIQUIDITY} "
+        f"short_term_only={SHORT_TERM_ONLY} max_days_to_end={MAX_DAYS_TO_END}"
+    )
+
+    while len(prelim) < DISCOVER_LIMIT:
+        params = {
+            "active": "true",
+            "closed": "false",
+            "limit": DISCOVER_PAGE_SIZE,
+            "offset": offset,
+            "liquidity_num_min": DISCOVER_MIN_LIQUIDITY,
+            "volume_num_min": DISCOVER_MIN_VOLUME,
+        }
+
+        try:
+            batch = safe_get_json(f"{GAMMA_BASE}/markets", params=params)
+        except Exception as e:
+            print(f"[{now_str()}] Discover markets error: {e}")
+            break
+
+        if not isinstance(batch, list) or not batch:
+            break
+
+        for m in batch:
+            slug = (m.get("slug") or "").strip()
+            question = (m.get("question") or m.get("title") or "").strip()
+            combined = f"{slug} {question}".lower()
+
+            if not slug or slug in seen:
+                continue
+            if ENABLE_YES_NO_ONLY and not is_yes_no_market(m):
+                continue
+            if SHORT_TERM_ONLY and not is_within_short_term_window(m):
+                continue
+            if is_blocked_topic(combined):
+                continue
+            if looks_like_crypto_ladder_market(combined):
+                continue
+            if not is_allowed_topic(combined):
+                continue
+            if not matches_keywords(combined):
+                continue
+
+            seen.add(slug)
+            prelim.append({
+                "slug": slug,
+                "baseline_prob": BASELINE_PROB,
+                "discovery_priority": discovery_priority(combined),
+            })
+
+            if len(prelim) >= DISCOVER_LIMIT:
+                break
+
+        offset += DISCOVER_PAGE_SIZE
+
+    prelim.sort(key=lambda x: -to_float(x.get("discovery_priority"), 0.0))
+
+    # Preflight gating: only keep books that already look tradable
+    kept: List[Dict[str, Any]] = []
+    checked = 0
+    for item in prelim:
+        if checked >= PREFLIGHT_MAX_CANDIDATES:
+            break
+
+        slug = item["slug"]
+        market_data, source_type = resolve_slug_to_market(slug)
+        if not market_data:
+            continue
+
+        token_id = extract_yes_token_id(market_data)
+        if not token_id:
+            continue
+
+        checked += 1
+        micro = preflight_book_check(market_data, token_id)
+        if not micro:
+            continue
+
+        item["topic_category"] = micro["topic_category"]
+        item["preflight_spread"] = micro["spread"]
+        item["preflight_midpoint"] = micro["midpoint"]
+        item["preflight_bid_depth"] = micro["bid_depth"]
+        item["preflight_ask_depth"] = micro["ask_depth"]
+        item["source_type"] = source_type
+        kept.append(item)
+
+    kept.sort(
+        key=lambda x: (
+            CATEGORY_PRIORITY.get(x.get("topic_category", "other"), 9),
+            -to_float(x.get("discovery_priority"), 0.0),
+            to_float(x.get("preflight_spread"), 9.0),
+            -min(to_float(x.get("preflight_bid_depth"), 0.0), to_float(x.get("preflight_ask_depth"), 0.0)),
+        )
+    )
+
+    print(f"[{now_str()}] Discover complete | prelim={len(prelim)} checked={checked} kept={len(kept)}")
+    return kept
+
+
+def fetch_watchlist() -> List[Dict[str, Any]]:
+    if TEST_MARKET_SLUG:
+        return [{"slug": TEST_MARKET_SLUG, "baseline_prob": BASELINE_PROB, "discovery_priority": 1.0}]
+
+    if AUTO_DISCOVER:
+        discovered = discover_markets()
+        if discovered:
+            return discovered
+
+    return fetch_watchlist_file()
+
+
+# =========================================
+# LIVE MARKET DATA
+# =========================================
 def choose_live_prob(best_bid: float, best_ask: float, last_trade: float) -> Tuple[float, str]:
     if best_bid > 0 and best_ask > 0 and best_ask >= best_bid:
         midpoint = round((best_bid + best_ask) / 2, 6)
@@ -650,27 +761,6 @@ def choose_live_prob(best_bid: float, best_ask: float, last_trade: float) -> Tup
     if best_ask > 0:
         return best_ask, "best_ask"
     return 0.0, "none"
-
-
-def level_price(level: Dict[str, Any]) -> float:
-    return to_float(level.get("price"), 0.0)
-
-
-def level_size(level: Dict[str, Any]) -> float:
-    for key in ("size", "amount", "quantity"):
-        if key in level:
-            return to_float(level.get(key), 0.0)
-    return 0.0
-
-
-def top_depth(levels: List[Dict[str, Any]], count: int) -> float:
-    return round(sum(level_size(x) for x in levels[:count]), 6)
-
-
-def best_level_size(levels: List[Dict[str, Any]]) -> float:
-    if not levels:
-        return 0.0
-    return round(level_size(levels[0]), 6)
 
 
 def compute_order_book_microstructure(
@@ -721,8 +811,7 @@ def estimate_fill_confidence(entry_price: float, top_side_depth: float, spread: 
     if MID_PRICE_MIN <= midpoint <= MID_PRICE_MAX:
         midpoint_score = 1.0
     else:
-        distance = min(abs(midpoint - MID_PRICE_MIN), abs(midpoint - MID_PRICE_MAX))
-        midpoint_score = clamp(1.0 - (distance / 0.20), 0.0, 1.0)
+        midpoint_score = 0.0
 
     score = (depth_score * 0.45) + (spread_score * 0.35) + (midpoint_score * 0.20)
 
@@ -748,10 +837,7 @@ def estimate_test_position_quality(best_bid: float, best_ask: float, liquidity: 
     spread_component = clamp((0.10 - spread) / 0.10, 0.0, 1.0)
     liquidity_component = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 1.0)
 
-    if MID_PRICE_MIN <= midpoint <= MID_PRICE_MAX:
-        midpoint_component = 1.0
-    else:
-        midpoint_component = 0.20
+    midpoint_component = 1.0 if MID_PRICE_MIN <= midpoint <= MID_PRICE_MAX else 0.0
 
     score = (spread_component * 0.45) + (liquidity_component * 0.25) + (midpoint_component * 0.30)
 
@@ -770,9 +856,7 @@ def estimate_shares(total_usd: float, price_per_share: float) -> float:
 
 def time_to_event_score(end_iso: str) -> float:
     dte = days_to_end(end_iso)
-    if dte is None:
-        return 0.0
-    if dte < 0:
+    if dte is None or dte < 0:
         return 0.0
     if dte <= 1:
         return 1.0
@@ -899,7 +983,6 @@ def side_micro_score(
     fill_confidence: float,
     category: str,
 ) -> Tuple[float, float]:
-    # Edge here is still modest and secondary.
     yes_edge = baseline_prob - live_prob
     no_edge = live_prob - baseline_prob
     edge = yes_edge if side == "YES" else no_edge
@@ -929,16 +1012,15 @@ def side_micro_score(
         edge_score = clamp(edge / abs(WATCH_THRESHOLD), 0.0, 0.45)
 
     total = (
-        (tiny_position_score * 0.30) +
+        (tiny_position_score * 0.28) +
         (pressure * 0.20) +
-        (fill_confidence * 0.15) +
-        (liquidity_score * 0.12) +
+        (fill_confidence * 0.18) +
+        (liquidity_score * 0.10) +
         (spread_score * 0.08) +
         (time_score * 0.10) +
-        (midpoint_zone * 0.05)
+        (midpoint_zone * 0.06)
     )
 
-    # edge is not dominant; it nudges
     total = total * (0.85 + 0.15 * edge_score) * category_bonus
     return round(total, 4), round(edge, 4)
 
@@ -956,6 +1038,8 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     time_score = to_float(m.get("time_score", 0.0), 0.0)
     obi = to_float(m.get("obi", 0.0), 0.0)
     category = m.get("topic_category", "other")
+    bid_depth = to_float(m.get("bid_depth", 0.0), 0.0)
+    ask_depth = to_float(m.get("ask_depth", 0.0), 0.0)
 
     if m.get("dead_book"):
         return "SKIP", f"Dead book ({m.get('dead_reason')})"
@@ -971,6 +1055,10 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         return "SKIP", "Spread too wide"
     if price_source == "last_trade":
         return "SKIP", "Last trade only"
+    if bid_depth < MIN_TOP_DEPTH:
+        return "SKIP", "Bid depth too thin"
+    if ask_depth < MIN_TOP_DEPTH:
+        return "SKIP", "Ask depth too thin"
     if tiny_position_score < 0.45:
         return "SKIP", f"Small-size weak ({m.get('tiny_position_note', 'weak')})"
     if midpoint_zone <= 0:
@@ -1010,6 +1098,7 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         fill_conf = to_float(m.get("yes_fill_confidence", 0.0), 0.0)
         fill_note = m.get("yes_fill_note", "")
         entry_price = to_float(m.get("yes_entry_price", 0.0), 0.0)
+        side_depth = ask_depth
     else:
         side = "NO"
         composite = no_score
@@ -1017,6 +1106,7 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         fill_conf = to_float(m.get("no_fill_confidence", 0.0), 0.0)
         fill_note = m.get("no_fill_note", "")
         entry_price = to_float(m.get("no_entry_price", 0.0), 0.0)
+        side_depth = bid_depth
 
     m["signal_side"] = side
     m["edge"] = edge
@@ -1024,12 +1114,15 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     m["fill_confidence"] = fill_conf
     m["fill_note"] = fill_note
     m["entry_price"] = entry_price
+    m["side_depth"] = side_depth
     m["yes_prob"] = live_prob
     m["no_prob"] = 1.0 - live_prob
     m["imbalance"] = live_prob - baseline_prob
     m["est_shares_min"] = estimate_shares(TARGET_MIN_TEST_POSITION_USD, entry_price)
     m["est_shares_max"] = estimate_shares(TARGET_MAX_TEST_POSITION_USD, entry_price)
 
+    if side_depth < MIN_TOP_DEPTH:
+        return "SKIP", "Chosen side depth too thin"
     if fill_conf < MIN_FILL_CONFIDENCE:
         return "SKIP", f"Fill confidence weak ({fill_note})"
 
@@ -1046,9 +1139,12 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
 # SCAN
 # =========================================
 def scan_markets() -> Dict[str, Any]:
+    global last_skip_counts
+
     watchlist = fetch_watchlist()
     results: List[Dict[str, Any]] = []
     counts = {"total": 0, "alert": 0, "watch": 0, "skip": 0}
+    skip_counter = Counter()
 
     print(f"[{now_str()}] Scan start | watchlist_items={len(watchlist)}")
 
@@ -1067,10 +1163,14 @@ def scan_markets() -> Dict[str, Any]:
                 counts["watch"] += 1
             else:
                 counts["skip"] += 1
+                skip_counter[reason or "Unknown"] += 1
 
         except Exception as e:
             print(f"[{now_str()}] Market scan error for {item}: {e}")
             counts["skip"] += 1
+            skip_counter["Fetch/resolve error"] += 1
+
+    last_skip_counts = skip_counter
 
     results.sort(
         key=lambda x: (
@@ -1103,8 +1203,10 @@ def qualifying_results(scan: Dict[str, Any]) -> List[Dict[str, Any]]:
 def summarize_skip_reasons(results: List[Dict[str, Any]]) -> str:
     reasons = [r.get("reason", "Unknown") for r in results if r.get("category") == "SKIP"]
     if not reasons:
+        reasons = list(last_skip_counts.elements())
+    if not reasons:
         return "No skip reasons available."
-    top = Counter(reasons).most_common(4)
+    top = Counter(reasons).most_common(6)
     return " | ".join(f"{k}: {v}" for k, v in top)
 
 
@@ -1118,6 +1220,9 @@ def near_miss_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "Spread too wide",
             "Liquidity too low",
             "Last trade only",
+            "Bid depth too thin",
+            "Ask depth too thin",
+            "Chosen side depth too thin",
         }
     ]
     usable.sort(
@@ -1150,6 +1255,7 @@ def format_market_block(r: Dict[str, Any]) -> str:
         f"obi={r.get('obi', 0):.3f} "
         f"bid_depth={r.get('bid_depth', 0):.2f} "
         f"ask_depth={r.get('ask_depth', 0):.2f} "
+        f"side_depth={r.get('side_depth', 0):.2f} "
         f"time_score={r.get('time_score', 0):.2f}\n"
         f"bid={r.get('best_bid', 0):.3f} "
         f"ask={r.get('best_ask', 0):.3f} "
@@ -1213,7 +1319,8 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
                     f"fill={r.get('fill_note', '')} fill_score={r.get('fill_confidence', 0):.3f} "
                     f"tiny={r.get('tiny_position_note', '')} tiny_score={r.get('tiny_position_score', 0):.3f}\n"
                     f"obi={r.get('obi', 0):.3f} "
-                    f"bid={r.get('best_bid', 0):.3f} ask={r.get('best_ask', 0):.3f} "
+                    f"bid_depth={r.get('bid_depth', 0):.2f} "
+                    f"ask_depth={r.get('ask_depth', 0):.2f} "
                     f"spread={r.get('spread', 0):.3f} liq={r.get('liquidity', 0):.0f}"
                 )
                 lines.append("")
@@ -1221,7 +1328,7 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
             lines.extend([
                 "",
                 "No tradable near-misses found.",
-                "Most candidates were rejected as dead books, one-sided books, or weak tiny-size fills.",
+                "Most candidates failed preflight book checks, depth checks, or fill confidence.",
             ])
 
         return "\n".join(lines).strip()
@@ -1348,16 +1455,20 @@ def health():
         "mid_price_min": MID_PRICE_MIN,
         "mid_price_max": MID_PRICE_MAX,
         "block_crypto_ladders": BLOCK_CRYPTO_LADDERS,
-        "auto_discover": AUTO_DISCOVER,
-        "enable_yes_no_only": ENABLE_YES_NO_ONLY,
-        "manual_scan_in_progress": manual_scan_in_progress,
-        "target_min_test_position_usd": TARGET_MIN_TEST_POSITION_USD,
-        "target_max_test_position_usd": TARGET_MAX_TEST_POSITION_USD,
         "book_levels": BOOK_LEVELS,
         "min_top_depth": MIN_TOP_DEPTH,
         "min_fill_confidence": MIN_FILL_CONFIDENCE,
         "micro_alert_score": MICRO_ALERT_SCORE,
         "micro_watch_score": MICRO_WATCH_SCORE,
+        "preflight_max_spread": PREFLIGHT_MAX_SPREAD,
+        "preflight_min_bid": PREFLIGHT_MIN_BID,
+        "preflight_max_ask": PREFLIGHT_MAX_ASK,
+        "preflight_max_candidates": PREFLIGHT_MAX_CANDIDATES,
+        "auto_discover": AUTO_DISCOVER,
+        "enable_yes_no_only": ENABLE_YES_NO_ONLY,
+        "manual_scan_in_progress": manual_scan_in_progress,
+        "target_min_test_position_usd": TARGET_MIN_TEST_POSITION_USD,
+        "target_max_test_position_usd": TARGET_MAX_TEST_POSITION_USD,
         "test_market_slug": TEST_MARKET_SLUG or "none",
     })
 
@@ -1421,6 +1532,10 @@ def webhook():
             f"min_fill_confidence={MIN_FILL_CONFIDENCE}\n"
             f"micro_alert_score={MICRO_ALERT_SCORE}\n"
             f"micro_watch_score={MICRO_WATCH_SCORE}\n"
+            f"preflight_max_spread={PREFLIGHT_MAX_SPREAD}\n"
+            f"preflight_min_bid={PREFLIGHT_MIN_BID}\n"
+            f"preflight_max_ask={PREFLIGHT_MAX_ASK}\n"
+            f"preflight_max_candidates={PREFLIGHT_MAX_CANDIDATES}\n"
             f"auto_discover={AUTO_DISCOVER}\n"
             f"enable_yes_no_only={ENABLE_YES_NO_ONLY}\n"
             f"manual_scan_in_progress={manual_scan_in_progress}\n"

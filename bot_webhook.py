@@ -1,7 +1,9 @@
 import ast
+import math
 import os
 import threading
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,54 +26,46 @@ MARKETS_URL = os.getenv(
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 BOT_LABEL = os.getenv("BOT_LABEL", "telegram-market-bot").strip()
 
-# YES-side thresholds: YES may be underpriced
-ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.08"))
-WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.03"))
+ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.10"))
+WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.05"))
 
-# NO-side thresholds: YES may be overpriced, so NO may be better
-NO_ALERT_THRESHOLD = float(os.getenv("NO_ALERT_THRESHOLD", "0.08"))
-NO_WATCH_THRESHOLD = float(os.getenv("NO_WATCH_THRESHOLD", "0.03"))
-
-SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "true").lower() == "true"
-DEBUG_SCAN_OUTPUT = os.getenv("DEBUG_SCAN_OUTPUT", "false").lower() == "true"
+SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "false").lower() == "true"
+DEBUG_SCAN_OUTPUT = os.getenv("DEBUG_SCAN_OUTPUT", "true").lower() == "true"
 
 BASELINE_PROB = float(os.getenv("BASELINE_PROB", "0.40"))
 
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "50000"))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.06"))
-MIN_BID = float(os.getenv("MIN_BID", "0.05"))
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "10000"))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.05"))
+MIN_BID = float(os.getenv("MIN_BID", "0.03"))
 MAX_ASK = float(os.getenv("MAX_ASK", "0.90"))
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 DEDUP_SECONDS = int(os.getenv("DEDUP_SECONDS", "3600"))
 
-# 24/7 default = every 120 minutes
 SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "7200"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "3"))
 ZERO_SUMMARY_EVERY_SECONDS = int(os.getenv("ZERO_SUMMARY_EVERY_SECONDS", "21600"))
 
 AUTO_DISCOVER = os.getenv("AUTO_DISCOVER", "true").lower() == "true"
-DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "50"))
+DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "250"))
 DISCOVER_PAGE_SIZE = int(os.getenv("DISCOVER_PAGE_SIZE", "100"))
-DISCOVER_MIN_VOLUME = float(os.getenv("DISCOVER_MIN_VOLUME", "100000"))
-DISCOVER_MIN_LIQUIDITY = float(os.getenv("DISCOVER_MIN_LIQUIDITY", "50000"))
+DISCOVER_MIN_VOLUME = float(os.getenv("DISCOVER_MIN_VOLUME", "25000"))
+DISCOVER_MIN_LIQUIDITY = float(os.getenv("DISCOVER_MIN_LIQUIDITY", "10000"))
 
 DISCOVER_KEYWORDS = os.getenv(
     "DISCOVER_KEYWORDS",
-    "fed,fomc,rates,rate hike,rate cut,interest,cpi,inflation,ppi,unemployment,bitcoin,btc,ethereum,eth,solana,sol,price,target,range,hit,reach,above,below,over,under,close,settle,expiry,by date,end of,weekly,monthly,sp500,s&p,nasdaq,index,dow,oil,crude,wti,gold,yield,bond,treasury",
+    "fed,fomc,rates,rate hike,rate cut,interest,cpi,inflation,ppi,unemployment,bitcoin,btc,ethereum,eth,solana,sol,approval,decision,announce,launch,ban,legal,etf,policy,election,primary,vote,debate,tariff,sanction,default,shutdown,opec,meeting,treasury,yield,bond,gold,oil,crude,wti,sp500,s&p,nasdaq,index,dow,weekly,monthly,by date,end of",
 ).strip()
 
 ENABLE_YES_NO_ONLY = os.getenv("ENABLE_YES_NO_ONLY", "true").lower() == "true"
 TEST_MARKET_SLUG = os.getenv("TEST_MARKET_SLUG", "").strip()
 
 SHORT_TERM_ONLY = os.getenv("SHORT_TERM_ONLY", "true").lower() == "true"
-MAX_DAYS_TO_END = int(os.getenv("MAX_DAYS_TO_END", "30"))
+MAX_DAYS_TO_END = int(os.getenv("MAX_DAYS_TO_END", "14"))
 
-# $1-$5 total trade budget
 TARGET_MIN_TEST_POSITION_USD = float(os.getenv("TARGET_MIN_TEST_POSITION_USD", "1"))
 TARGET_MAX_TEST_POSITION_USD = float(os.getenv("TARGET_MAX_TEST_POSITION_USD", "5"))
 
-# Stronger book quality filters
 EARLY_MIN_BID = float(os.getenv("EARLY_MIN_BID", "0.03"))
 EARLY_MAX_ASK = float(os.getenv("EARLY_MAX_ASK", "0.97"))
 EARLY_MAX_SPREAD = float(os.getenv("EARLY_MAX_SPREAD", "0.20"))
@@ -80,28 +74,37 @@ MID_PRICE_MAX = float(os.getenv("MID_PRICE_MAX", "0.95"))
 
 BLOCK_CRYPTO_LADDERS = os.getenv("BLOCK_CRYPTO_LADDERS", "true").lower() == "true"
 
+BOOK_LEVELS = int(os.getenv("BOOK_LEVELS", "3"))
+MIN_TOP_DEPTH = float(os.getenv("MIN_TOP_DEPTH", "10"))
+MIN_FILL_CONFIDENCE = float(os.getenv("MIN_FILL_CONFIDENCE", "0.45"))
+MICRO_ALERT_SCORE = float(os.getenv("MICRO_ALERT_SCORE", "0.62"))
+MICRO_WATCH_SCORE = float(os.getenv("MICRO_WATCH_SCORE", "0.52"))
+
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
-
-CATEGORY_WHITELIST = [
-    "fed", "fomc", "rates", "rate", "interest", "cpi", "inflation", "ppi", "unemployment",
-    "bitcoin", "btc", "ethereum", "eth", "solana", "sol",
-    "price", "target", "range", "hit", "reach", "above", "below", "over", "under", "close", "settle",
-    "sp500", "s&p", "nasdaq", "index", "dow",
-    "oil", "crude", "wti", "gold", "yield", "bond", "treasury"
-]
 
 NEGATIVE_BLOCKLIST = [
     "war", "military", "offensive", "strike", "israel", "iran", "lebanon",
     "gaza", "missile", "attack", "ground offensive", "troops", "yemen",
-    "post", "tweets", "tweet", "celebrity", "actor", "singer"
+    "post", "tweets", "tweet", "celebrity", "actor", "singer",
+]
+
+CATEGORY_WHITELIST = [
+    "fed", "fomc", "rates", "rate", "interest", "cpi", "inflation", "ppi", "unemployment",
+    "bitcoin", "btc", "ethereum", "eth", "solana", "sol",
+    "approval", "decision", "announce", "launch", "ban", "legal", "etf",
+    "policy", "election", "primary", "vote", "debate", "tariff", "sanction", "default", "shutdown",
+    "sp500", "s&p", "nasdaq", "index", "dow",
+    "oil", "crude", "wti", "gold", "yield", "bond", "treasury",
+    "weekly", "monthly", "by date", "end of", "meeting",
 ]
 
 CATEGORY_PRIORITY = {
     "crypto": 0,
     "macro": 1,
     "index_commodity": 2,
-    "other": 3,
+    "politics_event": 3,
+    "other": 4,
 }
 
 sent_cache: Dict[str, float] = {}
@@ -126,7 +129,6 @@ def send_telegram_message(chat_id: str, text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not chat_id or not text.strip():
         print(f"[{now_str()}] Telegram send skipped | missing token/chat_id/text")
         return
-
     try:
         r = requests.post(
             f"{TELEGRAM_API_URL}/sendMessage",
@@ -177,27 +179,21 @@ def mark_sent(key: str) -> None:
 def parse_jsonish_list(value: Any) -> List[Any]:
     if value is None:
         return []
-
     if isinstance(value, list):
         return value
-
     if isinstance(value, str):
         s = value.strip()
         if not s:
             return []
-
         try:
             parsed = ast.literal_eval(s)
             if isinstance(parsed, list):
                 return parsed
         except Exception:
             pass
-
         if "," in s:
             return [x.strip().strip('"').strip("'") for x in s.split(",") if x.strip()]
-
         return [s]
-
     return []
 
 
@@ -205,15 +201,18 @@ def normalize_command(text: str) -> str:
     t = (text or "").strip()
     if not t.startswith("/"):
         return t
-
     first = t.split()[0].strip().lower()
     if "@" in first:
         first = first.split("@")[0]
     return first
 
 
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
 # =========================================
-# DATE / SHORT-TERM FILTERS
+# DATE / SHORT TERM
 # =========================================
 def parse_dt(value: Any) -> Optional[datetime]:
     if not value:
@@ -242,8 +241,7 @@ def parse_dt(value: Any) -> Optional[datetime]:
 
     for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
         try:
-            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
-            return dt
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
         except Exception:
             continue
 
@@ -261,41 +259,46 @@ def extract_end_datetime(market_data: Dict[str, Any]) -> Optional[datetime]:
         market_data.get("endTime"),
         market_data.get("closeTime"),
     ]
-
     for c in candidates:
         dt = parse_dt(c)
         if dt:
             return dt
-
     return None
 
 
 def is_within_short_term_window(market_data: Dict[str, Any]) -> bool:
     if not SHORT_TERM_ONLY:
         return True
-
     end_dt = extract_end_datetime(market_data)
     if not end_dt:
         return False
-
     now = datetime.now(timezone.utc)
     max_dt = now + timedelta(days=MAX_DAYS_TO_END)
     return now <= end_dt <= max_dt
 
 
+def days_to_end(end_iso: str) -> Optional[float]:
+    dt = parse_dt(end_iso)
+    if not dt:
+        return None
+    delta = dt - datetime.now(timezone.utc)
+    return delta.total_seconds() / 86400.0
+
+
 # =========================================
-# TOPIC FILTERS
+# TOPICS
 # =========================================
 def classify_topic(text: str) -> str:
     t = (text or "").lower()
 
     if any(k in t for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol"]):
         return "crypto"
-    if any(k in t for k in ["fed", "fomc", "rate", "rates", "interest", "cpi", "inflation", "ppi", "unemployment", "yield", "bond", "treasury"]):
+    if any(k in t for k in ["fed", "fomc", "rate", "rates", "interest", "cpi", "inflation", "ppi", "unemployment", "yield", "bond", "treasury", "opec", "tariff", "sanction", "default", "shutdown"]):
         return "macro"
     if any(k in t for k in ["sp500", "s&p", "nasdaq", "index", "dow", "oil", "crude", "wti", "gold"]):
         return "index_commodity"
-
+    if any(k in t for k in ["election", "primary", "vote", "debate", "president", "secretary", "senate", "house", "governor"]):
+        return "politics_event"
     return "other"
 
 
@@ -314,8 +317,7 @@ def looks_like_crypto_ladder_market(text: str) -> bool:
         return False
 
     t = (text or "").lower()
-    crypto_hit = any(k in t for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol"])
-    if not crypto_hit:
+    if not any(k in t for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol"]):
         return False
 
     ladder_phrases = [
@@ -331,8 +333,10 @@ def looks_like_crypto_ladder_market(text: str) -> bool:
         "will bitcoin hit",
         "will ethereum hit",
         "will solana hit",
+        "between $",
         "above $",
         "below $",
+        "dip to",
     ]
     return any(p in t for p in ladder_phrases)
 
@@ -349,13 +353,13 @@ def normalize_outcomes(market_data: Dict[str, Any]) -> List[str]:
 
     tokens = market_data.get("tokens") or []
     if isinstance(tokens, list):
-        token_outcomes = []
+        result = []
         for t in tokens:
             outcome = t.get("outcome")
             if outcome is not None:
-                token_outcomes.append(str(outcome).strip())
-        if token_outcomes:
-            return token_outcomes
+                result.append(str(outcome).strip())
+        if result:
+            return result
 
     return []
 
@@ -375,7 +379,6 @@ def is_dead_book(best_bid: float, best_ask: float) -> Tuple[bool, str]:
     spread = best_ask - best_bid
     if spread <= 0:
         return True, "no-spread"
-
     if best_bid < EARLY_MIN_BID:
         return True, "bid-too-low-early"
     if best_ask > EARLY_MAX_ASK:
@@ -390,58 +393,8 @@ def is_dead_book(best_bid: float, best_ask: float) -> Tuple[bool, str]:
     return False, ""
 
 
-# =========================================
-# WATCHLIST / DISCOVERY
-# =========================================
-def parse_watchlist_line(line: str) -> Optional[Dict[str, Any]]:
-    raw = line.strip()
-    if not raw or raw.startswith("#"):
-        return None
-
-    parts = [p.strip() for p in raw.split("|")]
-    slug = parts[0]
-    baseline = BASELINE_PROB
-
-    if len(parts) >= 2 and parts[1]:
-        baseline = to_float(parts[1], BASELINE_PROB)
-
-    return {"slug": slug, "baseline_prob": baseline}
-
-
-def fetch_watchlist_file() -> List[Dict[str, Any]]:
-    try:
-        r = requests.get(MARKETS_URL, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        lines = [x.strip() for x in r.text.splitlines() if x.strip()]
-        items = []
-
-        for line in lines:
-            parsed = parse_watchlist_line(line)
-            if not parsed:
-                continue
-
-            slug_text = parsed["slug"].lower()
-            if is_blocked_topic(slug_text):
-                continue
-            if looks_like_crypto_ladder_market(slug_text):
-                continue
-            if not is_allowed_topic(slug_text):
-                continue
-
-            parsed["topic_category"] = classify_topic(slug_text)
-            items.append(parsed)
-
-        print(f"[{now_str()}] Watchlist file loaded | items={len(items)}")
-        return items
-    except Exception as e:
-        print(f"[{now_str()}] Watchlist fetch error: {e}")
-        return []
-
-
 def keyword_list() -> List[str]:
     raw = (DISCOVER_KEYWORDS or "").strip().strip('"').strip("'")
-    if raw.lower().startswith("discover_keywords="):
-        raw = raw.split("=", 1)[1].strip()
     return [x.strip().lower() for x in raw.split(",") if x.strip()]
 
 
@@ -450,6 +403,66 @@ def matches_keywords(text: str) -> bool:
         return False
     t = text.lower()
     return any(k in t for k in keyword_list())
+
+
+def parse_watchlist_line(line: str) -> Optional[Dict[str, Any]]:
+    raw = line.strip()
+    if not raw or raw.startswith("#"):
+        return None
+    parts = [p.strip() for p in raw.split("|")]
+    slug = parts[0]
+    baseline = BASELINE_PROB
+    if len(parts) >= 2 and parts[1]:
+        baseline = to_float(parts[1], BASELINE_PROB)
+    return {"slug": slug, "baseline_prob": baseline}
+
+
+# =========================================
+# DISCOVERY
+# =========================================
+def fetch_watchlist_file() -> List[Dict[str, Any]]:
+    try:
+        r = requests.get(MARKETS_URL, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        lines = [x.strip() for x in r.text.splitlines() if x.strip()]
+        items = []
+        for line in lines:
+            parsed = parse_watchlist_line(line)
+            if not parsed:
+                continue
+            slug_text = parsed["slug"].lower()
+            if is_blocked_topic(slug_text):
+                continue
+            if looks_like_crypto_ladder_market(slug_text):
+                continue
+            if not is_allowed_topic(slug_text):
+                continue
+            items.append(parsed)
+        print(f"[{now_str()}] Watchlist file loaded | items={len(items)}")
+        return items
+    except Exception as e:
+        print(f"[{now_str()}] Watchlist fetch error: {e}")
+        return []
+
+
+def discovery_priority(combined: str) -> float:
+    topic = classify_topic(combined)
+    base = {
+        "crypto": 1.00,
+        "macro": 0.95,
+        "index_commodity": 0.90,
+        "politics_event": 0.82,
+        "other": 0.70,
+    }.get(topic, 0.70)
+
+    if any(k in combined for k in ["approval", "decision", "announce", "launch", "meeting", "by date", "end of"]):
+        base += 0.08
+    if "weekly" in combined or "monthly" in combined:
+        base += 0.03
+    if looks_like_crypto_ladder_market(combined):
+        base -= 0.50
+
+    return round(base, 4)
 
 
 def discover_markets() -> List[Dict[str, Any]]:
@@ -507,7 +520,7 @@ def discover_markets() -> List[Dict[str, Any]]:
             found.append({
                 "slug": slug,
                 "baseline_prob": BASELINE_PROB,
-                "topic_category": classify_topic(combined),
+                "discovery_priority": discovery_priority(combined),
             })
 
             if len(found) >= DISCOVER_LIMIT:
@@ -515,31 +528,21 @@ def discover_markets() -> List[Dict[str, Any]]:
 
         offset += DISCOVER_PAGE_SIZE
 
+    found.sort(key=lambda x: -to_float(x.get("discovery_priority"), 0.0))
     print(f"[{now_str()}] Discover complete | found={len(found)}")
     return found
 
 
 def fetch_watchlist() -> List[Dict[str, Any]]:
     if TEST_MARKET_SLUG:
-        return [{
-            "slug": TEST_MARKET_SLUG,
-            "baseline_prob": BASELINE_PROB,
-            "topic_category": "other",
-        }]
+        return [{"slug": TEST_MARKET_SLUG, "baseline_prob": BASELINE_PROB, "discovery_priority": 1.0}]
 
     if AUTO_DISCOVER:
         discovered = discover_markets()
         if discovered:
             return discovered
 
-    fallback = fetch_watchlist_file()
-    filtered = []
-    for item in fallback:
-        category = item.get("topic_category") or classify_topic(item.get("slug", ""))
-        if category in {"crypto", "macro", "index_commodity"}:
-            item["topic_category"] = category
-            filtered.append(item)
-    return filtered
+    return fetch_watchlist_file()
 
 
 # =========================================
@@ -587,7 +590,6 @@ def pick_best_market_from_event(event_data: Dict[str, Any]) -> Optional[Dict[str
     if filtered:
         filtered.sort(key=lambda x: x[0], reverse=True)
         return filtered[0][1]
-
     return None
 
 
@@ -605,7 +607,6 @@ def extract_yes_token_id(market_data: Dict[str, Any]) -> Optional[str]:
     token_id = market_data.get("clobTokenId") or market_data.get("asset_id")
     if token_id:
         return str(token_id)
-
     return None
 
 
@@ -651,30 +652,112 @@ def choose_live_prob(best_bid: float, best_ask: float, last_trade: float) -> Tup
     return 0.0, "none"
 
 
-def estimate_test_position_quality(best_bid: float, best_ask: float, liquidity: float) -> Tuple[float, str]:
-    if best_bid <= 0 or best_ask <= 0:
-        return 0.0, "no-two-sided-book"
+def level_price(level: Dict[str, Any]) -> float:
+    return to_float(level.get("price"), 0.0)
+
+
+def level_size(level: Dict[str, Any]) -> float:
+    for key in ("size", "amount", "quantity"):
+        if key in level:
+            return to_float(level.get(key), 0.0)
+    return 0.0
+
+
+def top_depth(levels: List[Dict[str, Any]], count: int) -> float:
+    return round(sum(level_size(x) for x in levels[:count]), 6)
+
+
+def best_level_size(levels: List[Dict[str, Any]]) -> float:
+    if not levels:
+        return 0.0
+    return round(level_size(levels[0]), 6)
+
+
+def compute_order_book_microstructure(
+    bids: List[Dict[str, Any]],
+    asks: List[Dict[str, Any]],
+    best_bid: float,
+    best_ask: float,
+) -> Dict[str, float]:
+    bid_depth = top_depth(bids, BOOK_LEVELS)
+    ask_depth = top_depth(asks, BOOK_LEVELS)
+    best_bid_size = best_level_size(bids)
+    best_ask_size = best_level_size(asks)
+
+    total_depth = bid_depth + ask_depth
+    obi = 0.0
+    if total_depth > 0:
+        obi = (bid_depth - ask_depth) / total_depth
 
     spread = max(0.0, best_ask - best_bid)
     midpoint = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
 
-    if best_bid < EARLY_MIN_BID:
-        return 0.0, "bid-dead"
+    return {
+        "bid_depth": round(bid_depth, 6),
+        "ask_depth": round(ask_depth, 6),
+        "best_bid_size": round(best_bid_size, 6),
+        "best_ask_size": round(best_ask_size, 6),
+        "obi": round(obi, 6),
+        "midpoint": round(midpoint, 6),
+        "spread": round(spread, 6),
+    }
+
+
+def estimate_fill_confidence(entry_price: float, top_side_depth: float, spread: float, midpoint: float) -> Tuple[float, str]:
+    if entry_price <= 0:
+        return 0.0, "no-entry"
+    if spread <= 0:
+        return 0.0, "no-spread"
+    if top_side_depth <= 0:
+        return 0.0, "no-depth"
+
+    target_notional = TARGET_MAX_TEST_POSITION_USD
+    est_shares = target_notional / max(entry_price, 1e-9)
+    depth_ratio = top_side_depth / max(est_shares, 1e-9)
+
+    depth_score = clamp(depth_ratio / 3.0, 0.0, 1.0)
+    spread_score = clamp((0.10 - spread) / 0.10, 0.0, 1.0)
+
+    if MID_PRICE_MIN <= midpoint <= MID_PRICE_MAX:
+        midpoint_score = 1.0
+    else:
+        distance = min(abs(midpoint - MID_PRICE_MIN), abs(midpoint - MID_PRICE_MAX))
+        midpoint_score = clamp(1.0 - (distance / 0.20), 0.0, 1.0)
+
+    score = (depth_score * 0.45) + (spread_score * 0.35) + (midpoint_score * 0.20)
+
+    if score >= 0.75:
+        note = "fill-strong"
+    elif score >= 0.55:
+        note = "fill-possible"
+    else:
+        note = "fill-weak"
+
+    return round(score, 4), note
+
+
+def estimate_test_position_quality(best_bid: float, best_ask: float, liquidity: float, midpoint: float) -> Tuple[float, str]:
+    if best_bid <= 0 or best_ask <= 0:
+        return 0.0, "no-two-sided-book"
     if best_ask > EARLY_MAX_ASK:
         return 0.0, "ask-pinned"
-    if spread > EARLY_MAX_SPREAD:
-        return 0.0, "spread-dead"
-    if midpoint < MID_PRICE_MIN or midpoint > MID_PRICE_MAX:
-        return 0.0, "one-sided-mid"
+    if best_bid < EARLY_MIN_BID:
+        return 0.0, "bid-dead"
 
-    spread_component = max(0.0, 0.10 - spread) / 0.10
+    spread = max(0.0, best_ask - best_bid)
+    spread_component = clamp((0.10 - spread) / 0.10, 0.0, 1.0)
     liquidity_component = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 1.0)
 
-    score = (spread_component * 0.65) + (liquidity_component * 0.35)
+    if MID_PRICE_MIN <= midpoint <= MID_PRICE_MAX:
+        midpoint_component = 1.0
+    else:
+        midpoint_component = 0.20
+
+    score = (spread_component * 0.45) + (liquidity_component * 0.25) + (midpoint_component * 0.30)
 
     if score >= 0.75:
         return round(score, 4), "small-size-friendly"
-    if score >= 0.45:
+    if score >= 0.55:
         return round(score, 4), "small-size-possible"
     return round(score, 4), "small-size-weak"
 
@@ -685,10 +768,38 @@ def estimate_shares(total_usd: float, price_per_share: float) -> float:
     return round(total_usd / price_per_share, 2)
 
 
+def time_to_event_score(end_iso: str) -> float:
+    dte = days_to_end(end_iso)
+    if dte is None:
+        return 0.0
+    if dte < 0:
+        return 0.0
+    if dte <= 1:
+        return 1.0
+    if dte <= 3:
+        return 0.90
+    if dte <= 7:
+        return 0.80
+    if dte <= 10:
+        return 0.65
+    if dte <= 14:
+        return 0.50
+    return 0.25
+
+
+def midpoint_zone_score(midpoint: float) -> float:
+    if 0.20 <= midpoint <= 0.80:
+        return 1.0
+    if 0.15 <= midpoint <= 0.85:
+        return 0.80
+    if MID_PRICE_MIN <= midpoint <= MID_PRICE_MAX:
+        return 0.55
+    return 0.0
+
+
 def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
     slug = item["slug"]
     baseline_prob = to_float(item.get("baseline_prob"), BASELINE_PROB)
-    topic_category = item.get("topic_category", "other")
 
     market_data, source_type = resolve_slug_to_market(slug)
     if not market_data:
@@ -699,7 +810,6 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"No YES token ID found for slug: {slug}")
 
     book = fetch_order_book(token_id)
-
     bids = book.get("bids") or []
     asks = book.get("asks") or []
 
@@ -712,13 +822,27 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
     live_prob, price_source = choose_live_prob(best_bid, best_ask, last_trade)
     liquidity = to_float(market_data.get("liquidityClob", market_data.get("liquidity", 0.0)), 0.0)
 
-    tiny_position_score, tiny_position_note = estimate_test_position_quality(best_bid, best_ask, liquidity)
-
     label = market_data.get("question") or market_data.get("title") or market_data.get("slug") or slug
+    resolved_text = f"{market_data.get('slug', '')} {market_data.get('question', '')} {market_data.get('title', '')}".lower()
+    topic_category = classify_topic(resolved_text)
+
     end_dt = extract_end_datetime(market_data)
+    end_iso = end_dt.isoformat() if end_dt else ""
+
+    micro = compute_order_book_microstructure(bids, asks, best_bid, best_ask)
+    tiny_position_score, tiny_position_note = estimate_test_position_quality(
+        best_bid, best_ask, liquidity, micro["midpoint"]
+    )
 
     yes_entry_price = best_ask if best_ask > 0 else 0.0
     no_entry_price = round(1.0 - best_bid, 6) if best_bid > 0 else 0.0
+
+    yes_fill_confidence, yes_fill_note = estimate_fill_confidence(
+        yes_entry_price, micro["ask_depth"], spread, micro["midpoint"]
+    )
+    no_fill_confidence, no_fill_note = estimate_fill_confidence(
+        no_entry_price, micro["bid_depth"], spread, 1.0 - micro["midpoint"] if micro["midpoint"] > 0 else 0.0
+    )
 
     return {
         "market_id": market_data.get("id", slug),
@@ -735,19 +859,90 @@ def fetch_live_market_data(item: Dict[str, Any]) -> Dict[str, Any]:
         "spread": spread,
         "last_trade_price": last_trade,
         "token_id": token_id,
-        "end_dt": end_dt.isoformat() if end_dt else "",
+        "end_dt": end_iso,
         "tiny_position_score": tiny_position_score,
         "tiny_position_note": tiny_position_note,
         "dead_book": dead_book,
         "dead_reason": dead_reason,
         "yes_entry_price": yes_entry_price,
         "no_entry_price": no_entry_price,
+        "resolved_text": resolved_text,
+        "bid_depth": micro["bid_depth"],
+        "ask_depth": micro["ask_depth"],
+        "best_bid_size": micro["best_bid_size"],
+        "best_ask_size": micro["best_ask_size"],
+        "obi": micro["obi"],
+        "midpoint": micro["midpoint"],
+        "yes_fill_confidence": yes_fill_confidence,
+        "yes_fill_note": yes_fill_note,
+        "no_fill_confidence": no_fill_confidence,
+        "no_fill_note": no_fill_note,
+        "time_score": time_to_event_score(end_iso),
+        "midpoint_zone_score": midpoint_zone_score(micro["midpoint"]),
+        "discovery_priority": to_float(item.get("discovery_priority"), 0.0),
     }
 
 
 # =========================================
 # CLASSIFICATION / SCORING
 # =========================================
+def side_micro_score(
+    side: str,
+    live_prob: float,
+    baseline_prob: float,
+    spread: float,
+    liquidity: float,
+    tiny_position_score: float,
+    midpoint_zone: float,
+    time_score: float,
+    obi: float,
+    fill_confidence: float,
+    category: str,
+) -> Tuple[float, float]:
+    # Edge here is still modest and secondary.
+    yes_edge = baseline_prob - live_prob
+    no_edge = live_prob - baseline_prob
+    edge = yes_edge if side == "YES" else no_edge
+
+    spread_score = clamp((MAX_SPREAD - spread) / max(MAX_SPREAD, 1e-9), 0.0, 1.0)
+    liquidity_score = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 1.0)
+
+    if side == "YES":
+        pressure = clamp((obi + 1.0) / 2.0, 0.0, 1.0)
+    else:
+        pressure = clamp((1.0 - obi) / 2.0, 0.0, 1.0)
+
+    category_bonus = {
+        "crypto": 1.00,
+        "macro": 0.95,
+        "index_commodity": 0.92,
+        "politics_event": 0.86,
+        "other": 0.78,
+    }.get(category, 0.78)
+
+    edge_score = 0.0
+    if edge >= abs(ALERT_THRESHOLD):
+        edge_score = 1.0
+    elif edge >= abs(WATCH_THRESHOLD):
+        edge_score = 0.60
+    elif edge > 0:
+        edge_score = clamp(edge / abs(WATCH_THRESHOLD), 0.0, 0.45)
+
+    total = (
+        (tiny_position_score * 0.30) +
+        (pressure * 0.20) +
+        (fill_confidence * 0.15) +
+        (liquidity_score * 0.12) +
+        (spread_score * 0.08) +
+        (time_score * 0.10) +
+        (midpoint_zone * 0.05)
+    )
+
+    # edge is not dominant; it nudges
+    total = total * (0.85 + 0.15 * edge_score) * category_bonus
+    return round(total, 4), round(edge, 4)
+
+
 def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     liquidity = to_float(m.get("liquidity", 0), 0.0)
     spread = to_float(m.get("spread", 0), 0.0)
@@ -755,8 +950,12 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     best_ask = to_float(m.get("best_ask", 0), 0.0)
     price_source = (m.get("price_source") or "").strip()
     live_prob = to_float(m.get("live_prob", 0.0), 0.0)
-    baseline_prob = to_float(m.get("baseline_prob", BASELINE_PROB), BASELINE_PROB)
+    baseline_prob = to_float(m.get("baseline_prob"), BASELINE_PROB)
     tiny_position_score = to_float(m.get("tiny_position_score", 0.0), 0.0)
+    midpoint_zone = to_float(m.get("midpoint_zone_score", 0.0), 0.0)
+    time_score = to_float(m.get("time_score", 0.0), 0.0)
+    obi = to_float(m.get("obi", 0.0), 0.0)
+    category = m.get("topic_category", "other")
 
     if m.get("dead_book"):
         return "SKIP", f"Dead book ({m.get('dead_reason')})"
@@ -774,71 +973,71 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         return "SKIP", "Last trade only"
     if tiny_position_score < 0.45:
         return "SKIP", f"Small-size weak ({m.get('tiny_position_note', 'weak')})"
+    if midpoint_zone <= 0:
+        return "SKIP", "Midpoint outside tradable zone"
 
-    yes_edge = baseline_prob - live_prob
-    no_edge = live_prob - baseline_prob
-
-    yes_strength = 0.0
-    no_strength = 0.0
-
-    if yes_edge >= abs(ALERT_THRESHOLD):
-        yes_strength = 1.0
-    elif yes_edge >= abs(WATCH_THRESHOLD):
-        yes_strength = 0.6
-
-    if no_edge >= NO_ALERT_THRESHOLD:
-        no_strength = 1.0
-    elif no_edge >= NO_WATCH_THRESHOLD:
-        no_strength = 0.6
-
-    spread_score = max(0.0, MAX_SPREAD - spread) / max(MAX_SPREAD, 1e-9)
-    liquidity_score = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 1.0)
-    category_bonus = {
-        "crypto": 1.00,
-        "macro": 0.95,
-        "index_commodity": 0.90,
-        "other": 0.75,
-    }.get(m.get("topic_category", "other"), 0.75)
-
-    tradability_core = (
-        (spread_score * 0.35)
-        + (liquidity_score * 0.20)
-        + (tiny_position_score * 0.30)
-        + 0.15
+    yes_score, yes_edge = side_micro_score(
+        "YES",
+        live_prob,
+        baseline_prob,
+        spread,
+        liquidity,
+        tiny_position_score,
+        midpoint_zone,
+        time_score,
+        obi,
+        to_float(m.get("yes_fill_confidence", 0.0), 0.0),
+        category,
+    )
+    no_score, no_edge = side_micro_score(
+        "NO",
+        live_prob,
+        baseline_prob,
+        spread,
+        liquidity,
+        tiny_position_score,
+        midpoint_zone,
+        time_score,
+        obi,
+        to_float(m.get("no_fill_confidence", 0.0), 0.0),
+        category,
     )
 
-    yes_composite = tradability_core * (0.70 + 0.30 * yes_strength) * category_bonus
-    no_composite = tradability_core * (0.70 + 0.30 * no_strength) * category_bonus
-
-    if yes_composite >= no_composite:
+    if yes_score >= no_score:
         side = "YES"
+        composite = yes_score
         edge = yes_edge
-        side_strength = yes_strength
+        fill_conf = to_float(m.get("yes_fill_confidence", 0.0), 0.0)
+        fill_note = m.get("yes_fill_note", "")
         entry_price = to_float(m.get("yes_entry_price", 0.0), 0.0)
-        m["signal_side"] = side
-        m["edge"] = edge
-        m["composite_score"] = round(yes_composite, 4)
     else:
         side = "NO"
+        composite = no_score
         edge = no_edge
-        side_strength = no_strength
+        fill_conf = to_float(m.get("no_fill_confidence", 0.0), 0.0)
+        fill_note = m.get("no_fill_note", "")
         entry_price = to_float(m.get("no_entry_price", 0.0), 0.0)
-        m["signal_side"] = side
-        m["edge"] = edge
-        m["composite_score"] = round(no_composite, 4)
 
+    m["signal_side"] = side
+    m["edge"] = edge
+    m["composite_score"] = round(composite, 4)
+    m["fill_confidence"] = fill_conf
+    m["fill_note"] = fill_note
+    m["entry_price"] = entry_price
     m["yes_prob"] = live_prob
     m["no_prob"] = 1.0 - live_prob
     m["imbalance"] = live_prob - baseline_prob
-    m["entry_price"] = entry_price
     m["est_shares_min"] = estimate_shares(TARGET_MIN_TEST_POSITION_USD, entry_price)
     m["est_shares_max"] = estimate_shares(TARGET_MAX_TEST_POSITION_USD, entry_price)
 
-    if side_strength >= 1.0 and m["composite_score"] >= 0.62:
-        return "ALERT", f"{side} side score={m['composite_score']:.3f} edge={edge:.3f}"
+    if fill_conf < MIN_FILL_CONFIDENCE:
+        return "SKIP", f"Fill confidence weak ({fill_note})"
 
-    if side_strength >= 0.6 and m["composite_score"] >= 0.50:
-        return "WATCH", f"{side} side score={m['composite_score']:.3f} edge={edge:.3f}"
+    if composite >= MICRO_ALERT_SCORE and edge > 0:
+        return "ALERT", f"{side} microstructure score={composite:.3f} edge={edge:.3f}"
+
+    if composite >= MICRO_WATCH_SCORE:
+        return "WATCH", f"{side} near-ready score={composite:.3f} edge={edge:.3f}"
 
     return "SKIP", "No qualifying signal"
 
@@ -878,9 +1077,11 @@ def scan_markets() -> Dict[str, Any]:
             0 if x.get("category") == "ALERT" else 1 if x.get("category") == "WATCH" else 2,
             CATEGORY_PRIORITY.get(x.get("topic_category", "other"), 9),
             0 if not x.get("dead_book") else 1,
-            -to_float(x.get("tiny_position_score"), 0.0),
             -to_float(x.get("composite_score"), 0.0),
-            -abs(to_float(x.get("edge"), 0.0)),
+            -to_float(x.get("fill_confidence"), 0.0),
+            -to_float(x.get("tiny_position_score"), 0.0),
+            -to_float(x.get("time_score"), 0.0),
+            -abs(to_float(x.get("obi"), 0.0)),
         )
     )
 
@@ -889,7 +1090,7 @@ def scan_markets() -> Dict[str, Any]:
         f"total={counts['total']} alert={counts['alert']} "
         f"watch={counts['watch']} skip={counts['skip']}"
     )
-    return {"counts": counts, "results": results[:20]}
+    return {"counts": counts, "results": results[:30]}
 
 
 def qualifying_results(scan: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -897,6 +1098,37 @@ def qualifying_results(scan: Dict[str, Any]) -> List[Dict[str, Any]]:
         r for r in scan["results"]
         if r["category"] == "ALERT" or (r["category"] == "WATCH" and SEND_WATCH_ALERTS)
     ]
+
+
+def summarize_skip_reasons(results: List[Dict[str, Any]]) -> str:
+    reasons = [r.get("reason", "Unknown") for r in results if r.get("category") == "SKIP"]
+    if not reasons:
+        return "No skip reasons available."
+    top = Counter(reasons).most_common(4)
+    return " | ".join(f"{k}: {v}" for k, v in top)
+
+
+def near_miss_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    usable = [
+        r for r in results
+        if not r.get("dead_book")
+        and r.get("reason") not in {
+            "Bid too low",
+            "Ask too high",
+            "Spread too wide",
+            "Liquidity too low",
+            "Last trade only",
+        }
+    ]
+    usable.sort(
+        key=lambda x: (
+            -to_float(x.get("composite_score"), 0.0),
+            -to_float(x.get("fill_confidence"), 0.0),
+            -to_float(x.get("tiny_position_score"), 0.0),
+            -to_float(x.get("time_score"), 0.0),
+        )
+    )
+    return usable[:3]
 
 
 def format_market_block(r: Dict[str, Any]) -> str:
@@ -913,8 +1145,12 @@ def format_market_block(r: Dict[str, Any]) -> str:
         f"entry_price={r.get('entry_price', 0):.3f} "
         f"test_size=${TARGET_MIN_TEST_POSITION_USD:.0f}-${TARGET_MAX_TEST_POSITION_USD:.0f} "
         f"est_shares={r.get('est_shares_min', 0)}-{r.get('est_shares_max', 0)}\n"
-        f"tiny_size={r.get('tiny_position_note', '')} "
-        f"tiny_score={r.get('tiny_position_score', 0):.3f}\n"
+        f"fill={r.get('fill_note', '')} fill_score={r.get('fill_confidence', 0):.3f} "
+        f"tiny_size={r.get('tiny_position_note', '')} tiny_score={r.get('tiny_position_score', 0):.3f}\n"
+        f"obi={r.get('obi', 0):.3f} "
+        f"bid_depth={r.get('bid_depth', 0):.2f} "
+        f"ask_depth={r.get('ask_depth', 0):.2f} "
+        f"time_score={r.get('time_score', 0):.2f}\n"
         f"bid={r.get('best_bid', 0):.3f} "
         f"ask={r.get('best_ask', 0):.3f} "
         f"spread={r.get('spread', 0):.3f} "
@@ -945,11 +1181,9 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
             f"Qualifying markets: {len(top)}",
             "",
         ]
-
         for r in top[:5]:
             lines.append(format_market_block(r))
             lines.append("")
-
         return "\n".join(lines).strip()
 
     if DEBUG_SCAN_OUTPUT:
@@ -960,43 +1194,35 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
             f"Alerts: {counts.get('alert', 0)}",
             f"Watch: {counts.get('watch', 0)}",
             f"Skip: {counts.get('skip', 0)}",
+            "",
+            f"Near-miss summary: {summarize_skip_reasons(results)}",
         ]
 
-        fallback = [
-            r for r in results
-            if not r.get("dead_book")
-            and r.get("reason") not in {
-                "Bid too low",
-                "Ask too high",
-                "Spread too wide",
-            }
-        ][:3]
-
-        if not fallback:
-            fallback = [r for r in results if not r.get("dead_book")][:3]
-
-        if not fallback:
-            fallback = results[:3]
-
-        if fallback:
-            lines.extend(["", "Top candidates:", ""])
-            for r in fallback:
+        near = near_miss_results(results)
+        if near:
+            lines.extend(["", "Closest tradable near-misses:", ""])
+            for r in near:
                 lines.append(
                     f"{r.get('category', 'SKIP')} | {r.get('label', '')}\n"
                     f"slug={r.get('slug', '')}\n"
-                    f"reason={r.get('reason') or r.get('dead_reason') or 'No qualifying signal'}\n"
+                    f"reason={r.get('reason', 'No qualifying signal')}\n"
                     f"topic={r.get('topic_category', 'other')} side={r.get('signal_side', '?')}\n"
                     f"ends={r.get('end_dt', '') or 'unknown'}\n"
                     f"entry_price={r.get('entry_price', 0):.3f} "
                     f"est_shares={r.get('est_shares_min', 0)}-{r.get('est_shares_max', 0)}\n"
-                    f"tiny_size={r.get('tiny_position_note', '')} tiny_score={r.get('tiny_position_score', 0):.3f}\n"
-                    f"score={r.get('composite_score', 0):.3f} "
-                    f"bid={r.get('best_bid', 0):.3f} "
-                    f"ask={r.get('best_ask', 0):.3f} "
-                    f"spread={r.get('spread', 0):.3f} "
-                    f"liq={r.get('liquidity', 0):.0f}"
+                    f"fill={r.get('fill_note', '')} fill_score={r.get('fill_confidence', 0):.3f} "
+                    f"tiny={r.get('tiny_position_note', '')} tiny_score={r.get('tiny_position_score', 0):.3f}\n"
+                    f"obi={r.get('obi', 0):.3f} "
+                    f"bid={r.get('best_bid', 0):.3f} ask={r.get('best_ask', 0):.3f} "
+                    f"spread={r.get('spread', 0):.3f} liq={r.get('liquidity', 0):.0f}"
                 )
                 lines.append("")
+        else:
+            lines.extend([
+                "",
+                "No tradable near-misses found.",
+                "Most candidates were rejected as dead books, one-sided books, or weak tiny-size fills.",
+            ])
 
         return "\n".join(lines).strip()
 
@@ -1005,7 +1231,6 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
 
 def run_manual_scan_async(chat_id: str) -> None:
     global manual_scan_in_progress
-
     try:
         scan = scan_markets()
         msg = format_manual_scan(scan)
@@ -1049,13 +1274,11 @@ def auto_scan_loop() -> None:
                     dedupe_key = f"{r.get('slug')}|{r.get('category')}|{r.get('signal_side')}"
                     if already_sent(dedupe_key):
                         continue
-
                     send_telegram_message(TELEGRAM_CHAT_ID, format_market_block(r))
                     mark_sent(dedupe_key)
             else:
                 zero_scan_count += 1
                 elapsed = now - zero_window_started_at
-
                 if elapsed >= ZERO_SUMMARY_EVERY_SECONDS and zero_scan_count > 0:
                     send_telegram_message(
                         TELEGRAM_CHAT_ID,
@@ -1105,11 +1328,11 @@ def health():
     return jsonify({
         "ok": True,
         "service": BOT_LABEL,
-        "auto_discover": AUTO_DISCOVER,
-        "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
-        "enable_yes_no_only": ENABLE_YES_NO_ONLY,
+        "alert_threshold": ALERT_THRESHOLD,
+        "watch_threshold": WATCH_THRESHOLD,
+        "send_watch_alerts": SEND_WATCH_ALERTS,
+        "debug_scan_output": DEBUG_SCAN_OUTPUT,
         "scan_every_seconds": SCAN_EVERY_SECONDS,
-        "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
         "short_term_only": SHORT_TERM_ONLY,
         "max_days_to_end": MAX_DAYS_TO_END,
         "discover_limit": DISCOVER_LIMIT,
@@ -1125,15 +1348,17 @@ def health():
         "mid_price_min": MID_PRICE_MIN,
         "mid_price_max": MID_PRICE_MAX,
         "block_crypto_ladders": BLOCK_CRYPTO_LADDERS,
-        "alert_threshold": ALERT_THRESHOLD,
-        "watch_threshold": WATCH_THRESHOLD,
-        "no_alert_threshold": NO_ALERT_THRESHOLD,
-        "no_watch_threshold": NO_WATCH_THRESHOLD,
-        "send_watch_alerts": SEND_WATCH_ALERTS,
-        "debug_scan_output": DEBUG_SCAN_OUTPUT,
+        "auto_discover": AUTO_DISCOVER,
+        "enable_yes_no_only": ENABLE_YES_NO_ONLY,
         "manual_scan_in_progress": manual_scan_in_progress,
         "target_min_test_position_usd": TARGET_MIN_TEST_POSITION_USD,
         "target_max_test_position_usd": TARGET_MAX_TEST_POSITION_USD,
+        "book_levels": BOOK_LEVELS,
+        "min_top_depth": MIN_TOP_DEPTH,
+        "min_fill_confidence": MIN_FILL_CONFIDENCE,
+        "micro_alert_score": MICRO_ALERT_SCORE,
+        "micro_watch_score": MICRO_WATCH_SCORE,
+        "test_market_slug": TEST_MARKET_SLUG or "none",
     })
 
 
@@ -1173,8 +1398,6 @@ def webhook():
             "Health check\n"
             f"alert_threshold={ALERT_THRESHOLD}\n"
             f"watch_threshold={WATCH_THRESHOLD}\n"
-            f"no_alert_threshold={NO_ALERT_THRESHOLD}\n"
-            f"no_watch_threshold={NO_WATCH_THRESHOLD}\n"
             f"send_watch_alerts={SEND_WATCH_ALERTS}\n"
             f"debug_scan_output={DEBUG_SCAN_OUTPUT}\n"
             f"scan_every_seconds={SCAN_EVERY_SECONDS}\n"
@@ -1193,6 +1416,11 @@ def webhook():
             f"mid_price_min={MID_PRICE_MIN}\n"
             f"mid_price_max={MID_PRICE_MAX}\n"
             f"block_crypto_ladders={BLOCK_CRYPTO_LADDERS}\n"
+            f"book_levels={BOOK_LEVELS}\n"
+            f"min_top_depth={MIN_TOP_DEPTH}\n"
+            f"min_fill_confidence={MIN_FILL_CONFIDENCE}\n"
+            f"micro_alert_score={MICRO_ALERT_SCORE}\n"
+            f"micro_watch_score={MICRO_WATCH_SCORE}\n"
             f"auto_discover={AUTO_DISCOVER}\n"
             f"enable_yes_no_only={ENABLE_YES_NO_ONLY}\n"
             f"manual_scan_in_progress={manual_scan_in_progress}\n"

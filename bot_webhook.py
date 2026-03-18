@@ -124,6 +124,7 @@ zero_window_started_at = time.time()
 last_skip_counts: Counter = Counter()
 last_pipeline_stats: Dict[str, Any] = {}
 last_preflight_reason_counts: Dict[str, Any] = {}
+last_near_passes: Dict[str, Any] = {"discover": [], "fallback": []}
 
 CANDIDATE_CACHE_TTL_SECONDS = 90
 
@@ -538,59 +539,133 @@ def resolve_slug_to_market(slug: str) -> Tuple[Optional[Dict[str, Any]], Optiona
 
 
 def preflight_book_check(market_data: Dict[str, Any], token_id: str) -> Optional[Dict[str, Any]]:
+    label = market_data.get("question") or market_data.get("title") or market_data.get("slug") or ""
+
     try:
         book = fetch_order_book(token_id)
     except Exception:
-        return {"ok": False, "reason": "book_fetch_failed"}
+        return {"ok": False, "reason": "book_fetch_failed", "label": label, "distance_to_pass": 999.0}
 
     bids = book.get("bids") or []
     asks = book.get("asks") or []
 
     best_bid = to_float(bids[0].get("price")) if bids else 0.0
     best_ask = to_float(asks[0].get("price")) if asks else 0.0
-
-    if best_bid <= 0:
-        return {"ok": False, "reason": "preflight_no_bid"}
-    if best_ask <= 0:
-        return {"ok": False, "reason": "preflight_no_ask"}
-
-    spread = best_ask - best_bid
-    if spread <= 0:
-        return {"ok": False, "reason": "preflight_no_spread"}
-    if best_bid < PREFLIGHT_MIN_BID:
-        return {"ok": False, "reason": "preflight_bid_too_low", "best_bid": round(best_bid, 6), "best_ask": round(best_ask, 6), "spread": round(spread, 6)}
-    if best_ask > PREFLIGHT_MAX_ASK:
-        return {"ok": False, "reason": "preflight_ask_too_high", "best_bid": round(best_bid, 6), "best_ask": round(best_ask, 6), "spread": round(spread, 6)}
-    if spread > PREFLIGHT_MAX_SPREAD:
-        return {"ok": False, "reason": "preflight_spread_too_wide", "best_bid": round(best_bid, 6), "best_ask": round(best_ask, 6), "spread": round(spread, 6)}
-
     bid_depth = top_depth(bids, BOOK_LEVELS)
     ask_depth = top_depth(asks, BOOK_LEVELS)
-    if bid_depth < MIN_TOP_DEPTH:
-        return {"ok": False, "reason": "preflight_bid_depth_thin", "bid_depth": round(bid_depth, 6), "ask_depth": round(ask_depth, 6)}
-    if ask_depth < MIN_TOP_DEPTH:
-        return {"ok": False, "reason": "preflight_ask_depth_thin", "bid_depth": round(bid_depth, 6), "ask_depth": round(ask_depth, 6)}
+    spread = max(0.0, best_ask - best_bid) if best_bid > 0 and best_ask > 0 else 0.0
+    midpoint = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
 
-    midpoint = (best_bid + best_ask) / 2.0
-    if midpoint < MID_PRICE_MIN or midpoint > MID_PRICE_MAX:
-        return {"ok": False, "reason": "preflight_midpoint_outside", "midpoint": round(midpoint, 6)}
-
-    resolved_text = f"{market_data.get('slug', '')} {market_data.get('question', '')} {market_data.get('title', '')}".lower()
-
-    return {
-        "ok": True,
-        "reason": "ok",
-        "book": book,
+    base = {
+        "label": label,
         "best_bid": round(best_bid, 6),
         "best_ask": round(best_ask, 6),
         "spread": round(spread, 6),
         "bid_depth": round(bid_depth, 6),
         "ask_depth": round(ask_depth, 6),
         "midpoint": round(midpoint, 6),
-        "topic_category": classify_topic(resolved_text),
-        "label": market_data.get("question") or market_data.get("title") or market_data.get("slug") or "",
-        "resolved_text": resolved_text,
     }
+
+    if best_bid <= 0:
+        return {**base, "ok": False, "reason": "preflight_no_bid", "distance_to_pass": 999.0}
+    if best_ask <= 0:
+        return {**base, "ok": False, "reason": "preflight_no_ask", "distance_to_pass": 999.0}
+    if spread <= 0:
+        return {**base, "ok": False, "reason": "preflight_no_spread", "distance_to_pass": 999.0}
+    if best_bid < PREFLIGHT_MIN_BID:
+        return {
+            **base,
+            "ok": False,
+            "reason": "preflight_bid_too_low",
+            "distance_to_pass": round(PREFLIGHT_MIN_BID - best_bid, 6),
+            "distance_note": f"bid short by {round(PREFLIGHT_MIN_BID - best_bid, 6)}",
+        }
+    if best_ask > PREFLIGHT_MAX_ASK:
+        return {
+            **base,
+            "ok": False,
+            "reason": "preflight_ask_too_high",
+            "distance_to_pass": round(best_ask - PREFLIGHT_MAX_ASK, 6),
+            "distance_note": f"ask above cap by {round(best_ask - PREFLIGHT_MAX_ASK, 6)}",
+        }
+    if spread > PREFLIGHT_MAX_SPREAD:
+        return {
+            **base,
+            "ok": False,
+            "reason": "preflight_spread_too_wide",
+            "distance_to_pass": round(spread - PREFLIGHT_MAX_SPREAD, 6),
+            "distance_note": f"spread wide by {round(spread - PREFLIGHT_MAX_SPREAD, 6)}",
+        }
+    if bid_depth < MIN_TOP_DEPTH:
+        return {
+            **base,
+            "ok": False,
+            "reason": "preflight_bid_depth_thin",
+            "distance_to_pass": round(MIN_TOP_DEPTH - bid_depth, 6),
+            "distance_note": f"bid depth short by {round(MIN_TOP_DEPTH - bid_depth, 6)}",
+        }
+    if ask_depth < MIN_TOP_DEPTH:
+        return {
+            **base,
+            "ok": False,
+            "reason": "preflight_ask_depth_thin",
+            "distance_to_pass": round(MIN_TOP_DEPTH - ask_depth, 6),
+            "distance_note": f"ask depth short by {round(MIN_TOP_DEPTH - ask_depth, 6)}",
+        }
+    if midpoint < MID_PRICE_MIN or midpoint > MID_PRICE_MAX:
+        midpoint_distance = (MID_PRICE_MIN - midpoint) if midpoint < MID_PRICE_MIN else (midpoint - MID_PRICE_MAX)
+        return {
+            **base,
+            "ok": False,
+            "reason": "preflight_midpoint_outside",
+            "distance_to_pass": round(midpoint_distance, 6),
+            "distance_note": f"midpoint outside by {round(midpoint_distance, 6)}",
+        }
+
+    resolved_text = f"{market_data.get('slug', '')} {market_data.get('question', '')} {market_data.get('title', '')}".lower()
+
+    return {
+        **base,
+        "ok": True,
+        "reason": "ok",
+        "book": book,
+        "topic_category": classify_topic(resolved_text),
+        "label": label,
+        "resolved_text": resolved_text,
+        "distance_to_pass": 0.0,
+    }
+
+
+def record_preflight_near_pass(stats: Dict[str, Any], candidate: Dict[str, Any], bucket_key: str) -> None:
+    if not candidate or candidate.get("ok"):
+        return
+
+    reason = candidate.get("reason", "unknown")
+    if reason in {"resolve_failed", "token_missing", "book_fetch_failed"}:
+        return
+
+    micro = candidate.get("micro") or {}
+    label = micro.get("label") or candidate.get("slug") or ""
+    entry = {
+        "label": label,
+        "slug": candidate.get("slug", ""),
+        "reason": reason,
+        "distance_to_pass": to_float(micro.get("distance_to_pass"), 999.0),
+        "distance_note": micro.get("distance_note", ""),
+        "best_bid": to_float(micro.get("best_bid"), 0.0),
+        "best_ask": to_float(micro.get("best_ask"), 0.0),
+        "spread": to_float(micro.get("spread"), 0.0),
+        "bid_depth": to_float(micro.get("bid_depth"), 0.0),
+        "ask_depth": to_float(micro.get("ask_depth"), 0.0),
+        "midpoint": to_float(micro.get("midpoint"), 0.0),
+    }
+
+    key = f"{bucket_key}_near_passes"
+    arr = stats.setdefault(key, [])
+    arr.append(entry)
+    arr.sort(key=lambda x: (to_float(x.get("distance_to_pass"), 999.0), to_float(x.get("spread"), 999.0), -max(to_float(x.get("bid_depth"), 0.0), to_float(x.get("ask_depth"), 0.0))))
+    if len(arr) > 5:
+        del arr[5:]
 
 
 def discovery_priority(combined: str) -> float:
@@ -672,6 +747,7 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "discover_resolve_failures": 0,
         "discover_preflight_failures": 0,
         "discover_preflight_reason_counts": {},
+        "discover_near_passes": [],
     }
 
     print(
@@ -754,6 +830,7 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 stats["discover_preflight_failures"] += 1
                 reason_counts = stats.setdefault("discover_preflight_reason_counts", {})
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                record_preflight_near_pass(stats, candidate, "discover")
             continue
 
         kept.append(candidate)
@@ -830,6 +907,7 @@ def build_prefiltered_fallback_candidates() -> Tuple[List[Dict[str, Any]], Dict[
                 stats["fallback_preflight_failures"] += 1
                 reason_counts = stats.setdefault("fallback_preflight_reason_counts", {})
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                record_preflight_near_pass(stats, candidate, "fallback")
             continue
         kept.append(candidate)
 
@@ -1337,7 +1415,7 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
 # SCAN
 # =========================================
 def scan_markets() -> Dict[str, Any]:
-    global last_skip_counts, last_pipeline_stats, last_preflight_reason_counts
+    global last_skip_counts, last_pipeline_stats, last_preflight_reason_counts, last_near_passes
 
     watchlist, pipeline_stats = fetch_watchlist()
     results: List[Dict[str, Any]] = []
@@ -1377,6 +1455,10 @@ def scan_markets() -> Dict[str, Any]:
     last_preflight_reason_counts = {
         "discover": dict(pipeline_stats.get("discover_preflight_reason_counts", {})),
         "fallback": dict(pipeline_stats.get("fallback_preflight_reason_counts", {})),
+    }
+    last_near_passes = {
+        "discover": list(pipeline_stats.get("discover_near_passes", []))[:5],
+        "fallback": list(pipeline_stats.get("fallback_near_passes", []))[:5],
     }
     last_skip_counts = skip_counter
 
@@ -1501,9 +1583,51 @@ def format_market_block(r: Dict[str, Any]) -> str:
     )
 
 
+
+
+def format_preflight_near_passes(pipeline: Dict[str, Any]) -> List[str]:
+    discover = list(pipeline.get("discover_near_passes", []) or [])
+    fallback = list(pipeline.get("fallback_near_passes", []) or [])
+    combined = []
+    for item in discover:
+        combined.append(("discover", item))
+    for item in fallback:
+        combined.append(("fallback", item))
+
+    if not combined:
+        return []
+
+    combined.sort(key=lambda x: (to_float(x[1].get("distance_to_pass"), 999.0), to_float(x[1].get("spread"), 999.0), -max(to_float(x[1].get("bid_depth"), 0.0), to_float(x[1].get("ask_depth"), 0.0))))
+    lines = ["Closest preflight near-passes:", ""]
+    for source, item in combined[:5]:
+        lines.append(
+            f"{source.upper()} | {item.get('label', '')}\n"
+            f"slug={item.get('slug', '')}\n"
+            f"reason={item.get('reason', '')} | {item.get('distance_note', '') or ('distance=' + str(item.get('distance_to_pass', '')))}\n"
+            f"bid={to_float(item.get('best_bid'), 0.0):.3f} ask={to_float(item.get('best_ask'), 0.0):.3f} spread={to_float(item.get('spread'), 0.0):.3f}\n"
+            f"bid_depth={to_float(item.get('bid_depth'), 0.0):.2f} ask_depth={to_float(item.get('ask_depth'), 0.0):.2f} midpoint={to_float(item.get('midpoint'), 0.0):.3f}"
+        )
+        lines.append("")
+    return lines
+
 def format_zero_summary(zero_count: int, seconds_in_window: int) -> str:
     minutes = max(1, round(seconds_in_window / 60))
-    return f"No qualifying markets in last {minutes} minutes.\nEmpty scans: {zero_count}"
+    discover_reasons = (last_preflight_reason_counts or {}).get("discover", {}) or {}
+    top_reason = "none"
+    if discover_reasons:
+        key = max(discover_reasons, key=lambda k: discover_reasons.get(k, 0))
+        top_reason = f"{key}:{discover_reasons.get(key, 0)}"
+    near = (last_near_passes or {}).get("discover", []) or []
+    near_text = "none"
+    if near:
+        first = near[0]
+        near_text = f"{first.get('reason', 'unknown')} ({first.get('distance_note', '') or first.get('distance_to_pass', '')})"
+    return (
+        f"No qualifying markets in last {minutes} minutes.\n"
+        f"Empty scans: {zero_count}\n"
+        f"Top preflight block: {top_reason}\n"
+        f"Closest near-pass: {near_text}"
+    )
 
 
 def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
@@ -1570,6 +1694,9 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
                 "Most candidates failed preflight, depth, fill confidence, or cached candidate resolution.",
                 f"Preflight detail: discover={pipeline.get('discover_preflight_reason_counts', {})} fallback={pipeline.get('fallback_preflight_reason_counts', {})}",
             ])
+            preflight_near = format_preflight_near_passes(pipeline)
+            if preflight_near:
+                lines.extend([""] + preflight_near)
 
         return "\n".join(lines).strip()
 
@@ -1712,6 +1839,7 @@ def health():
         "test_market_slug": TEST_MARKET_SLUG or "none",
         "last_pipeline_stats": last_pipeline_stats,
         "last_preflight_reason_counts": last_preflight_reason_counts,
+        "last_near_passes": last_near_passes,
         "candidate_cache_ttl_seconds": CANDIDATE_CACHE_TTL_SECONDS,
     })
 
@@ -1787,7 +1915,8 @@ def webhook():
             f"test_market_slug={TEST_MARKET_SLUG or 'none'}\n"
             f"candidate_cache_ttl_seconds={CANDIDATE_CACHE_TTL_SECONDS}\n"
             f"last_pipeline_stats={last_pipeline_stats}\n"
-            f"last_preflight_reason_counts={last_preflight_reason_counts}"
+            f"last_preflight_reason_counts={last_preflight_reason_counts}\n"
+            f"last_near_passes={last_near_passes}"
         )
         send_telegram_message(chat_id, msg)
         return jsonify({"ok": True})

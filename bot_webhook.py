@@ -359,20 +359,66 @@ def looks_like_strike_ladder_market(text: str) -> bool:
     obvious_phrases = [
         "hit (high)",
         "hit (low)",
+        "(high)",
+        "(low)",
         "all time high",
         "all-time-high",
         "ath by",
+        "price target",
+        "target by",
     ]
     if any(p in t for p in obvious_phrases):
         return True
 
-    trigger_words = ["hit", "reach", "above", "below", "between"]
-    assets = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crude oil", "oil", "wti", "gold", "sp500", "s&p", "nasdaq"]
-    date_words = ["by end of", "by march", "by april", "by may", "by june", "by july", "by august", "by september", "by october", "by november", "by december", "by friday", "by saturday", "by sunday"]
-    if "$" in t and any(w in t for w in trigger_words) and any(a in t for a in assets) and any(d in t for d in date_words):
-        return True
+    trigger_words = ["hit", "reach", "above", "below", "between", "touch"]
+    assets = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crude oil", "oil", "wti", "gold", "sp500", "s&p", "nasdaq", "dow"]
+    date_words = ["by end of", "by march", "by april", "by may", "by june", "by july", "by august", "by september", "by october", "by november", "by december", "by friday", "by saturday", "by sunday", "by march 31", "by april 30"]
+    if any(w in t for w in trigger_words) and any(a in t for a in assets) and any(d in t for d in date_words):
+        if "$" in t or " all time high" in t or " ath " in f" {t} ":
+            return True
 
     return False
+
+
+def canonical_market_family_key(slug: str, question: str) -> str:
+    combined = f"{slug or ''} {question or ''}".lower().strip()
+    if not combined:
+        return ""
+
+    normalized = combined
+    replacements = {
+        "(high)": "",
+        "(low)": "",
+        "all time high": "ath",
+        "all-time-high": "ath",
+        " by end of march": " by_date",
+        " by march 31, 2026": " by_date",
+        " by march 31": " by_date",
+        " by end of april": " by_date",
+        " by april 30": " by_date",
+        " by friday": " by_date",
+        " by saturday": " by_date",
+        " by sunday": " by_date",
+    }
+    for a, b in replacements.items():
+        normalized = normalized.replace(a, b)
+
+    for token in ["$100", "$105", "$110", "$115", "$120", "$125", "$130", "$150", "$200", "$40", "$50", "$60", "$70", "$80", "$85", "$90", "$95", "$100k", "$120k"]:
+        normalized = normalized.replace(token.lower(), "$x")
+
+    words = normalized.replace("?", " ").replace(",", " ").split()
+    if not words:
+        return ""
+
+    if looks_like_crypto_ladder_market(normalized) or looks_like_strike_ladder_market(normalized):
+        keep = []
+        for w in words:
+            if w in {"will", "the", "a", "an", "to", "of", "in", "on", "and", "or", "by_date", "by", "end"}:
+                continue
+            keep.append(w)
+        return "family:" + " ".join(keep[:8])
+
+    return "market:" + " ".join(words[:10])
 
 
 def is_dead_extreme_book(best_bid: float, best_ask: float) -> bool:
@@ -704,7 +750,11 @@ def record_preflight_near_pass(stats: Dict[str, Any], candidate: Dict[str, Any],
         "side_hint": micro.get("side_hint", ""),
     }
 
+    combined_text = f"{entry['slug']} {entry['label']}".lower()
+
     if reason == "preflight_dead_extreme_book":
+        return
+    if looks_like_crypto_ladder_market(combined_text) or looks_like_strike_ladder_market(combined_text):
         return
     if entry["best_bid"] < 0.003:
         return
@@ -805,6 +855,7 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "discover_preflight_failures": 0,
         "discover_preflight_reason_counts": {},
         "discover_near_passes": [],
+        "discover_family_skips": 0,
     }
 
     print(
@@ -813,6 +864,8 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         f"min_volume={DISCOVER_MIN_VOLUME} min_liquidity={DISCOVER_MIN_LIQUIDITY} "
         f"short_term_only={SHORT_TERM_ONLY} max_days_to_end={MAX_DAYS_TO_END}"
     )
+
+    family_seen = set()
 
     while len(prelim) < DISCOVER_LIMIT:
         params = {
@@ -853,11 +906,20 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             if not matches_keywords(combined):
                 continue
 
+            family_key = canonical_market_family_key(slug, question)
+            if family_key and family_key in family_seen:
+                stats["discover_family_skips"] += 1
+                continue
+
             seen.add(slug)
+            if family_key:
+                family_seen.add(family_key)
+
             prelim.append({
                 "slug": slug,
                 "baseline_prob": BASELINE_PROB,
                 "discovery_priority": discovery_priority(combined),
+                "family_key": family_key,
             })
             if len(prelim) >= DISCOVER_LIMIT:
                 break
@@ -905,7 +967,7 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
     print(
         f"[{now_str()}] Discover complete | prelim={stats['discover_prelim']} "
-        f"checked={stats['discover_checked']} kept={stats['discover_kept']}"
+        f"checked={stats['discover_checked']} kept={stats['discover_kept']} family_skips={stats['discover_family_skips']}"
     )
     return kept, stats
 
@@ -916,6 +978,7 @@ def fetch_watchlist_file() -> List[Dict[str, Any]]:
         r.raise_for_status()
         lines = [x.strip() for x in r.text.splitlines() if x.strip()]
         items = []
+        family_seen = set()
         for line in lines:
             parsed = parse_watchlist_line(line)
             if not parsed:
@@ -927,6 +990,11 @@ def fetch_watchlist_file() -> List[Dict[str, Any]]:
                 continue
             if not is_allowed_topic(slug_text):
                 continue
+            family_key = canonical_market_family_key(parsed["slug"], parsed["slug"])
+            if family_key and family_key in family_seen:
+                continue
+            if family_key:
+                family_seen.add(family_key)
             items.append(parsed)
         print(f"[{now_str()}] Watchlist file loaded | items={len(items)}")
         return items

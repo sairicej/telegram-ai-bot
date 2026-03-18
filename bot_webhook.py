@@ -11,6 +11,8 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
+SCRIPT_VERSION = "v6-discovery-intake"
+
 # =========================================
 # ENV / SETTINGS
 # =========================================
@@ -125,6 +127,7 @@ last_skip_counts: Counter = Counter()
 last_pipeline_stats: Dict[str, Any] = {}
 last_preflight_reason_counts: Dict[str, Any] = {}
 last_near_passes: Dict[str, Any] = {"discover": [], "fallback": []}
+last_discovery_samples: Dict[str, Any] = {"accepted": [], "hard_skipped": []}
 
 CANDIDATE_CACHE_TTL_SECONDS = 90
 
@@ -419,6 +422,62 @@ def canonical_market_family_key(slug: str, question: str) -> str:
         return "family:" + " ".join(keep[:8])
 
     return "market:" + " ".join(words[:10])
+
+
+def extract_asset_family_bucket(text: str) -> str:
+    t = (text or "").lower()
+    if any(k in t for k in ["crude oil", " oil ", " wti", "wti "]):
+        return "asset:oil"
+    if any(k in t for k in ["bitcoin", " btc"]):
+        return "asset:btc"
+    if any(k in t for k in ["ethereum", " eth"]):
+        return "asset:eth"
+    if any(k in t for k in ["solana", " sol"]):
+        return "asset:sol"
+    if "gold" in t:
+        return "asset:gold"
+    if any(k in t for k in ["sp500", "s&p", "nasdaq", "dow"]):
+        return "asset:index"
+    if any(k in t for k in ["fed", "fomc", "cpi", "ppi", "unemployment", "tariff", "shutdown", "vote", "debate", "primary", "approval", "ruling", "hearing", "decision"]):
+        return "asset:event"
+    return ""
+
+
+def looks_like_shell_price_market(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    shell_phrases = [
+        "all time high", "all-time-high", "ath by", "price target", "target by",
+        "by end of march", "by end of april", "by march 31", "by april 30",
+    ]
+    if any(p in t for p in shell_phrases) and any(a in t for a in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crude oil", "oil", "wti", "gold", "sp500", "s&p", "nasdaq", "dow"]):
+        if any(w in t for w in ["hit", "reach", "above", "below", "between", "touch", "high", "low"]):
+            return True
+    return False
+
+
+def should_hard_skip_discovery_market(text: str) -> Tuple[bool, str]:
+    t = (text or "").lower()
+    if not t:
+        return False, ""
+    if looks_like_crypto_ladder_market(t):
+        return True, "hard_skip_crypto_ladder"
+    if looks_like_strike_ladder_market(t):
+        return True, "hard_skip_strike_ladder"
+    if looks_like_shell_price_market(t):
+        return True, "hard_skip_shell_price_market"
+    return False, ""
+
+
+def is_event_bound_market(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in [
+        "decision", "announce", "approval", "ruling", "hearing", "vote", "debate",
+        "primary", "meeting", "today", "tonight", "tomorrow", "this week", "by friday",
+        "by saturday", "by sunday", "cpi", "ppi", "fomc", "fed", "rates", "tariff",
+        "shutdown", "legal", "etf", "policy"
+    ])
 
 
 def is_dead_extreme_book(best_bid: float, best_ask: float) -> bool:
@@ -856,6 +915,10 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "discover_preflight_reason_counts": {},
         "discover_near_passes": [],
         "discover_family_skips": 0,
+        "discover_hard_skipped": 0,
+        "discover_family_bucket_skips": 0,
+        "discover_accept_samples": [],
+        "discover_skip_samples": [],
     }
 
     print(
@@ -866,6 +929,7 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     )
 
     family_seen = set()
+    family_bucket_seen = set()
 
     while len(prelim) < DISCOVER_LIMIT:
         params = {
@@ -899,7 +963,12 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 continue
             if is_blocked_topic(combined):
                 continue
-            if looks_like_crypto_ladder_market(combined) or looks_like_strike_ladder_market(combined):
+            hard_skip, hard_reason = should_hard_skip_discovery_market(combined)
+            if hard_skip:
+                stats["discover_hard_skipped"] += 1
+                samples = stats.setdefault("discover_skip_samples", [])
+                if len(samples) < 5:
+                    samples.append({"slug": slug, "reason": hard_reason, "question": question})
                 continue
             if not is_allowed_topic(combined):
                 continue
@@ -907,20 +976,31 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 continue
 
             family_key = canonical_market_family_key(slug, question)
+            family_bucket = extract_asset_family_bucket(combined) if family_key.startswith("family:") else ""
             if family_key and family_key in family_seen:
                 stats["discover_family_skips"] += 1
+                continue
+            if family_bucket and family_bucket in family_bucket_seen:
+                stats["discover_family_bucket_skips"] += 1
                 continue
 
             seen.add(slug)
             if family_key:
                 family_seen.add(family_key)
+            if family_bucket:
+                family_bucket_seen.add(family_bucket)
 
             prelim.append({
                 "slug": slug,
                 "baseline_prob": BASELINE_PROB,
                 "discovery_priority": discovery_priority(combined),
                 "family_key": family_key,
+                "family_bucket": family_bucket,
+                "question": question,
             })
+            accept_samples = stats.setdefault("discover_accept_samples", [])
+            if len(accept_samples) < 5:
+                accept_samples.append({"slug": slug, "question": question, "priority": discovery_priority(combined)})
             if len(prelim) >= DISCOVER_LIMIT:
                 break
 
@@ -967,7 +1047,7 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
     print(
         f"[{now_str()}] Discover complete | prelim={stats['discover_prelim']} "
-        f"checked={stats['discover_checked']} kept={stats['discover_kept']} family_skips={stats['discover_family_skips']}"
+        f"checked={stats['discover_checked']} kept={stats['discover_kept']} family_skips={stats['discover_family_skips']} hard_skipped={stats['discover_hard_skipped']} bucket_skips={stats['discover_family_bucket_skips']}"
     )
     return kept, stats
 
@@ -979,6 +1059,7 @@ def fetch_watchlist_file() -> List[Dict[str, Any]]:
         lines = [x.strip() for x in r.text.splitlines() if x.strip()]
         items = []
         family_seen = set()
+        family_bucket_seen = set()
         for line in lines:
             parsed = parse_watchlist_line(line)
             if not parsed:
@@ -986,15 +1067,21 @@ def fetch_watchlist_file() -> List[Dict[str, Any]]:
             slug_text = parsed["slug"].lower()
             if is_blocked_topic(slug_text):
                 continue
-            if looks_like_crypto_ladder_market(slug_text) or looks_like_strike_ladder_market(slug_text):
+            hard_skip, _ = should_hard_skip_discovery_market(slug_text)
+            if hard_skip:
                 continue
             if not is_allowed_topic(slug_text):
                 continue
             family_key = canonical_market_family_key(parsed["slug"], parsed["slug"])
+            family_bucket = extract_asset_family_bucket(slug_text) if family_key.startswith("family:") else ""
             if family_key and family_key in family_seen:
+                continue
+            if family_bucket and family_bucket in family_bucket_seen:
                 continue
             if family_key:
                 family_seen.add(family_key)
+            if family_bucket:
+                family_bucket_seen.add(family_bucket)
             items.append(parsed)
         print(f"[{now_str()}] Watchlist file loaded | items={len(items)}")
         return items
@@ -1083,6 +1170,11 @@ def fetch_watchlist() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "discover_resolve_failures": 0,
         "discover_preflight_failures": 0,
         "discover_preflight_reason_counts": {},
+        "discover_hard_skipped": 0,
+        "discover_family_skips": 0,
+        "discover_family_bucket_skips": 0,
+        "discover_accept_samples": [],
+        "discover_skip_samples": [],
     }
 
     if AUTO_DISCOVER:
@@ -1540,7 +1632,7 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
 # SCAN
 # =========================================
 def scan_markets() -> Dict[str, Any]:
-    global last_skip_counts, last_pipeline_stats, last_preflight_reason_counts, last_near_passes
+    global last_skip_counts, last_pipeline_stats, last_preflight_reason_counts, last_near_passes, last_discovery_samples
 
     watchlist, pipeline_stats = fetch_watchlist()
     results: List[Dict[str, Any]] = []
@@ -1584,6 +1676,10 @@ def scan_markets() -> Dict[str, Any]:
     last_near_passes = {
         "discover": list(pipeline_stats.get("discover_near_passes", []))[:5],
         "fallback": list(pipeline_stats.get("fallback_near_passes", []))[:5],
+    }
+    last_discovery_samples = {
+        "accepted": list(pipeline_stats.get("discover_accept_samples", []))[:5],
+        "hard_skipped": list(pipeline_stats.get("discover_skip_samples", []))[:5],
     }
     last_skip_counts = skip_counter
 
@@ -1665,6 +1761,9 @@ def format_pipeline_stats(pipeline: Dict[str, Any]) -> str:
     return (
         f"Pipeline: source={pipeline.get('watchlist_source', 'unknown')} | "
         f"discover_prelim={pipeline.get('discover_prelim', 0)} | "
+        f"discover_hard_skipped={pipeline.get('discover_hard_skipped', 0)} | "
+        f"discover_family_skips={pipeline.get('discover_family_skips', 0)} | "
+        f"discover_bucket_skips={pipeline.get('discover_family_bucket_skips', 0)} | "
         f"discover_checked={pipeline.get('discover_checked', 0)} | "
         f"discover_kept={pipeline.get('discover_kept', 0)} | "
         f"fallback_items={pipeline.get('fallback_items', 0)} | "
@@ -1737,6 +1836,7 @@ def format_preflight_near_passes(pipeline: Dict[str, Any]) -> List[str]:
 
 def format_zero_summary(zero_count: int, seconds_in_window: int) -> str:
     minutes = max(1, round(seconds_in_window / 60))
+    pipeline = last_pipeline_stats or {}
     discover_reasons = (last_preflight_reason_counts or {}).get("discover", {}) or {}
     top_reason = "none"
     if discover_reasons:
@@ -1751,6 +1851,7 @@ def format_zero_summary(zero_count: int, seconds_in_window: int) -> str:
         f"No qualifying markets in last {minutes} minutes.\n"
         f"Empty scans: {zero_count}\n"
         f"Top preflight block: {top_reason}\n"
+        f"Hard-skipped in discovery: {pipeline.get('discover_hard_skipped', 0)} | family skips: {pipeline.get('discover_family_skips', 0)} | bucket skips: {pipeline.get('discover_family_bucket_skips', 0)}\n"
         f"Closest near-pass: {near_text}"
     )
 
@@ -1914,6 +2015,7 @@ def home():
     return jsonify({
         "ok": True,
         "service": BOT_LABEL,
+        "script_version": SCRIPT_VERSION,
         "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
         "scan_every_seconds": SCAN_EVERY_SECONDS,
         "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
@@ -1927,6 +2029,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": BOT_LABEL,
+        "script_version": SCRIPT_VERSION,
         "alert_threshold": ALERT_THRESHOLD,
         "watch_threshold": WATCH_THRESHOLD,
         "send_watch_alerts": SEND_WATCH_ALERTS,
@@ -1965,6 +2068,7 @@ def health():
         "last_pipeline_stats": last_pipeline_stats,
         "last_preflight_reason_counts": last_preflight_reason_counts,
         "last_near_passes": last_near_passes,
+        "last_discovery_samples": last_discovery_samples,
         "candidate_cache_ttl_seconds": CANDIDATE_CACHE_TTL_SECONDS,
     })
 

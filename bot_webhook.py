@@ -351,6 +351,36 @@ def looks_like_crypto_ladder_market(text: str) -> bool:
     return any(p in t for p in ladder_phrases)
 
 
+def looks_like_strike_ladder_market(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+
+    obvious_phrases = [
+        "hit (high)",
+        "hit (low)",
+        "all time high",
+        "all-time-high",
+        "ath by",
+    ]
+    if any(p in t for p in obvious_phrases):
+        return True
+
+    trigger_words = ["hit", "reach", "above", "below", "between"]
+    assets = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crude oil", "oil", "wti", "gold", "sp500", "s&p", "nasdaq"]
+    date_words = ["by end of", "by march", "by april", "by may", "by june", "by july", "by august", "by september", "by october", "by november", "by december", "by friday", "by saturday", "by sunday"]
+    if "$" in t and any(w in t for w in trigger_words) and any(a in t for a in assets) and any(d in t for d in date_words):
+        return True
+
+    return False
+
+
+def is_dead_extreme_book(best_bid: float, best_ask: float) -> bool:
+    if best_bid <= 0 or best_ask <= 0:
+        return False
+    return best_bid <= 0.002 and best_ask >= 0.998 and (best_ask - best_bid) >= 0.90
+
+
 # =========================================
 # MARKET HELPERS
 # =========================================
@@ -479,7 +509,7 @@ def pick_best_market_from_event(event_data: Dict[str, Any]) -> Optional[Dict[str
             continue
         if is_blocked_topic(text):
             continue
-        if looks_like_crypto_ladder_market(text):
+        if looks_like_crypto_ladder_market(text) or looks_like_strike_ladder_market(text):
             continue
         if not is_allowed_topic(text):
             continue
@@ -523,7 +553,7 @@ def resolve_slug_to_market(slug: str) -> Tuple[Optional[Dict[str, Any]], Optiona
             return None, None
         if is_blocked_topic(text):
             return None, None
-        if looks_like_crypto_ladder_market(text):
+        if looks_like_crypto_ladder_market(text) or looks_like_strike_ladder_market(text):
             return None, None
         if not is_allowed_topic(text):
             return None, None
@@ -556,6 +586,8 @@ def preflight_book_check(market_data: Dict[str, Any], token_id: str) -> Optional
     spread = max(0.0, best_ask - best_bid) if best_bid > 0 and best_ask > 0 else 0.0
     midpoint = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
 
+    side_hint = "YES" if ask_depth >= bid_depth else "NO"
+
     base = {
         "label": label,
         "best_bid": round(best_bid, 6),
@@ -564,7 +596,17 @@ def preflight_book_check(market_data: Dict[str, Any], token_id: str) -> Optional
         "bid_depth": round(bid_depth, 6),
         "ask_depth": round(ask_depth, 6),
         "midpoint": round(midpoint, 6),
+        "side_hint": side_hint,
     }
+
+    if is_dead_extreme_book(best_bid, best_ask):
+        return {
+            **base,
+            "ok": False,
+            "reason": "preflight_dead_extreme_book",
+            "distance_to_pass": 999.0,
+            "distance_note": "book pinned at extremes",
+        }
 
     if best_bid <= 0:
         return {**base, "ok": False, "reason": "preflight_no_bid", "distance_to_pass": 999.0}
@@ -633,6 +675,7 @@ def preflight_book_check(market_data: Dict[str, Any], token_id: str) -> Optional
         "label": label,
         "resolved_text": resolved_text,
         "distance_to_pass": 0.0,
+        "side_hint": side_hint,
     }
 
 
@@ -658,7 +701,17 @@ def record_preflight_near_pass(stats: Dict[str, Any], candidate: Dict[str, Any],
         "bid_depth": to_float(micro.get("bid_depth"), 0.0),
         "ask_depth": to_float(micro.get("ask_depth"), 0.0),
         "midpoint": to_float(micro.get("midpoint"), 0.0),
+        "side_hint": micro.get("side_hint", ""),
     }
+
+    if reason == "preflight_dead_extreme_book":
+        return
+    if entry["best_bid"] < 0.003:
+        return
+    if entry["spread"] > 0.25:
+        return
+    if is_dead_extreme_book(entry["best_bid"], entry["best_ask"]):
+        return
 
     key = f"{bucket_key}_near_passes"
     arr = stats.setdefault(key, [])
@@ -684,6 +737,10 @@ def discovery_priority(combined: str) -> float:
         base += 0.03
     if looks_like_crypto_ladder_market(combined):
         base -= 0.50
+    if looks_like_strike_ladder_market(combined):
+        base -= 0.55
+    if any(k in combined for k in ["today", "tonight", "tomorrow", "this week", "by friday", "by saturday", "by sunday", "end of march", "end of april"]):
+        base += 0.05
 
     return round(base, 4)
 
@@ -789,7 +846,7 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 continue
             if is_blocked_topic(combined):
                 continue
-            if looks_like_crypto_ladder_market(combined):
+            if looks_like_crypto_ladder_market(combined) or looks_like_strike_ladder_market(combined):
                 continue
             if not is_allowed_topic(combined):
                 continue
@@ -866,7 +923,7 @@ def fetch_watchlist_file() -> List[Dict[str, Any]]:
             slug_text = parsed["slug"].lower()
             if is_blocked_topic(slug_text):
                 continue
-            if looks_like_crypto_ladder_market(slug_text):
+            if looks_like_crypto_ladder_market(slug_text) or looks_like_strike_ladder_market(slug_text):
                 continue
             if not is_allowed_topic(slug_text):
                 continue
@@ -1605,7 +1662,7 @@ def format_preflight_near_passes(pipeline: Dict[str, Any]) -> List[str]:
             f"slug={item.get('slug', '')}\n"
             f"reason={item.get('reason', '')} | {item.get('distance_note', '') or ('distance=' + str(item.get('distance_to_pass', '')))}\n"
             f"bid={to_float(item.get('best_bid'), 0.0):.3f} ask={to_float(item.get('best_ask'), 0.0):.3f} spread={to_float(item.get('spread'), 0.0):.3f}\n"
-            f"bid_depth={to_float(item.get('bid_depth'), 0.0):.2f} ask_depth={to_float(item.get('ask_depth'), 0.0):.2f} midpoint={to_float(item.get('midpoint'), 0.0):.3f}"
+            f"bid_depth={to_float(item.get('bid_depth'), 0.0):.2f} ask_depth={to_float(item.get('ask_depth'), 0.0):.2f} midpoint={to_float(item.get('midpoint'), 0.0):.3f} side_hint={item.get('side_hint', '')}"
         )
         lines.append("")
     return lines

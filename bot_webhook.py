@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-SCRIPT_VERSION = "v8-rolling-30d-event-universe"
+SCRIPT_VERSION = "v9-curated-catalyst-30d"
 
 # =========================================
 # ENV / SETTINGS
@@ -103,6 +103,20 @@ CATEGORY_WHITELIST = [
     "tariff", "shutdown", "meeting", "today", "tonight", "tomorrow", "this week",
     "by monday", "by tuesday", "by wednesday", "by thursday", "by friday", "by saturday", "by sunday",
     "ftx", "bankruptcy", "payout", "relaunch", "sentencing", "sec", "etf",
+]
+
+CURATED_EVENT_TERMS = [
+    "cpi", "ppi", "fomc", "fed", "rates", "rate", "inflation", "unemployment",
+    "approval", "decision", "announce", "ruling", "hearing", "court", "judge", "legal",
+    "policy", "election", "primary", "vote", "debate", "president", "senate", "house", "governor",
+    "tariff", "shutdown", "meeting", "bankruptcy", "payout", "relaunch", "sentencing", "sec", "etf",
+    "delisted", "delist", "removed", "out as", "out by", "confirm", "confirmed", "deny", "denied",
+    "settlement", "trial", "appeal", "filing", "deadline", "hearing", "ruling", "approval",
+]
+
+CURATED_SPECIAL_TERMS = [
+    "ftx", "tariff dividend", "secretary of defense", "president by", "out as",
+    "bankruptcy payout", "court ruling", "fed decision", "cpi release", "ppi release",
 ]
 
 CATEGORY_PRIORITY = {
@@ -576,6 +590,43 @@ def is_event_bound_market(text: str) -> bool:
     return any(k in t for k in core_terms) or is_rolling_window_phrase(t)
 
 
+def curated_catalyst_score(text: str) -> float:
+    t = (text or "").lower()
+    if not t:
+        return 0.0
+
+    score = 0.0
+    event_hits = sum(1 for term in CURATED_EVENT_TERMS if term in t)
+    special_hits = sum(1 for term in CURATED_SPECIAL_TERMS if term in t)
+
+    if event_hits:
+        score += min(0.45, 0.12 * event_hits)
+    if special_hits:
+        score += min(0.25, 0.10 * special_hits)
+    if is_rolling_window_phrase(t):
+        score += 0.22
+    if " by " in t or "by-" in t or "deadline" in t:
+        score += 0.08
+    if any(k in t for k in ["out as", "out by", "delisted", "delist", "approval", "ruling", "hearing", "vote", "debate", "payout", "sentencing"]):
+        score += 0.10
+    if looks_like_low_urgency_theme_market(t) or looks_like_ranking_market(t):
+        score -= 0.50
+    if any(k in t for k in ["best model", "leaderboard", "top model"]):
+        score -= 0.50
+    return round(score, 4)
+
+
+def is_curated_catalyst_market(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    if not is_allowed_topic(t):
+        return False
+    if not is_event_bound_market(t) and not is_secondary_special_situation(t):
+        return False
+    return curated_catalyst_score(t) >= 0.34
+
+
 def is_dead_extreme_book(best_bid: float, best_ask: float) -> bool:
     if best_bid <= 0 or best_ask <= 0:
         return False
@@ -932,18 +983,20 @@ def record_preflight_near_pass(stats: Dict[str, Any], candidate: Dict[str, Any],
 def discovery_priority(combined: str) -> float:
     topic = classify_topic(combined)
     base = {
-        "politics_event": 1.00,
-        "legal_special": 0.97,
-        "macro": 0.95,
-        "crypto_event": 0.86,
-        "other": 0.65,
-    }.get(topic, 0.65)
+        "politics_event": 1.02,
+        "legal_special": 0.99,
+        "macro": 0.97,
+        "crypto_event": 0.84,
+        "other": 0.62,
+    }.get(topic, 0.62)
+
+    base += min(0.20, curated_catalyst_score(combined))
 
     if is_event_bound_market(combined):
         base += 0.08
     if is_secondary_special_situation(combined):
         base += 0.04
-    if any(k in combined for k in ["approval", "decision", "ruling", "hearing", "vote", "debate", "cpi", "ppi", "fomc", "fed", "sentencing", "payout"]):
+    if any(k in combined for k in ["approval", "decision", "ruling", "hearing", "vote", "debate", "cpi", "ppi", "fomc", "fed", "sentencing", "payout", "delisted"]):
         base += 0.05
     if is_rolling_window_phrase(combined):
         base += 0.04
@@ -1026,6 +1079,7 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "discover_family_bucket_skips": 0,
         "discover_accept_samples": [],
         "discover_skip_samples": [],
+        "discover_non_curated_skips": 0,
     }
 
     print(
@@ -1080,6 +1134,12 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             if not is_allowed_topic(combined):
                 continue
             if not matches_keywords(combined):
+                continue
+            if not is_curated_catalyst_market(combined):
+                stats["discover_non_curated_skips"] += 1
+                samples = stats.setdefault("discover_skip_samples", [])
+                if len(samples) < 5:
+                    samples.append({"slug": slug, "reason": "hard_skip_non_curated_event", "question": question})
                 continue
 
             family_key = canonical_market_family_key(slug, question)
@@ -1154,7 +1214,7 @@ def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
     print(
         f"[{now_str()}] Discover complete | prelim={stats['discover_prelim']} "
-        f"checked={stats['discover_checked']} kept={stats['discover_kept']} family_skips={stats['discover_family_skips']} hard_skipped={stats['discover_hard_skipped']} bucket_skips={stats['discover_family_bucket_skips']}"
+        f"checked={stats['discover_checked']} kept={stats['discover_kept']} family_skips={stats['discover_family_skips']} hard_skipped={stats['discover_hard_skipped']} non_curated={stats.get('discover_non_curated_skips', 0)} bucket_skips={stats['discover_family_bucket_skips']}"
     )
     return kept, stats
 
@@ -1282,6 +1342,7 @@ def fetch_watchlist() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "discover_family_bucket_skips": 0,
         "discover_accept_samples": [],
         "discover_skip_samples": [],
+        "discover_non_curated_skips": 0,
     }
 
     if AUTO_DISCOVER:
@@ -1869,6 +1930,7 @@ def format_pipeline_stats(pipeline: Dict[str, Any]) -> str:
         f"Pipeline: source={pipeline.get('watchlist_source', 'unknown')} | "
         f"discover_prelim={pipeline.get('discover_prelim', 0)} | "
         f"discover_hard_skipped={pipeline.get('discover_hard_skipped', 0)} | "
+        f"discover_non_curated_skips={pipeline.get('discover_non_curated_skips', 0)} | "
         f"discover_family_skips={pipeline.get('discover_family_skips', 0)} | "
         f"discover_bucket_skips={pipeline.get('discover_family_bucket_skips', 0)} | "
         f"discover_checked={pipeline.get('discover_checked', 0)} | "

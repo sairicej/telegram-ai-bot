@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-SCRIPT_VERSION = "v7-event-universe"
+SCRIPT_VERSION = "v8-rolling-30d-event-universe"
 
 # =========================================
 # ENV / SETTINGS
@@ -55,7 +55,7 @@ DISCOVER_MIN_LIQUIDITY = float(os.getenv("DISCOVER_MIN_LIQUIDITY", "10000"))
 
 DISCOVER_KEYWORDS = os.getenv(
     "DISCOVER_KEYWORDS",
-    "cpi,ppi,fomc,fed,rates,rate cut,rate hike,unemployment,inflation,approval,decision,announce,ruling,hearing,court,judge,legal,policy,vote,debate,primary,election,tariff,shutdown,meeting,by friday,by saturday,by sunday,today,tonight,tomorrow,this week,end of march,end of april,ftx,bankruptcy,payout,relaunch,sentencing,sec,etf",
+    "cpi,ppi,fomc,fed,rates,rate cut,rate hike,unemployment,inflation,approval,decision,announce,ruling,hearing,court,judge,legal,policy,vote,debate,primary,election,tariff,shutdown,meeting,today,tonight,tomorrow,this week,ftx,bankruptcy,payout,relaunch,sentencing,sec,etf",
 ).strip()
 
 ENABLE_YES_NO_ONLY = os.getenv("ENABLE_YES_NO_ONLY", "true").lower() == "true"
@@ -101,7 +101,7 @@ CATEGORY_WHITELIST = [
     "approval", "decision", "announce", "ruling", "hearing", "court", "judge", "legal",
     "policy", "election", "primary", "vote", "debate", "president", "senate", "house", "governor",
     "tariff", "shutdown", "meeting", "today", "tonight", "tomorrow", "this week",
-    "by friday", "by saturday", "by sunday", "end of march", "end of april",
+    "by monday", "by tuesday", "by wednesday", "by thursday", "by friday", "by saturday", "by sunday",
     "ftx", "bankruptcy", "payout", "relaunch", "sentencing", "sec", "etf",
 ]
 
@@ -130,6 +130,12 @@ last_near_passes: Dict[str, Any] = {"discover": [], "fallback": []}
 last_discovery_samples: Dict[str, Any] = {"accepted": [], "hard_skipped": []}
 
 CANDIDATE_CACHE_TTL_SECONDS = 90
+ROLLING_DISCOVERY_DAYS = 30
+
+MONTH_NAMES = [
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+]
 
 # =========================================
 # BASICS
@@ -298,6 +304,58 @@ def days_to_end(end_iso: str) -> Optional[float]:
     return delta.total_seconds() / 86400.0
 
 
+def month_name(dt: datetime) -> str:
+    return MONTH_NAMES[dt.month - 1]
+
+
+def rolling_window_end() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(days=ROLLING_DISCOVERY_DAYS)
+
+
+def rolling_date_terms(days: int = ROLLING_DISCOVERY_DAYS) -> List[str]:
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(days=days)
+    terms = {
+        "today", "tonight", "tomorrow", "this week",
+        "by friday", "by saturday", "by sunday", "by monday", "by tuesday", "by wednesday", "by thursday",
+        f"end of {month_name(now)}",
+        f"end of {month_name(end)}",
+    }
+
+    cursor = now
+    while cursor <= end:
+        terms.add(f"by {month_name(cursor)} {cursor.day}")
+        cursor += timedelta(days=1)
+
+    return sorted(terms)
+
+
+def looks_like_ranking_market(text: str) -> bool:
+    t = (text or "").lower()
+    ranking_phrases = [
+        "best model", "second-best model", "second best model", "top model",
+        "best ai model", "top ai model", "leaderboard", "ranked",
+        "have the second-best", "have the second best", "best-performing model",
+        "best performing model", "most used model", "highest ranked model",
+    ]
+    return any(p in t for p in ranking_phrases)
+
+
+def looks_like_low_urgency_theme_market(text: str) -> bool:
+    t = (text or "").lower()
+    theme_phrases = [
+        "at the end of", "by end of"
+    ]
+    if looks_like_ranking_market(t):
+        return True
+    return any(p in t for p in theme_phrases) and any(k in t for k in ["best model", "second-best", "leaderboard", "top model", "top ai"])
+
+
+def is_rolling_window_phrase(text: str) -> bool:
+    t = (text or "").lower()
+    return any(term in t for term in rolling_date_terms())
+
+
 # =========================================
 # TOPICS
 # =========================================
@@ -327,6 +385,8 @@ def is_secondary_special_situation(text: str) -> bool:
 
 def is_allowed_topic(text: str) -> bool:
     t = (text or "").lower()
+    if looks_like_ranking_market(t) or looks_like_low_urgency_theme_market(t):
+        return False
     if not any(k in t for k in CATEGORY_WHITELIST):
         return False
     if is_event_bound_market(t):
@@ -384,7 +444,7 @@ def looks_like_strike_ladder_market(text: str) -> bool:
 
     trigger_words = ["hit", "reach", "above", "below", "between", "touch"]
     assets = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crude oil", "oil", "wti", "gold", "sp500", "s&p", "nasdaq", "dow"]
-    date_words = ["by end of", "by march", "by april", "by may", "by june", "by july", "by august", "by september", "by october", "by november", "by december", "by friday", "by saturday", "by sunday", "by march 31", "by april 30"]
+    date_words = ["by end of", "by friday", "by saturday", "by sunday", "by monday", "by tuesday", "by wednesday", "by thursday"] + rolling_date_terms()
     if any(w in t for w in trigger_words) and any(a in t for a in assets) and any(d in t for d in date_words):
         if "$" in t or " all time high" in t or " ath " in f" {t} ":
             return True
@@ -403,17 +463,21 @@ def canonical_market_family_key(slug: str, question: str) -> str:
         "(low)": "",
         "all time high": "ath",
         "all-time-high": "ath",
-        " by end of march": " by_date",
-        " by march 31, 2026": " by_date",
-        " by march 31": " by_date",
-        " by end of april": " by_date",
-        " by april 30": " by_date",
         " by friday": " by_date",
         " by saturday": " by_date",
         " by sunday": " by_date",
+        " by monday": " by_date",
+        " by tuesday": " by_date",
+        " by wednesday": " by_date",
+        " by thursday": " by_date",
     }
     for a, b in replacements.items():
         normalized = normalized.replace(a, b)
+    for term in rolling_date_terms():
+        normalized = normalized.replace(f" by {term}", " by_date")
+        normalized = normalized.replace(f" end of {term}", " by_date")
+        if term.startswith("by "):
+            normalized = normalized.replace(term, "by_date")
 
     for token in ["$100", "$105", "$110", "$115", "$120", "$125", "$130", "$150", "$200", "$40", "$50", "$60", "$70", "$80", "$85", "$90", "$95", "$100k", "$120k"]:
         normalized = normalized.replace(token.lower(), "$x")
@@ -464,7 +528,7 @@ def looks_like_shell_price_market(text: str) -> bool:
         return False
     shell_phrases = [
         "all time high", "all-time-high", "ath by", "price target", "target by",
-        "by end of march", "by end of april", "by march 31", "by april 30",
+        "by end of", "end of",
     ]
     if any(p in t for p in shell_phrases) and any(a in t for a in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crude oil", "oil", "wti", "gold", "sp500", "s&p", "nasdaq", "dow"]):
         if any(w in t for w in ["hit", "reach", "above", "below", "between", "touch", "high", "low"]):
@@ -489,6 +553,8 @@ def should_hard_skip_discovery_market(text: str) -> Tuple[bool, str]:
         return False, ""
     if looks_like_short_window_price_market(t):
         return True, "hard_skip_short_window_price_market"
+    if looks_like_ranking_market(t):
+        return True, "hard_skip_ranking_market"
     if looks_like_crypto_ladder_market(t):
         return True, "hard_skip_crypto_ladder"
     if looks_like_strike_ladder_market(t):
@@ -500,13 +566,14 @@ def should_hard_skip_discovery_market(text: str) -> Tuple[bool, str]:
 
 def is_event_bound_market(text: str) -> bool:
     t = (text or "").lower()
-    return any(k in t for k in [
+    core_terms = [
         "decision", "announce", "approval", "ruling", "hearing", "vote", "debate",
-        "primary", "meeting", "today", "tonight", "tomorrow", "this week", "by friday",
-        "by saturday", "by sunday", "cpi", "ppi", "fomc", "fed", "rates", "tariff",
+        "primary", "meeting", "today", "tonight", "tomorrow", "this week",
+        "cpi", "ppi", "fomc", "fed", "rates", "tariff",
         "shutdown", "legal", "etf", "policy", "court", "judge", "sentencing",
         "bankruptcy", "payout", "relaunch", "sec", "election"
-    ])
+    ]
+    return any(k in t for k in core_terms) or is_rolling_window_phrase(t)
 
 
 def is_dead_extreme_book(best_bid: float, best_ask: float) -> bool:
@@ -569,13 +636,16 @@ def is_dead_book(best_bid: float, best_ask: float) -> Tuple[bool, str]:
 
 def keyword_list() -> List[str]:
     raw = (DISCOVER_KEYWORDS or "").strip().strip('"').strip("'")
-    return [x.strip().lower() for x in raw.split(",") if x.strip()]
+    base = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    return sorted(set(base + rolling_date_terms()))
 
 
 def matches_keywords(text: str) -> bool:
     if not text:
         return False
     t = text.lower()
+    if looks_like_ranking_market(t):
+        return False
     return any(k in t for k in keyword_list())
 
 
@@ -875,7 +945,7 @@ def discovery_priority(combined: str) -> float:
         base += 0.04
     if any(k in combined for k in ["approval", "decision", "ruling", "hearing", "vote", "debate", "cpi", "ppi", "fomc", "fed", "sentencing", "payout"]):
         base += 0.05
-    if any(k in combined for k in ["today", "tonight", "tomorrow", "this week", "by friday", "by saturday", "by sunday", "end of march", "end of april"]):
+    if is_rolling_window_phrase(combined):
         base += 0.04
     if any(k in combined for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "oil", "crude", "wti", "gold", "sp500", "s&p", "nasdaq", "dow"]):
         base -= 0.06
@@ -2053,6 +2123,7 @@ def home():
         "ok": True,
         "service": BOT_LABEL,
         "script_version": SCRIPT_VERSION,
+        "rolling_discovery_days": ROLLING_DISCOVERY_DAYS,
         "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
         "scan_every_seconds": SCAN_EVERY_SECONDS,
         "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
@@ -2067,6 +2138,7 @@ def health():
         "ok": True,
         "service": BOT_LABEL,
         "script_version": SCRIPT_VERSION,
+        "rolling_discovery_days": ROLLING_DISCOVERY_DAYS,
         "alert_threshold": ALERT_THRESHOLD,
         "watch_threshold": WATCH_THRESHOLD,
         "send_watch_alerts": SEND_WATCH_ALERTS,

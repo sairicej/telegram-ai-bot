@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-SCRIPT_VERSION = "v9-curated-catalyst-30d"
+SCRIPT_VERSION = "v10-prod-plus-observation"
 
 # =========================================
 # ENV / SETTINGS
@@ -142,6 +142,14 @@ last_pipeline_stats: Dict[str, Any] = {}
 last_preflight_reason_counts: Dict[str, Any] = {}
 last_near_passes: Dict[str, Any] = {"discover": [], "fallback": []}
 last_discovery_samples: Dict[str, Any] = {"accepted": [], "hard_skipped": []}
+last_observation_results: List[Dict[str, Any]] = []
+session_started_at = time.time()
+session_scan_count = 0
+session_empty_prod_scans = 0
+session_observation_hits = 0
+session_observation_repeat_hits = 0
+session_best_observation: Dict[str, Any] = {}
+session_observation_seen: Dict[str, Dict[str, Any]] = {}
 
 CANDIDATE_CACHE_TTL_SECONDS = 90
 ROLLING_DISCOVERY_DAYS = 30
@@ -1797,10 +1805,149 @@ def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
 
 
 # =========================================
+# OBSERVATION LANE
+# =========================================
+def observation_reason_from_market(m: Dict[str, Any]) -> str:
+    reasons = []
+    spread = to_float(m.get("spread", 0.0), 0.0)
+    best_bid = to_float(m.get("best_bid", 0.0), 0.0)
+    fill_conf = to_float(m.get("fill_confidence", 0.0), 0.0)
+    side_depth = to_float(m.get("side_depth", 0.0), 0.0)
+
+    if best_bid < MIN_BID:
+        reasons.append("bid still weak")
+    if spread > MAX_SPREAD:
+        reasons.append("spread still wide")
+    if side_depth < MIN_TOP_DEPTH:
+        reasons.append("side depth thin")
+    if fill_conf < MIN_FILL_CONFIDENCE:
+        reasons.append("fill confidence weak")
+    if not reasons:
+        reasons.append("not ready yet")
+    return ", ".join(reasons[:3])
+
+
+def classify_observation_market(m: Dict[str, Any], production_reason: Optional[str]) -> Tuple[bool, Optional[str]]:
+    if m.get("dead_book"):
+        return False, None
+    if to_float(m.get("liquidity", 0.0), 0.0) < MIN_LIQUIDITY:
+        return False, None
+
+    best_bid = to_float(m.get("best_bid", 0.0), 0.0)
+    best_ask = to_float(m.get("best_ask", 0.0), 0.0)
+    spread = to_float(m.get("spread", 0.0), 0.0)
+    bid_depth = to_float(m.get("bid_depth", 0.0), 0.0)
+    ask_depth = to_float(m.get("ask_depth", 0.0), 0.0)
+    midpoint = to_float(m.get("midpoint", 0.0), 0.0)
+    tiny_position_score = to_float(m.get("tiny_position_score", 0.0), 0.0)
+
+    if best_bid <= 0 or best_ask <= 0:
+        return False, None
+    if best_bid < 0.003:
+        return False, None
+    if best_ask >= 0.995:
+        return False, None
+    if spread > 0.20:
+        return False, None
+    if max(bid_depth, ask_depth) < 5.0:
+        return False, None
+    if tiny_position_score < 0.20:
+        return False, None
+    if midpoint <= 0 or midpoint < 0.01 or midpoint > 0.99:
+        return False, None
+
+    return True, observation_reason_from_market(m)
+
+
+def build_observation_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    obs = []
+    for r in results:
+        if r.get("category") in {"ALERT", "WATCH"}:
+            continue
+        ok, why_not_ready = classify_observation_market(r, r.get("reason"))
+        if not ok:
+            continue
+        item = dict(r)
+        item["observation_reason"] = why_not_ready
+        item["observation_interest"] = round(
+            (to_float(item.get("tiny_position_score", 0.0), 0.0) * 0.25) +
+            (to_float(item.get("fill_confidence", 0.0), 0.0) * 0.20) +
+            (to_float(item.get("time_score", 0.0), 0.0) * 0.20) +
+            (clamp((0.20 - to_float(item.get("spread", 0.0), 0.0)) / 0.20, 0.0, 1.0) * 0.15) +
+            (min(max(to_float(item.get("bid_depth", 0.0), 0.0), to_float(item.get("ask_depth", 0.0), 0.0)) / 25.0, 1.0) * 0.10) +
+            (abs(to_float(item.get("obi", 0.0), 0.0)) * 0.10),
+            4,
+        )
+        obs.append(item)
+    obs.sort(key=lambda x: (-to_float(x.get("observation_interest", 0.0), 0.0), -to_float(x.get("fill_confidence", 0.0), 0.0), -to_float(x.get("tiny_position_score", 0.0), 0.0), -to_float(x.get("time_score", 0.0), 0.0)))
+    return obs[:5]
+
+
+def update_session_tracking(scan: Dict[str, Any]) -> None:
+    global session_scan_count, session_empty_prod_scans, session_observation_hits, session_observation_repeat_hits, session_best_observation
+    session_scan_count += 1
+    prod = qualifying_results(scan)
+    if not prod:
+        session_empty_prod_scans += 1
+
+    obs = scan.get("observation_results", []) or []
+    session_observation_hits += len(obs)
+    for item in obs:
+        slug = item.get("slug", "")
+        prev = session_observation_seen.get(slug)
+        if prev:
+            session_observation_repeat_hits += 1
+        session_observation_seen[slug] = {
+            "bid": to_float(item.get("best_bid", 0.0), 0.0),
+            "spread": to_float(item.get("spread", 0.0), 0.0),
+            "depth": max(to_float(item.get("bid_depth", 0.0), 0.0), to_float(item.get("ask_depth", 0.0), 0.0)),
+            "label": item.get("label", ""),
+            "interest": to_float(item.get("observation_interest", 0.0), 0.0),
+        }
+        if not session_best_observation or to_float(item.get("observation_interest", 0.0), 0.0) > to_float(session_best_observation.get("observation_interest", 0.0), 0.0):
+            session_best_observation = {
+                "slug": slug,
+                "label": item.get("label", ""),
+                "observation_interest": to_float(item.get("observation_interest", 0.0), 0.0),
+                "best_bid": to_float(item.get("best_bid", 0.0), 0.0),
+                "spread": to_float(item.get("spread", 0.0), 0.0),
+            }
+
+
+def format_observation_block(r: Dict[str, Any]) -> str:
+    return (
+        f"FORMING | {r.get('label', '')}\n"
+        f"slug={r.get('slug', '')}\n"
+        f"topic={r.get('topic_category', 'other')} side={r.get('signal_side', '?')} interest={to_float(r.get('observation_interest', 0.0), 0.0):.3f}\n"
+        f"why interesting=real book forming around catalyst\n"
+        f"not ready because={r.get('observation_reason', 'not ready yet')}\n"
+        f"bid={to_float(r.get('best_bid', 0.0), 0.0):.3f} ask={to_float(r.get('best_ask', 0.0), 0.0):.3f} spread={to_float(r.get('spread', 0.0), 0.0):.3f}\n"
+        f"bid_depth={to_float(r.get('bid_depth', 0.0), 0.0):.2f} ask_depth={to_float(r.get('ask_depth', 0.0), 0.0):.2f} fill={to_float(r.get('fill_confidence', 0.0), 0.0):.3f} tiny={to_float(r.get('tiny_position_score', 0.0), 0.0):.3f}"
+    )
+
+
+def format_session_summary() -> List[str]:
+    top_reason = "none"
+    if last_skip_counts:
+        k, v = last_skip_counts.most_common(1)[0]
+        top_reason = f"{k}:{v}"
+    best = "none"
+    if session_best_observation:
+        best = f"{session_best_observation.get('label', '')} | interest={to_float(session_best_observation.get('observation_interest', 0.0), 0.0):.3f}"
+    return [
+        "Session summary:",
+        f"scans={session_scan_count} | empty_prod_scans={session_empty_prod_scans} | unique_forming={len(session_observation_seen)}",
+        f"observation_hits={session_observation_hits} | observation_repeats={session_observation_repeat_hits}",
+        f"top_skip_reason={top_reason}",
+        f"best_forming={best}",
+    ]
+
+
+# =========================================
 # SCAN
 # =========================================
 def scan_markets() -> Dict[str, Any]:
-    global last_skip_counts, last_pipeline_stats, last_preflight_reason_counts, last_near_passes, last_discovery_samples
+    global last_skip_counts, last_pipeline_stats, last_preflight_reason_counts, last_near_passes, last_discovery_samples, last_observation_results
 
     watchlist, pipeline_stats = fetch_watchlist()
     results: List[Dict[str, Any]] = []
@@ -1851,6 +1998,9 @@ def scan_markets() -> Dict[str, Any]:
     }
     last_skip_counts = skip_counter
 
+    observation_results = build_observation_results(results)
+    last_observation_results = observation_results
+
     results.sort(
         key=lambda x: (
             0 if x.get("category") == "ALERT" else 1 if x.get("category") == "WATCH" else 2,
@@ -1864,12 +2014,14 @@ def scan_markets() -> Dict[str, Any]:
         )
     )
 
+    scan = {"counts": counts, "results": results[:30], "observation_results": observation_results[:5], "pipeline": pipeline_stats}
+    update_session_tracking(scan)
     print(
         f"[{now_str()}] Scan complete | "
         f"total={counts['total']} alert={counts['alert']} "
-        f"watch={counts['watch']} skip={counts['skip']}"
+        f"watch={counts['watch']} skip={counts['skip']} obs={len(observation_results[:5])}"
     )
-    return {"counts": counts, "results": results[:30], "pipeline": pipeline_stats}
+    return scan
 
 
 def qualifying_results(scan: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2016,12 +2168,17 @@ def format_zero_summary(zero_count: int, seconds_in_window: int) -> str:
     if near:
         first = near[0]
         near_text = f"{first.get('reason', 'unknown')} ({first.get('distance_note', '') or first.get('distance_to_pass', '')})"
+    obs_text = "none"
+    if last_observation_results:
+        top_obs = last_observation_results[0]
+        obs_text = f"{top_obs.get('label', '')} | not ready: {top_obs.get('observation_reason', '')}"
     return (
         f"No qualifying markets in last {minutes} minutes.\n"
         f"Empty scans: {zero_count}\n"
         f"Top preflight block: {top_reason}\n"
         f"Hard-skipped in discovery: {pipeline.get('discover_hard_skipped', 0)} | family skips: {pipeline.get('discover_family_skips', 0)} | bucket skips: {pipeline.get('discover_family_bucket_skips', 0)}\n"
-        f"Closest near-pass: {near_text}"
+        f"Closest near-pass: {near_text}\n"
+        f"Top forming market: {obs_text}"
     )
 
 
@@ -2093,6 +2250,16 @@ def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
             if preflight_near:
                 lines.extend([""] + preflight_near)
 
+        obs = scan.get("observation_results", []) or []
+        if obs:
+            lines.extend(["", "Forming markets:", ""])
+            for r in obs[:3]:
+                lines.append(format_observation_block(r))
+                lines.append("")
+        else:
+            lines.extend(["", "Forming markets: none"] )
+
+        lines.extend([""] + format_session_summary())
         return "\n".join(lines).strip()
 
     return None
@@ -2240,6 +2407,15 @@ def health():
         "last_preflight_reason_counts": last_preflight_reason_counts,
         "last_near_passes": last_near_passes,
         "last_discovery_samples": last_discovery_samples,
+        "last_observation_results": last_observation_results[:5],
+        "session_summary": {
+            "scans": session_scan_count,
+            "empty_prod_scans": session_empty_prod_scans,
+            "observation_hits": session_observation_hits,
+            "observation_repeats": session_observation_repeat_hits,
+            "unique_forming": len(session_observation_seen),
+            "best_forming": session_best_observation,
+        },
         "candidate_cache_ttl_seconds": CANDIDATE_CACHE_TTL_SECONDS,
     })
 
@@ -2316,7 +2492,9 @@ def webhook():
             f"candidate_cache_ttl_seconds={CANDIDATE_CACHE_TTL_SECONDS}\n"
             f"last_pipeline_stats={last_pipeline_stats}\n"
             f"last_preflight_reason_counts={last_preflight_reason_counts}\n"
-            f"last_near_passes={last_near_passes}"
+            f"last_near_passes={last_near_passes}\n"
+            f"last_observation_results={last_observation_results[:5]}\n"
+            f"session_summary={{'scans': {session_scan_count}, 'empty_prod_scans': {session_empty_prod_scans}, 'observation_hits': {session_observation_hits}, 'observation_repeats': {session_observation_repeat_hits}, 'unique_forming': {len(session_observation_seen)}, 'best_forming': {session_best_observation}}}"
         )
         send_telegram_message(chat_id, msg)
         return jsonify({"ok": True})

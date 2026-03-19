@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-SCRIPT_VERSION = "v6-discovery-intake"
+SCRIPT_VERSION = "v7-event-universe"
 
 # =========================================
 # ENV / SETTINGS
@@ -55,7 +55,7 @@ DISCOVER_MIN_LIQUIDITY = float(os.getenv("DISCOVER_MIN_LIQUIDITY", "10000"))
 
 DISCOVER_KEYWORDS = os.getenv(
     "DISCOVER_KEYWORDS",
-    "fed,fomc,rates,rate hike,rate cut,interest,cpi,inflation,ppi,unemployment,bitcoin,btc,ethereum,eth,solana,sol,approval,decision,announce,launch,ban,legal,etf,policy,election,primary,vote,debate,tariff,sanction,default,shutdown,opec,meeting,treasury,yield,bond,gold,oil,crude,wti,sp500,s&p,nasdaq,index,dow,weekly,monthly,by date,end of",
+    "cpi,ppi,fomc,fed,rates,rate cut,rate hike,unemployment,inflation,approval,decision,announce,ruling,hearing,court,judge,legal,policy,vote,debate,primary,election,tariff,shutdown,meeting,by friday,by saturday,by sunday,today,tonight,tomorrow,this week,end of march,end of april,ftx,bankruptcy,payout,relaunch,sentencing,sec,etf",
 ).strip()
 
 ENABLE_YES_NO_ONLY = os.getenv("ENABLE_YES_NO_ONLY", "true").lower() == "true"
@@ -93,23 +93,23 @@ NEGATIVE_BLOCKLIST = [
     "war", "military", "offensive", "strike", "israel", "iran", "lebanon",
     "gaza", "missile", "attack", "ground offensive", "troops", "yemen",
     "post", "tweets", "tweet", "celebrity", "actor", "singer",
+    "up or down", "price to beat", "fdv above", "fdv below", "one day after launch",
 ]
 
 CATEGORY_WHITELIST = [
-    "fed", "fomc", "rates", "rate", "interest", "cpi", "inflation", "ppi", "unemployment",
-    "bitcoin", "btc", "ethereum", "eth", "solana", "sol",
-    "approval", "decision", "announce", "launch", "ban", "legal", "etf",
-    "policy", "election", "primary", "vote", "debate", "tariff", "sanction", "default", "shutdown",
-    "sp500", "s&p", "nasdaq", "index", "dow",
-    "oil", "crude", "wti", "gold", "yield", "bond", "treasury",
-    "weekly", "monthly", "by date", "end of", "meeting",
+    "cpi", "ppi", "fomc", "fed", "rates", "rate", "inflation", "unemployment",
+    "approval", "decision", "announce", "ruling", "hearing", "court", "judge", "legal",
+    "policy", "election", "primary", "vote", "debate", "president", "senate", "house", "governor",
+    "tariff", "shutdown", "meeting", "today", "tonight", "tomorrow", "this week",
+    "by friday", "by saturday", "by sunday", "end of march", "end of april",
+    "ftx", "bankruptcy", "payout", "relaunch", "sentencing", "sec", "etf",
 ]
 
 CATEGORY_PRIORITY = {
-    "crypto": 0,
-    "macro": 1,
-    "index_commodity": 2,
-    "politics_event": 3,
+    "politics_event": 0,
+    "legal_special": 1,
+    "macro": 2,
+    "crypto_event": 3,
     "other": 4,
 }
 
@@ -304,14 +304,14 @@ def days_to_end(end_iso: str) -> Optional[float]:
 def classify_topic(text: str) -> str:
     t = (text or "").lower()
 
-    if any(k in t for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol"]):
-        return "crypto"
-    if any(k in t for k in ["fed", "fomc", "rate", "rates", "interest", "cpi", "inflation", "ppi", "unemployment", "yield", "bond", "treasury", "opec", "tariff", "sanction", "default", "shutdown"]):
-        return "macro"
-    if any(k in t for k in ["sp500", "s&p", "nasdaq", "index", "dow", "oil", "crude", "wti", "gold"]):
-        return "index_commodity"
-    if any(k in t for k in ["election", "primary", "vote", "debate", "president", "secretary", "senate", "house", "governor"]):
+    if any(k in t for k in ["ftx", "bankruptcy", "payout", "relaunch", "sentencing", "court", "judge", "hearing", "ruling", "sec"]):
+        return "legal_special"
+    if any(k in t for k in ["election", "primary", "vote", "debate", "president", "senate", "house", "governor"]):
         return "politics_event"
+    if any(k in t for k in ["fed", "fomc", "rate", "rates", "interest", "cpi", "inflation", "ppi", "unemployment", "tariff", "shutdown", "policy", "meeting"]):
+        return "macro"
+    if any(k in t for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "etf", "approval"]):
+        return "crypto_event"
     return "other"
 
 
@@ -320,9 +320,18 @@ def is_blocked_topic(text: str) -> bool:
     return any(k in t for k in NEGATIVE_BLOCKLIST)
 
 
+def is_secondary_special_situation(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in ["ftx", "bankruptcy", "payout", "relaunch", "sentencing", "court", "judge", "sec"])
+
+
 def is_allowed_topic(text: str) -> bool:
     t = (text or "").lower()
-    return any(k in t for k in CATEGORY_WHITELIST)
+    if not any(k in t for k in CATEGORY_WHITELIST):
+        return False
+    if is_event_bound_market(t):
+        return True
+    return is_secondary_special_situation(t)
 
 
 def looks_like_crypto_ladder_market(text: str) -> bool:
@@ -426,6 +435,12 @@ def canonical_market_family_key(slug: str, question: str) -> str:
 
 def extract_asset_family_bucket(text: str) -> str:
     t = (text or "").lower()
+    if any(k in t for k in ["ftx", "bankruptcy", "payout", "relaunch", "sentencing"]):
+        return "asset:ftx"
+    if any(k in t for k in ["election", "primary", "vote", "debate", "president", "senate", "house", "governor"]):
+        return "asset:politics"
+    if any(k in t for k in ["fed", "fomc", "cpi", "ppi", "unemployment", "rates", "tariff", "shutdown"]):
+        return "asset:macro"
     if any(k in t for k in ["crude oil", " oil ", " wti", "wti "]):
         return "asset:oil"
     if any(k in t for k in ["bitcoin", " btc"]):
@@ -457,10 +472,23 @@ def looks_like_shell_price_market(text: str) -> bool:
     return False
 
 
+def looks_like_short_window_price_market(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    short_window_phrases = [
+        "up or down", "price to beat", "fdv above", "fdv below",
+        "one day after launch", "5 minutes", "15 minutes", "30 minutes", "4 hour", "4 hours",
+    ]
+    return any(p in t for p in short_window_phrases)
+
+
 def should_hard_skip_discovery_market(text: str) -> Tuple[bool, str]:
     t = (text or "").lower()
     if not t:
         return False, ""
+    if looks_like_short_window_price_market(t):
+        return True, "hard_skip_short_window_price_market"
     if looks_like_crypto_ladder_market(t):
         return True, "hard_skip_crypto_ladder"
     if looks_like_strike_ladder_market(t):
@@ -476,7 +504,8 @@ def is_event_bound_market(text: str) -> bool:
         "decision", "announce", "approval", "ruling", "hearing", "vote", "debate",
         "primary", "meeting", "today", "tonight", "tomorrow", "this week", "by friday",
         "by saturday", "by sunday", "cpi", "ppi", "fomc", "fed", "rates", "tariff",
-        "shutdown", "legal", "etf", "policy"
+        "shutdown", "legal", "etf", "policy", "court", "judge", "sentencing",
+        "bankruptcy", "payout", "relaunch", "sec", "election"
     ])
 
 
@@ -833,23 +862,31 @@ def record_preflight_near_pass(stats: Dict[str, Any], candidate: Dict[str, Any],
 def discovery_priority(combined: str) -> float:
     topic = classify_topic(combined)
     base = {
-        "crypto": 1.00,
+        "politics_event": 1.00,
+        "legal_special": 0.97,
         "macro": 0.95,
-        "index_commodity": 0.90,
-        "politics_event": 0.82,
-        "other": 0.70,
-    }.get(topic, 0.70)
+        "crypto_event": 0.86,
+        "other": 0.65,
+    }.get(topic, 0.65)
 
-    if any(k in combined for k in ["approval", "decision", "announce", "launch", "meeting", "by date", "end of"]):
+    if is_event_bound_market(combined):
         base += 0.08
-    if "weekly" in combined or "monthly" in combined:
-        base += 0.03
-    if looks_like_crypto_ladder_market(combined):
-        base -= 0.50
-    if looks_like_strike_ladder_market(combined):
-        base -= 0.55
-    if any(k in combined for k in ["today", "tonight", "tomorrow", "this week", "by friday", "by saturday", "by sunday", "end of march", "end of april"]):
+    if is_secondary_special_situation(combined):
+        base += 0.04
+    if any(k in combined for k in ["approval", "decision", "ruling", "hearing", "vote", "debate", "cpi", "ppi", "fomc", "fed", "sentencing", "payout"]):
         base += 0.05
+    if any(k in combined for k in ["today", "tonight", "tomorrow", "this week", "by friday", "by saturday", "by sunday", "end of march", "end of april"]):
+        base += 0.04
+    if any(k in combined for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "oil", "crude", "wti", "gold", "sp500", "s&p", "nasdaq", "dow"]):
+        base -= 0.06
+    if looks_like_short_window_price_market(combined):
+        base -= 0.50
+    if looks_like_crypto_ladder_market(combined):
+        base -= 0.55
+    if looks_like_strike_ladder_market(combined):
+        base -= 0.60
+    if looks_like_shell_price_market(combined):
+        base -= 0.60
 
     return round(base, 4)
 

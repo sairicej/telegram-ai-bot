@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v13.4-endtime-only-window-fix"
+SCRIPT_VERSION = "v13.5-open-status-gate"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -135,6 +135,48 @@ def market_slug(market: Dict[str, Any]) -> str:
 
 def market_question(market: Dict[str, Any]) -> str:
     return str(market.get("question") or market.get("title") or "")
+
+
+def is_open_status_market(market: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Small discovery guard so obviously closed/resolved markets do not rely on time parsing.
+    This keeps the pipeline focused on live, short-term, executable setups.
+    """
+    truthy_false = {"false", "0", "no", "closed", "inactive", "resolved", "ended", "finalized", "settled"}
+    truthy_true = {"true", "1", "yes", "open", "active", "live"}
+
+    def norm(v):
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if v is None:
+            return ""
+        return str(v).strip().lower()
+
+    for key in ["closed", "isClosed", "archived", "isArchived", "resolved", "isResolved", "ended", "isEnded", "settled", "finalized"]:
+        if norm(market.get(key)) in truthy_true:
+            return False, f"status:{key}"
+
+    active_seen = False
+    for key in ["active", "isActive", "enableOrderBook", "orderBookEnabled"]:
+        val = norm(market.get(key))
+        if val:
+            active_seen = True
+            if val in truthy_false:
+                return False, f"status:{key}"
+
+    status_val = norm(market.get("status"))
+    if status_val in truthy_false:
+        return False, "status:status"
+    if status_val and status_val not in truthy_true and "open" not in status_val and "active" not in status_val and "live" not in status_val:
+        return False, f"status:{status_val}"
+
+    market_status = norm(market.get("marketStatus"))
+    if market_status in truthy_false:
+        return False, "status:marketStatus"
+    if market_status and market_status not in truthy_true and "open" not in market_status and "active" not in market_status and "live" not in market_status:
+        return False, f"status:{market_status}"
+
+    return True, "ok"
 
 
 def get_market_end_dt(market: Dict[str, Any]) -> Tuple[Optional[datetime], str]:
@@ -425,8 +467,9 @@ def fetch_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
 
 def fetch_gamma_markets(limit: int) -> List[Dict[str, Any]]:
     urls = [
+        (f"{GAMMA_BASE}/markets", {"active": "true", "closed": "false", "archived": "false", "limit": limit}),
+        (f"{GAMMA_BASE}/markets", {"closed": "false", "archived": "false", "limit": limit}),
         (f"{GAMMA_BASE}/markets", {"limit": limit}),
-        (f"{GAMMA_BASE}/markets", {"closed": "false", "limit": limit}),
     ]
     for url, params in urls:
         try:
@@ -711,6 +754,20 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         sports_like = is_sports_or_highflow_market(m)
         curated_like = is_curated_catalyst_market(m)
         event_like = sports_like or curated_like
+
+        open_ok, open_reason = is_open_status_market(m)
+        if not open_ok:
+            add_hard_skip(f"hard_skip_{open_reason}", m)
+            if len(stats.get("discover_reject_samples", [])) < 5:
+                stats.setdefault("discover_reject_samples", []).append({
+                    "slug": market_slug(m),
+                    "reason": f"hard_skip_{open_reason}",
+                    "time_source": "status",
+                    "time_value": "status-gate",
+                    "question": market_question(m),
+                })
+            continue
+
         allowed_time, time_reason, time_dt, time_source = classify_time_window(m)
         if not allowed_time:
             add_hard_skip(time_reason, m)

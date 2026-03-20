@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v13.6-soft-time-window-fix"
+SCRIPT_VERSION = "v13.7-yesno-recognition-fix"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -355,15 +355,59 @@ def rolling_date_phrases() -> List[str]:
 
 
 def is_yes_no_market(market: Dict[str, Any]) -> bool:
+    """
+    Keep YES/NO only, but be less brittle about how Gamma formats it.
+    Accept:
+    - outcomes as a real list
+    - outcomes as a JSON/string list like '["Yes","No"]'
+    - two tokens where labels appear in outcome/name/title/label
+    """
+    def clean_label(v: Any) -> str:
+        return compact_text(str(v or "")).lower()
+
+    def is_yes_no_pair(labels: List[str]) -> bool:
+        cleaned = [clean_label(x) for x in labels if clean_label(x)]
+        if len(cleaned) != 2:
+            return False
+        return sorted(cleaned) == ["no", "yes"]
+
     outcomes = market.get("outcomes")
+
     if isinstance(outcomes, list):
-        cleaned = [compact_text(str(x)).lower() for x in outcomes]
-        return cleaned == ["yes", "no"] or cleaned == ["no", "yes"]
+        if is_yes_no_pair(outcomes):
+            return True
+
+    if isinstance(outcomes, str):
+        s = outcomes.strip()
+        if s:
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list) and is_yes_no_pair(parsed):
+                    return True
+            except Exception:
+                pass
+
+            # fallback for loose comma-separated strings like "Yes,No"
+            parts = [p.strip().strip('"\'') for p in s.strip("[]").split(",") if p.strip()]
+            if is_yes_no_pair(parts):
+                return True
+
     tokens = market.get("tokens") or []
-    if len(tokens) == 2:
-        labels = [compact_text(str(t.get("outcome", ""))).lower() for t in tokens]
-        return sorted(labels) == ["no", "yes"]
+    if isinstance(tokens, list) and len(tokens) == 2:
+        labels = []
+        for t in tokens:
+            if isinstance(t, dict):
+                for key in ["outcome", "name", "title", "label"]:
+                    if t.get(key):
+                        labels.append(t.get(key))
+                        break
+            elif t:
+                labels.append(t)
+        if is_yes_no_pair(labels):
+            return True
+
     return False
+
 
 
 def market_volume(market: Dict[str, Any]) -> float:

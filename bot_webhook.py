@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v14-market-detail-hydration"
+SCRIPT_VERSION = "v14.1-force-hydration-on-missing-tokens"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -615,17 +615,11 @@ def fetch_market_detail(market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def hydrate_market_for_tokens(market: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     """
-    Discovery list payloads can be thin. Hydrate a fuller market record before
-    token extraction so YES/NO token ids can be resolved from market detail.
+    Discovery list payloads can be thin. Only skip hydration if inline extraction
+    already resolves BOTH YES and NO token ids. Otherwise force detail fetch.
     """
-    tokens = market.get("tokens") or []
-    parallel_ids = (
-        market.get("clobTokenIds")
-        or market.get("clob_token_ids")
-        or market.get("tokenIds")
-        or market.get("token_ids")
-    )
-    if tokens or parallel_ids:
+    inline_yes, inline_no = extract_yes_no_tokens(market)
+    if inline_yes and inline_no:
         return market, "inline"
 
     detail = fetch_market_detail(market)

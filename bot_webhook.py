@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v13.3-timefield-fix-runtime-patch"
+SCRIPT_VERSION = "v13.4-endtime-only-window-fix"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -139,7 +139,9 @@ def market_question(market: Dict[str, Any]) -> str:
 
 def get_market_end_dt(market: Dict[str, Any]) -> Tuple[Optional[datetime], str]:
     """
-    Try multiple possible time fields used by Polymarket/Gamma/event objects.
+    Use only true end/close fields for discovery window checks.
+    Do not treat start fields as expiry. That was causing active markets
+    to be misclassified as already over.
     Returns (datetime_or_none, source_field_name).
     """
     candidates = [
@@ -150,12 +152,10 @@ def get_market_end_dt(market: Dict[str, Any]) -> Tuple[Optional[datetime], str]:
         ("end_time", market.get("end_time")),
         ("closeTime", market.get("closeTime")),
         ("close_time", market.get("close_time")),
-        ("gameStartTime", market.get("gameStartTime")),
-        ("game_start_time", market.get("game_start_time")),
-        ("startDate", market.get("startDate")),
-        ("start_date", market.get("start_date")),
-        ("startTime", market.get("startTime")),
-        ("start_time", market.get("start_time")),
+        ("expirationDate", market.get("expirationDate")),
+        ("expiration_date", market.get("expiration_date")),
+        ("expiry", market.get("expiry")),
+        ("expiresAt", market.get("expiresAt")),
     ]
 
     event_obj = market.get("event") or {}
@@ -164,11 +164,21 @@ def get_market_end_dt(market: Dict[str, Any]) -> Tuple[Optional[datetime], str]:
             ("event.endDate", event_obj.get("endDate")),
             ("event.end_date", event_obj.get("end_date")),
             ("event.endTime", event_obj.get("endTime")),
-            ("event.startDate", event_obj.get("startDate")),
-            ("event.start_time", event_obj.get("start_time")),
-            ("event.startTime", event_obj.get("startTime")),
-            ("event.gameStartTime", event_obj.get("gameStartTime")),
+            ("event.closeTime", event_obj.get("closeTime")),
+            ("event.expirationDate", event_obj.get("expirationDate")),
         ])
+
+    events = market.get("events") or []
+    if isinstance(events, list):
+        for idx, event_obj in enumerate(events[:3]):
+            if isinstance(event_obj, dict):
+                candidates.extend([
+                    (f"events[{idx}].endDate", event_obj.get("endDate")),
+                    (f"events[{idx}].end_date", event_obj.get("end_date")),
+                    (f"events[{idx}].endTime", event_obj.get("endTime")),
+                    (f"events[{idx}].closeTime", event_obj.get("closeTime")),
+                    (f"events[{idx}].expirationDate", event_obj.get("expirationDate")),
+                ])
 
     for key, value in candidates:
         dt = parse_iso_datetime(value)

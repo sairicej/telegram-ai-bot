@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v13.5-open-status-gate"
+SCRIPT_VERSION = "v13.6-soft-time-window-fix"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -231,14 +231,22 @@ def get_market_end_dt(market: Dict[str, Any]) -> Tuple[Optional[datetime], str]:
 
 def classify_time_window(market: Dict[str, Any]) -> Tuple[bool, str, Optional[datetime], str]:
     end_dt, source = get_market_end_dt(market)
+
+    # If we can't find time, DO NOT kill it
     if end_dt is None:
-        return False, "hard_skip_missing_time", None, source
+        return True, "soft_missing_time", None, source
+
     now_dt = datetime.now(timezone.utc)
     delta_days = (end_dt - now_dt).total_seconds() / 86400.0
+
+    # Only reject if clearly past
     if delta_days < 0:
         return False, "hard_skip_past_event", end_dt, source
+
+    # If outside window → allow but tag it
     if delta_days > MAX_DAYS_TO_END:
-        return False, "hard_skip_outside_window", end_dt, source
+        return True, "soft_outside_window", end_dt, source
+
     return True, "ok", end_dt, source
 
 
@@ -1062,10 +1070,10 @@ def format_health_text() -> str:
         f"target_max_test_position_usd={TARGET_MAX_TEST_POSITION_USD}",
         f"test_market_slug={TEST_MARKET_SLUG or 'none'}",
         f"candidate_cache_ttl_seconds={CANDIDATE_CACHE_TTL_SECONDS}",
-        f"last_pipeline_stats={last_pipeline_stats}",
-        f"last_preflight_reason_counts={last_preflight_reason_counts}",
-        f"last_near_passes={last_near_passes}",
-        f"last_observation_results={last_observation_results}",
+        f"last_pipeline_summary={len(last_pipeline_stats)} keys",
+        f"preflight_reasons={list(last_preflight_reason_counts.get('discover', {}).keys())[:3]}",
+        f"near_passes_count={len(last_near_passes.get('discover', []))}",
+        f"observation_count={len(last_observation_results)}",
         f"session_summary={session_summary}",
     ]
     return "\n".join(lines)

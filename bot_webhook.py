@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v12-sports-highflow-discovery-fix"
+SCRIPT_VERSION = "v12.1-sports-highflow-discovery-fix-async"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -934,20 +934,38 @@ def run_scan_and_update() -> Dict[str, Any]:
 
 
 def handle_command(text: str) -> str:
-    global manual_scan_in_progress
     cmd = (text or "").strip().lower()
     if cmd.startswith("/health"):
         return format_health_text()
     if cmd.startswith("/scan"):
-        with state_lock:
-            manual_scan_in_progress = True
-        try:
-            scan = run_scan_and_update()
-            return format_scan_text(scan)
-        finally:
-            with state_lock:
-                manual_scan_in_progress = False
+        return "__RUN_SCAN_ASYNC__"
     return "Commands: /health, /scan"
+
+
+def run_manual_scan_async(chat_id: str) -> None:
+    global manual_scan_in_progress
+    try:
+        scan = run_scan_and_update()
+        reply = format_scan_text(scan)
+        if TELEGRAM_BOT_TOKEN and chat_id:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": reply},
+                timeout=REQUEST_TIMEOUT,
+            )
+    except Exception as exc:
+        if TELEGRAM_BOT_TOKEN and chat_id:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": f"Scan error: {exc}"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+            except Exception:
+                pass
+    finally:
+        with state_lock:
+            manual_scan_in_progress = False
 
 
 def background_loop() -> None:
@@ -994,11 +1012,40 @@ def scan_route():
 
 @app.route("/webhook", methods=["POST"])
 def webhook_route():
+    global manual_scan_in_progress
     payload = request.get_json(silent=True) or {}
     msg = payload.get("message") or payload.get("edited_message") or {}
-    chat_id = msg.get("chat", {}).get("id")
+    chat_id = str(msg.get("chat", {}).get("id") or "").strip()
     text = msg.get("text", "")
     reply = handle_command(text)
+
+    if reply == "__RUN_SCAN_ASYNC__":
+        with state_lock:
+            if manual_scan_in_progress:
+                if TELEGRAM_BOT_TOKEN and chat_id:
+                    try:
+                        requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            json={"chat_id": chat_id, "text": "Scan already running. Wait for result."},
+                            timeout=REQUEST_TIMEOUT,
+                        )
+                    except Exception:
+                        pass
+                return jsonify({"ok": True})
+            manual_scan_in_progress = True
+
+        if TELEGRAM_BOT_TOKEN and chat_id:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": "Running scan..."},
+                    timeout=REQUEST_TIMEOUT,
+                )
+            except Exception:
+                pass
+        threading.Thread(target=run_manual_scan_async, args=(chat_id,), daemon=True).start()
+        return jsonify({"ok": True})
+
     if TELEGRAM_BOT_TOKEN and chat_id:
         try:
             requests.post(

@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v13.2-timefield-fix"
+SCRIPT_VERSION = "v13.3-timefield-fix-runtime-patch"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -107,6 +107,34 @@ background_started = False
 # =========================================================
 def now_utc() -> datetime:
     return datetime.now(tz=UTC)
+
+
+def parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+def market_slug(market: Dict[str, Any]) -> str:
+    return str(market.get("slug") or "")
+
+
+def market_question(market: Dict[str, Any]) -> str:
+    return str(market.get("question") or market.get("title") or "")
 
 
 def get_market_end_dt(market: Dict[str, Any]) -> Tuple[Optional[datetime], str]:
@@ -1082,6 +1110,11 @@ def format_zero_summary() -> str:
     if reason_counts:
         k, v = sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[0]
         top_reason = f"{k}:{v}"
+    hard_skip_counts = last_pipeline_stats.get("discover_hard_skip_reason_counts", {}) or {}
+    hard_skip_reason = "none"
+    if hard_skip_counts:
+        hk, hv = sorted(hard_skip_counts.items(), key=lambda x: x[1], reverse=True)[0]
+        hard_skip_reason = f"{hk}:{hv}"
     best_forming = session_summary.get("best_forming") or {}
     best_forming_label = best_forming.get("question") if isinstance(best_forming, dict) else None
     return "\n".join([

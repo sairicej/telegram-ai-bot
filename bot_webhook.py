@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v13.9-scan-resolution-debug"
+SCRIPT_VERSION = "v14-market-detail-hydration"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -553,6 +553,89 @@ def fetch_manual_slugs() -> List[str]:
         return []
 
 
+def merge_market_records(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base or {})
+    for k, v in (extra or {}).items():
+        if v is None or v == "":
+            continue
+        if k == "tokens" and isinstance(v, list) and v:
+            merged[k] = v
+            continue
+        if k in ["outcomes", "clobTokenIds", "clob_token_ids", "tokenIds", "token_ids"] and v:
+            merged[k] = v
+            continue
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            inner = dict(merged.get(k) or {})
+            inner.update(v)
+            merged[k] = inner
+            continue
+        if isinstance(v, list) and isinstance(merged.get(k), list) and not merged.get(k):
+            merged[k] = v
+            continue
+        if k not in merged or merged.get(k) in (None, "", [], {}):
+            merged[k] = v
+    return merged
+
+
+def fetch_market_detail(market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    slug = str(market.get("slug") or "").strip()
+    market_id = market.get("id") or market.get("market_id") or market.get("marketId")
+    urls = []
+
+    if slug:
+        urls.extend([
+            (f"{GAMMA_BASE}/markets", {"slug": slug}),
+            (f"{GAMMA_BASE}/markets/{slug}", None),
+            (f"{GAMMA_BASE}/markets/slug/{slug}", None),
+        ])
+    if market_id not in (None, ""):
+        market_id = str(market_id)
+        urls.extend([
+            (f"{GAMMA_BASE}/markets/{market_id}", None),
+            (f"{GAMMA_BASE}/markets", {"id": market_id}),
+            (f"{GAMMA_BASE}/markets", {"market_id": market_id}),
+        ])
+
+    for url, params in urls:
+        try:
+            data = fetch_json(url, params=params)
+            if isinstance(data, list) and data:
+                first = data[0]
+                if isinstance(first, dict):
+                    return first
+            if isinstance(data, dict):
+                for key in ["market", "data"]:
+                    if isinstance(data.get(key), dict):
+                        return data[key]
+                return data
+        except Exception:
+            continue
+    return None
+
+
+def hydrate_market_for_tokens(market: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """
+    Discovery list payloads can be thin. Hydrate a fuller market record before
+    token extraction so YES/NO token ids can be resolved from market detail.
+    """
+    tokens = market.get("tokens") or []
+    parallel_ids = (
+        market.get("clobTokenIds")
+        or market.get("clob_token_ids")
+        or market.get("tokenIds")
+        or market.get("token_ids")
+    )
+    if tokens or parallel_ids:
+        return market, "inline"
+
+    detail = fetch_market_detail(market)
+    if not detail:
+        return market, "detail_missing"
+
+    merged = merge_market_records(market, detail)
+    merged["_hydrated"] = True
+    return merged, "detail_ok"
+
 def find_market_by_slug(markets: List[Dict[str, Any]], slug: str) -> Optional[Dict[str, Any]]:
     slug = (slug or "").strip().lower()
     for m in markets:
@@ -1012,22 +1095,30 @@ def scan_once() -> Dict[str, Any]:
     for market in candidates:
         stats["discover_checked"] += 1
         slug = market.get("slug", "")
-        yes_token, no_token = extract_yes_no_tokens(market)
+        hydrated_market, hydration_source = hydrate_market_for_tokens(market)
+        if hydration_source == "detail_ok":
+            stats["hydrated_detail_hits"] = stats.get("hydrated_detail_hits", 0) + 1
+        elif hydration_source == "detail_missing":
+            stats["hydrated_detail_misses"] = stats.get("hydrated_detail_misses", 0) + 1
+
+        yes_token, no_token = extract_yes_no_tokens(hydrated_market)
         if not yes_token or not no_token:
             stats["discover_resolve_failures"] += 1
             if len(stats.setdefault("resolve_failure_samples", [])) < 5:
-                raw_tokens = market.get("tokens") or []
+                raw_tokens = hydrated_market.get("tokens") or []
                 token_sample = raw_tokens[:2] if isinstance(raw_tokens, list) else raw_tokens
                 stats["resolve_failure_samples"].append({
-                    "slug": market.get("slug", ""),
-                    "question": market.get("question", market.get("title", "")),
+                    "slug": hydrated_market.get("slug", ""),
+                    "question": hydrated_market.get("question", hydrated_market.get("title", "")),
+                    "hydration_source": hydration_source,
                     "yes_token": yes_token,
                     "no_token": no_token,
-                    "outcomes": market.get("outcomes"),
+                    "outcomes": hydrated_market.get("outcomes"),
                     "token_sample": token_sample,
                 })
             continue
 
+        market = hydrated_market
         cache_key = slug or market.get("question", "")
         cached = candidate_cache.get(cache_key)
         use_cache = cached and (utc_ts() - cached.get("ts", 0) <= CANDIDATE_CACHE_TTL_SECONDS)
@@ -1202,6 +1293,8 @@ def format_health_text() -> str:
         f"observation_count={len(last_observation_results)}",
         f"resolve_failure_samples={len((last_pipeline_stats or {}).get('resolve_failure_samples', []))}",
         f"book_failure_samples={len((last_pipeline_stats or {}).get('book_failure_samples', []))}",
+        f"hydrated_detail_hits={(last_pipeline_stats or {}).get('hydrated_detail_hits', 0)}",
+        f"hydrated_detail_misses={(last_pipeline_stats or {}).get('hydrated_detail_misses', 0)}",
         f"session_summary={session_summary}",
     ]
     return "\n".join(lines)
@@ -1248,7 +1341,7 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"fallback_kept={pipeline.get('fallback_kept', 0)} | "
             f"cache_used={pipeline.get('cache_used', 0)} | "
             f"cache_refetched={pipeline.get('cache_refetched', 0)} | "
-            f"resolve_failures={pipeline.get('discover_resolve_failures', 0)} | "f"resolve_samples={len(pipeline.get('resolve_failure_samples', []) or [])} | "f"book_samples={len(pipeline.get('book_failure_samples', []) or [])} | "
+            f"resolve_failures={pipeline.get('discover_resolve_failures', 0)} | "f"resolve_samples={len(pipeline.get('resolve_failure_samples', []) or [])} | "f"book_samples={len(pipeline.get('book_failure_samples', []) or [])} | "f"hydrated_hits={pipeline.get('hydrated_detail_hits', 0)} | "f"hydrated_misses={pipeline.get('hydrated_detail_misses', 0)} | "
             f"top_preflight_discover={top_reason} | top_preflight_fallback=none"
         ),
         "",
@@ -1278,6 +1371,7 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
                 lines.extend([
                     f"{s.get('question') or 'unknown'}",
                     f"slug={s.get('slug', '')}",
+                    f"hydration_source={s.get('hydration_source', 'unknown')}",
                     f"yes_token={s.get('yes_token')} no_token={s.get('no_token')}",
                     f"outcomes={s.get('outcomes')}",
                 ])

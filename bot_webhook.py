@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v13-discovery-admission-debug"
+SCRIPT_VERSION = "v13.1-discovery-failopen-debug"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -607,6 +607,7 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
     primary_pool: List[Dict[str, Any]] = []
     relaxed_pool: List[Dict[str, Any]] = []
+    failopen_pool: List[Dict[str, Any]] = []
 
     def add_hard_skip(reason: str, market: Dict[str, Any]):
         stats["discover_hard_skipped"] += 1
@@ -634,6 +635,10 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         if is_strike_or_shell(m):
             add_hard_skip("hard_skip_strike_ladder", m)
             continue
+
+        # fail-open candidate pool for discovery debugging:
+        # if a market is short-term, yes/no, and not obvious junk, let it be considered later
+        failopen_pool.append(m)
 
         liq = market_liquidity(m)
         vol = market_volume(m)
@@ -695,6 +700,14 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             if len(selected) >= target:
                 break
             try_add(m, relaxed=True)
+
+    # Final fail-open path: if discovery still admitted nobody, let a capped number of
+    # short-term yes/no non-junk markets reach preflight so the real engine can judge them.
+    if not selected and failopen_pool:
+        failopen_pool.sort(key=lambda x: (market_liquidity(x), market_volume(x), event_priority(x)), reverse=True)
+        for m in failopen_pool[:min(target, 24)]:
+            if try_add(m, relaxed=True):
+                stats["discover_failopen_admits"] += 1
 
     final_list = selected[:target]
     for m in final_list[:5]:
@@ -905,6 +918,11 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
     if reason_counts:
         k, v = sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[0]
         top_reason = f"{k}:{v}"
+    hard_skip_reason = "none"
+    hard_skip_counts = pipeline.get("discover_hard_skip_reason_counts", {}) or {}
+    if hard_skip_counts:
+        hk, hv = sorted(hard_skip_counts.items(), key=lambda x: x[1], reverse=True)[0]
+        hard_skip_reason = f"{hk}:{hv}"
 
     lines = [
         "Scan finished. No qualifying markets." if not alerts and not watches else "Scan finished.",
@@ -918,6 +936,8 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"discover_prelim={pipeline.get('discover_prelim', 0)} | "
             f"discover_hard_skipped={pipeline.get('discover_hard_skipped', 0)} | "
             f"discover_non_curated_skips={pipeline.get('discover_non_curated_skips', 0)} | "
+            f"discover_relaxed_admits={pipeline.get('discover_relaxed_admits', 0)} | "
+            f"discover_failopen_admits={pipeline.get('discover_failopen_admits', 0)} | "
             f"discover_family_skips={pipeline.get('discover_family_skips', 0)} | "
             f"discover_bucket_skips={pipeline.get('discover_bucket_skips', 0)} | "
             f"discover_checked={pipeline.get('discover_checked', 0)} | "
@@ -980,7 +1000,7 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
         "Session summary:",
         f"scans={session_summary.get('scans', 0)} | empty_prod_scans={session_summary.get('empty_prod_scans', 0)} | unique_forming={session_summary.get('unique_forming', 0)}",
         f"observation_hits={session_summary.get('observation_hits', 0)} | observation_repeats={session_summary.get('observation_repeats', 0)}",
-        f"top_skip_reason={top_reason if top_reason else 'none'}",
+        f"top_skip_reason={top_reason if top_reason else 'none'} | top_hard_skip={hard_skip_reason}",
         f"best_forming={session_summary.get('best_forming', {}) or 'none'}",
     ])
     return "\n".join(lines)
@@ -998,6 +1018,7 @@ def format_zero_summary() -> str:
         f"No qualifying markets in last {int(ZERO_SUMMARY_EVERY_SECONDS/60) + 2} minutes.",
         f"Empty scans: {empty_scan_streak}",
         f"Top preflight block: {top_reason}",
+        f"Top hard-skip block: {hard_skip_reason}",
         f"Hard-skipped in discovery: {last_pipeline_stats.get('discover_hard_skipped', 0)} | family skips: {last_pipeline_stats.get('discover_family_skips', 0)} | bucket skips: {last_pipeline_stats.get('discover_bucket_skips', 0)}",
         "Closest near-pass: none" if not last_near_passes.get("discover") else f"Closest near-pass: {last_near_passes['discover'][0].get('question')}",
         f"Top forming market: {best_forming_label or 'none'}",

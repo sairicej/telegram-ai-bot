@@ -129,6 +129,53 @@ def compact_text(value: str) -> str:
 def title_slug_text(market: Dict[str, Any]) -> str:
     return compact_text(f"{market.get('question', '')} {market.get('slug', '')}").lower()
 
+def full_market_text(market: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    for key in [
+        "question", "slug", "description", "category", "subcategory", "groupItemTitle",
+        "title", "eventTitle", "eventSlug", "seriesSlug", "resolutionSource", "rules"
+    ]:
+        v = market.get(key)
+        if v:
+            parts.append(str(v))
+    tags = market.get("tags") or market.get("tag") or []
+    if isinstance(tags, list):
+        for t in tags:
+            if isinstance(t, dict):
+                parts.extend(str(t.get(k, "")) for k in ["label", "name", "slug"] if t.get(k))
+            elif t:
+                parts.append(str(t))
+    events = market.get("events") or []
+    if isinstance(events, list):
+        for e in events:
+            if isinstance(e, dict):
+                parts.extend(str(e.get(k, "")) for k in ["title", "slug", "category"] if e.get(k))
+    return compact_text(" ".join(parts)).lower()
+
+
+def is_sports_or_highflow_market(market: Dict[str, Any]) -> bool:
+    txt = full_market_text(market)
+    sports_terms = [
+        "sports", "game", "match", "vs", " v ", "final", "series", "playoff", "tournament",
+        "championship", "world cup", "world series", "opening day", "mlb", "nba", "nfl", "nhl",
+        "ncaa", "soccer", "football", "baseball", "basketball", "hockey", "tennis", "golf",
+        "ufc", "mma", "boxing", "race", "grand prix", "wimbledon", "masters"
+    ]
+    return any(term in txt for term in sports_terms)
+
+
+def is_curated_catalyst_market(market: Dict[str, Any]) -> bool:
+    txt = full_market_text(market)
+    catalyst_terms = [
+        "vote", "voting", "hearing", "ruling", "approval", "decision", "debate", "primary",
+        "caucus", "election", "tariff", "shutdown", "fed", "fomc", "cpi", "ppi", "rates",
+        "jobs report", "payrolls", "bankruptcy", "ftx", "payout", "sentencing", "settlement",
+        "delist", "delisted", "trial", "verdict", "sec", "etf", "earnings"
+    ]
+    if any(term in txt for term in catalyst_terms):
+        return True
+    return any(p in txt for p in rolling_date_phrases())
+
 
 def hours_to_event(end_iso: str) -> Optional[float]:
     if not end_iso:

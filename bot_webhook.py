@@ -1,8 +1,9 @@
-import ast
 import os
-import threading
+import re
 import time
-from collections import Counter
+import math
+import json
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -11,188 +12,108 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-SCRIPT_VERSION = "v10-prod-plus-observation"
+# =========================================================
+# Version
+# =========================================================
+SCRIPT_VERSION = "v11-sports-highflow"
+ROLLING_DISCOVERY_DAYS = 30
+UTC = timezone.utc
 
-# =========================================
-# ENV / SETTINGS
-# =========================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+# =========================================================
+# Environment
+# =========================================================
+GAMMA_BASE = os.getenv("GAMMA_BASE", "https://gamma-api.polymarket.com")
+CLOB_BASE = os.getenv("CLOB_BASE", "https://clob.polymarket.com")
+MARKETS_URL = os.getenv("MARKETS_URL", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-MARKETS_URL = os.getenv(
-    "MARKETS_URL",
-    "https://raw.githubusercontent.com/sairicej/telegram-ai-bot/main/live_feed_markets.txt",
-).strip()
-
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-BOT_LABEL = os.getenv("BOT_LABEL", "telegram-market-bot").strip()
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
+SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "7200"))
+ZERO_SUMMARY_EVERY_SECONDS = int(os.getenv("ZERO_SUMMARY_EVERY_SECONDS", "21600"))
+DEDUP_SECONDS = int(os.getenv("DEDUP_SECONDS", "3600"))
+CANDIDATE_CACHE_TTL_SECONDS = int(os.getenv("CANDIDATE_CACHE_TTL_SECONDS", "90"))
 
 ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "-0.10"))
 WATCH_THRESHOLD = float(os.getenv("WATCH_THRESHOLD", "-0.05"))
-
 SEND_WATCH_ALERTS = os.getenv("SEND_WATCH_ALERTS", "false").lower() == "true"
 DEBUG_SCAN_OUTPUT = os.getenv("DEBUG_SCAN_OUTPUT", "true").lower() == "true"
-
-BASELINE_PROB = float(os.getenv("BASELINE_PROB", "0.40"))
-
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "10000"))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.05"))
-MIN_BID = float(os.getenv("MIN_BID", "0.03"))
-MAX_ASK = float(os.getenv("MAX_ASK", "0.90"))
-
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
-DEDUP_SECONDS = int(os.getenv("DEDUP_SECONDS", "3600"))
-
-SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "7200"))
-MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "3"))
-ZERO_SUMMARY_EVERY_SECONDS = int(os.getenv("ZERO_SUMMARY_EVERY_SECONDS", "21600"))
-
+SHORT_TERM_ONLY = os.getenv("SHORT_TERM_ONLY", "true").lower() == "true"
+MAX_DAYS_TO_END = int(os.getenv("MAX_DAYS_TO_END", "14"))
 AUTO_DISCOVER = os.getenv("AUTO_DISCOVER", "true").lower() == "true"
+ENABLE_YES_NO_ONLY = os.getenv("ENABLE_YES_NO_ONLY", "true").lower() == "true"
+BLOCK_CRYPTO_LADDERS = os.getenv("BLOCK_CRYPTO_LADDERS", "true").lower() == "true"
+
 DISCOVER_LIMIT = int(os.getenv("DISCOVER_LIMIT", "250"))
 DISCOVER_PAGE_SIZE = int(os.getenv("DISCOVER_PAGE_SIZE", "100"))
 DISCOVER_MIN_VOLUME = float(os.getenv("DISCOVER_MIN_VOLUME", "25000"))
 DISCOVER_MIN_LIQUIDITY = float(os.getenv("DISCOVER_MIN_LIQUIDITY", "10000"))
-
 DISCOVER_KEYWORDS = os.getenv(
     "DISCOVER_KEYWORDS",
-    "cpi,ppi,fomc,fed,rates,rate cut,rate hike,unemployment,inflation,approval,decision,announce,ruling,hearing,court,judge,legal,policy,vote,debate,primary,election,tariff,shutdown,meeting,today,tonight,tomorrow,this week,ftx,bankruptcy,payout,relaunch,sentencing,sec,etf",
-).strip()
+    "sports,game,match,final,win,series,playoff,tournament,championship,opening day,tonight,tomorrow,this week,hearing,ruling,vote,approval,cpi,ppi,fomc,fed,rates,tariff,shutdown,ftx,payout,sentencing"
+)
 
-ENABLE_YES_NO_ONLY = os.getenv("ENABLE_YES_NO_ONLY", "true").lower() == "true"
-TEST_MARKET_SLUG = os.getenv("TEST_MARKET_SLUG", "").strip()
-
-SHORT_TERM_ONLY = os.getenv("SHORT_TERM_ONLY", "true").lower() == "true"
-MAX_DAYS_TO_END = int(os.getenv("MAX_DAYS_TO_END", "14"))
-
-TARGET_MIN_TEST_POSITION_USD = float(os.getenv("TARGET_MIN_TEST_POSITION_USD", "1"))
-TARGET_MAX_TEST_POSITION_USD = float(os.getenv("TARGET_MAX_TEST_POSITION_USD", "5"))
-
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "10000"))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.05"))
+MIN_BID = float(os.getenv("MIN_BID", "0.01"))
+MAX_ASK = float(os.getenv("MAX_ASK", "0.90"))
 EARLY_MIN_BID = float(os.getenv("EARLY_MIN_BID", "0.03"))
 EARLY_MAX_ASK = float(os.getenv("EARLY_MAX_ASK", "0.97"))
 EARLY_MAX_SPREAD = float(os.getenv("EARLY_MAX_SPREAD", "0.20"))
 MID_PRICE_MIN = float(os.getenv("MID_PRICE_MIN", "0.05"))
 MID_PRICE_MAX = float(os.getenv("MID_PRICE_MAX", "0.95"))
-
-BLOCK_CRYPTO_LADDERS = os.getenv("BLOCK_CRYPTO_LADDERS", "true").lower() == "true"
-
 BOOK_LEVELS = int(os.getenv("BOOK_LEVELS", "3"))
 MIN_TOP_DEPTH = float(os.getenv("MIN_TOP_DEPTH", "10"))
 MIN_FILL_CONFIDENCE = float(os.getenv("MIN_FILL_CONFIDENCE", "0.45"))
 MICRO_ALERT_SCORE = float(os.getenv("MICRO_ALERT_SCORE", "0.62"))
 MICRO_WATCH_SCORE = float(os.getenv("MICRO_WATCH_SCORE", "0.52"))
 
-PREFLIGHT_MAX_SPREAD = float(os.getenv("PREFLIGHT_MAX_SPREAD", "0.12"))
-PREFLIGHT_MIN_BID = float(os.getenv("PREFLIGHT_MIN_BID", "0.03"))
-PREFLIGHT_MAX_ASK = float(os.getenv("PREFLIGHT_MAX_ASK", "0.97"))
-PREFLIGHT_MAX_CANDIDATES = int(os.getenv("PREFLIGHT_MAX_CANDIDATES", "60"))
+PREFLIGHT_MAX_SPREAD = float(os.getenv("PREFLIGHT_MAX_SPREAD", "0.18"))
+PREFLIGHT_MIN_BID = float(os.getenv("PREFLIGHT_MIN_BID", "0.005"))
+PREFLIGHT_MAX_ASK = float(os.getenv("PREFLIGHT_MAX_ASK", "0.99"))
+PREFLIGHT_MAX_CANDIDATES = int(os.getenv("PREFLIGHT_MAX_CANDIDATES", "120"))
 
-GAMMA_BASE = "https://gamma-api.polymarket.com"
-CLOB_BASE = "https://clob.polymarket.com"
+TARGET_MIN_TEST_POSITION_USD = float(os.getenv("TARGET_MIN_TEST_POSITION_USD", "1"))
+TARGET_MAX_TEST_POSITION_USD = float(os.getenv("TARGET_MAX_TEST_POSITION_USD", "5"))
+TEST_MARKET_SLUG = os.getenv("TEST_MARKET_SLUG", "")
+MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "3"))
 
-NEGATIVE_BLOCKLIST = [
-    "war", "military", "offensive", "strike", "israel", "iran", "lebanon",
-    "gaza", "missile", "attack", "ground offensive", "troops", "yemen",
-    "post", "tweets", "tweet", "celebrity", "actor", "singer",
-    "up or down", "price to beat", "fdv above", "fdv below", "one day after launch",
-]
-
-CATEGORY_WHITELIST = [
-    "cpi", "ppi", "fomc", "fed", "rates", "rate", "inflation", "unemployment",
-    "approval", "decision", "announce", "ruling", "hearing", "court", "judge", "legal",
-    "policy", "election", "primary", "vote", "debate", "president", "senate", "house", "governor",
-    "tariff", "shutdown", "meeting", "today", "tonight", "tomorrow", "this week",
-    "by monday", "by tuesday", "by wednesday", "by thursday", "by friday", "by saturday", "by sunday",
-    "ftx", "bankruptcy", "payout", "relaunch", "sentencing", "sec", "etf",
-]
-
-CURATED_EVENT_TERMS = [
-    "cpi", "ppi", "fomc", "fed", "rates", "rate", "inflation", "unemployment",
-    "approval", "decision", "announce", "ruling", "hearing", "court", "judge", "legal",
-    "policy", "election", "primary", "vote", "debate", "president", "senate", "house", "governor",
-    "tariff", "shutdown", "meeting", "bankruptcy", "payout", "relaunch", "sentencing", "sec", "etf",
-    "delisted", "delist", "removed", "out as", "out by", "confirm", "confirmed", "deny", "denied",
-    "settlement", "trial", "appeal", "filing", "deadline", "hearing", "ruling", "approval",
-]
-
-CURATED_SPECIAL_TERMS = [
-    "ftx", "tariff dividend", "secretary of defense", "president by", "out as",
-    "bankruptcy payout", "court ruling", "fed decision", "cpi release", "ppi release",
-]
-
-CATEGORY_PRIORITY = {
-    "politics_event": 0,
-    "legal_special": 1,
-    "macro": 2,
-    "crypto_event": 3,
-    "other": 4,
-}
-
-sent_cache: Dict[str, float] = {}
-_background_started = False
-_background_lock = threading.Lock()
-
-manual_scan_lock = threading.Lock()
+# =========================================================
+# Runtime state
+# =========================================================
+state_lock = threading.Lock()
 manual_scan_in_progress = False
-
-zero_scan_count = 0
-zero_window_started_at = time.time()
-
-last_skip_counts: Counter = Counter()
+last_zero_summary_sent_at = 0.0
+empty_scan_streak = 0
 last_pipeline_stats: Dict[str, Any] = {}
-last_preflight_reason_counts: Dict[str, Any] = {}
+last_preflight_reason_counts: Dict[str, Any] = {"discover": {}, "fallback": {}}
 last_near_passes: Dict[str, Any] = {"discover": [], "fallback": []}
-last_discovery_samples: Dict[str, Any] = {"accepted": [], "hard_skipped": []}
 last_observation_results: List[Dict[str, Any]] = []
-session_started_at = time.time()
-session_scan_count = 0
-session_empty_prod_scans = 0
-session_observation_hits = 0
-session_observation_repeat_hits = 0
-session_best_observation: Dict[str, Any] = {}
-session_observation_seen: Dict[str, Dict[str, Any]] = {}
+session_summary: Dict[str, Any] = {
+    "scans": 0,
+    "empty_prod_scans": 0,
+    "observation_hits": 0,
+    "observation_repeats": 0,
+    "unique_forming": 0,
+    "best_forming": {},
+}
+observation_seen: Dict[str, Dict[str, Any]] = {}
+alert_dedupe: Dict[str, float] = {}
+candidate_cache: Dict[str, Dict[str, Any]] = {}
+background_started = False
 
-CANDIDATE_CACHE_TTL_SECONDS = 90
-ROLLING_DISCOVERY_DAYS = 30
-
-MONTH_NAMES = [
-    "january", "february", "march", "april", "may", "june",
-    "july", "august", "september", "october", "november", "december",
-]
-
-# =========================================
-# BASICS
-# =========================================
-def now_str() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+# =========================================================
+# Helpers
+# =========================================================
+def now_utc() -> datetime:
+    return datetime.now(tz=UTC)
 
 
-def send_telegram_message(chat_id: str, text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not chat_id or not text.strip():
-        print(f"[{now_str()}] Telegram send skipped | missing token/chat_id/text")
-        return
-    try:
-        r = requests.post(
-            f"{TELEGRAM_API_URL}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": True,
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-        r.raise_for_status()
-        print(f"[{now_str()}] Telegram message sent.")
-    except Exception as e:
-        print(f"[{now_str()}] Telegram send error: {e}")
+def utc_ts() -> float:
+    return time.time()
 
 
-def safe_get_json(url: str, params: Optional[dict] = None) -> Any:
-    r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
-
-
-def to_float(value: Any, default: float = 0.0) -> float:
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
             return default
@@ -201,2318 +122,891 @@ def to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def cleanup_cache() -> None:
-    now = time.time()
-    expired = [k for k, v in sent_cache.items() if now - v > DEDUP_SECONDS]
-    for k in expired:
-        del sent_cache[k]
+def compact_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "")).strip()
 
 
-def already_sent(key: str) -> bool:
-    cleanup_cache()
-    return key in sent_cache
+def title_slug_text(market: Dict[str, Any]) -> str:
+    return compact_text(f"{market.get('question', '')} {market.get('slug', '')}").lower()
 
 
-def mark_sent(key: str) -> None:
-    sent_cache[key] = time.time()
-
-
-def parse_jsonish_list(value: Any) -> List[Any]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return []
-        try:
-            parsed = ast.literal_eval(s)
-            if isinstance(parsed, list):
-                return parsed
-        except Exception:
-            pass
-        if "," in s:
-            return [x.strip().strip('"').strip("'") for x in s.split(",") if x.strip()]
-        return [s]
-    return []
-
-
-def normalize_command(text: str) -> str:
-    t = (text or "").strip()
-    if not t.startswith("/"):
-        return t
-    first = t.split()[0].strip().lower()
-    if "@" in first:
-        first = first.split("@")[0]
-    return first
-
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-# =========================================
-# DATE / SHORT TERM
-# =========================================
-def parse_dt(value: Any) -> Optional[datetime]:
-    if not value:
+def hours_to_event(end_iso: str) -> Optional[float]:
+    if not end_iso:
         return None
-
-    if isinstance(value, (int, float)):
-        try:
-            return datetime.fromtimestamp(float(value), tz=timezone.utc)
-        except Exception:
-            return None
-
-    s = str(value).strip()
-    if not s:
-        return None
-
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-
     try:
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+        return (dt - now_utc()).total_seconds() / 3600.0
     except Exception:
-        pass
-
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-
-    return None
+        return None
 
 
-def extract_end_datetime(market_data: Dict[str, Any]) -> Optional[datetime]:
-    candidates = [
-        market_data.get("endDate"),
-        market_data.get("end_date"),
-        market_data.get("expirationDate"),
-        market_data.get("expiration_date"),
-        market_data.get("closeDate"),
-        market_data.get("close_date"),
-        market_data.get("endTime"),
-        market_data.get("closeTime"),
-    ]
-    for c in candidates:
-        dt = parse_dt(c)
-        if dt:
-            return dt
-    return None
-
-
-def is_within_short_term_window(market_data: Dict[str, Any]) -> bool:
+def within_short_term(market: Dict[str, Any]) -> bool:
     if not SHORT_TERM_ONLY:
         return True
-    end_dt = extract_end_datetime(market_data)
-    if not end_dt:
+    h = hours_to_event(market.get("end_date_iso") or market.get("endDate") or market.get("end_date"))
+    if h is None:
         return False
-    now = datetime.now(timezone.utc)
-    max_dt = now + timedelta(days=MAX_DAYS_TO_END)
-    return now <= end_dt <= max_dt
+    return h >= 0 and h <= MAX_DAYS_TO_END * 24
 
 
-def days_to_end(end_iso: str) -> Optional[float]:
-    dt = parse_dt(end_iso)
-    if not dt:
-        return None
-    delta = dt - datetime.now(timezone.utc)
-    return delta.total_seconds() / 86400.0
+def rolling_date_phrases() -> List[str]:
+    start = now_utc().date()
+    phrases = {"today", "tomorrow", "tonight", "this week"}
+    for i in range(0, ROLLING_DISCOVERY_DAYS + 1):
+        d = start + timedelta(days=i)
+        phrases.add(f"by {d.strftime('%B').lower()} {d.day}")
+        phrases.add(f"by {d.strftime('%b').lower()} {d.day}")
+        phrases.add(d.strftime("%B %d").lower().replace(" 0", " "))
+        phrases.add(d.strftime("%b %d").lower().replace(" 0", " "))
+        phrases.add(d.strftime("%A").lower())
+    month_end = (start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    phrases.add(f"end of {start.strftime('%B').lower()}")
+    if month_end <= start + timedelta(days=ROLLING_DISCOVERY_DAYS):
+        phrases.add(f"end of {month_end.strftime('%B').lower()}")
+    return sorted(phrases)
 
 
-def month_name(dt: datetime) -> str:
-    return MONTH_NAMES[dt.month - 1]
-
-
-def rolling_window_end() -> datetime:
-    return datetime.now(timezone.utc) + timedelta(days=ROLLING_DISCOVERY_DAYS)
-
-
-def rolling_date_terms(days: int = ROLLING_DISCOVERY_DAYS) -> List[str]:
-    now = datetime.now(timezone.utc)
-    end = now + timedelta(days=days)
-    terms = {
-        "today", "tonight", "tomorrow", "this week",
-        "by friday", "by saturday", "by sunday", "by monday", "by tuesday", "by wednesday", "by thursday",
-        f"end of {month_name(now)}",
-        f"end of {month_name(end)}",
-    }
-
-    cursor = now
-    while cursor <= end:
-        terms.add(f"by {month_name(cursor)} {cursor.day}")
-        cursor += timedelta(days=1)
-
-    return sorted(terms)
-
-
-def looks_like_ranking_market(text: str) -> bool:
-    t = (text or "").lower()
-    ranking_phrases = [
-        "best model", "second-best model", "second best model", "top model",
-        "best ai model", "top ai model", "leaderboard", "ranked",
-        "have the second-best", "have the second best", "best-performing model",
-        "best performing model", "most used model", "highest ranked model",
-    ]
-    return any(p in t for p in ranking_phrases)
-
-
-def looks_like_low_urgency_theme_market(text: str) -> bool:
-    t = (text or "").lower()
-    theme_phrases = [
-        "at the end of", "by end of"
-    ]
-    if looks_like_ranking_market(t):
-        return True
-    return any(p in t for p in theme_phrases) and any(k in t for k in ["best model", "second-best", "leaderboard", "top model", "top ai"])
-
-
-def is_rolling_window_phrase(text: str) -> bool:
-    t = (text or "").lower()
-    return any(term in t for term in rolling_date_terms())
-
-
-# =========================================
-# TOPICS
-# =========================================
-def classify_topic(text: str) -> str:
-    t = (text or "").lower()
-
-    if any(k in t for k in ["ftx", "bankruptcy", "payout", "relaunch", "sentencing", "court", "judge", "hearing", "ruling", "sec"]):
-        return "legal_special"
-    if any(k in t for k in ["election", "primary", "vote", "debate", "president", "senate", "house", "governor"]):
-        return "politics_event"
-    if any(k in t for k in ["fed", "fomc", "rate", "rates", "interest", "cpi", "inflation", "ppi", "unemployment", "tariff", "shutdown", "policy", "meeting"]):
-        return "macro"
-    if any(k in t for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "etf", "approval"]):
-        return "crypto_event"
-    return "other"
-
-
-def is_blocked_topic(text: str) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in NEGATIVE_BLOCKLIST)
-
-
-def is_secondary_special_situation(text: str) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in ["ftx", "bankruptcy", "payout", "relaunch", "sentencing", "court", "judge", "sec"])
-
-
-def is_allowed_topic(text: str) -> bool:
-    t = (text or "").lower()
-    if looks_like_ranking_market(t) or looks_like_low_urgency_theme_market(t):
-        return False
-    if not any(k in t for k in CATEGORY_WHITELIST):
-        return False
-    if is_event_bound_market(t):
-        return True
-    return is_secondary_special_situation(t)
-
-
-def looks_like_crypto_ladder_market(text: str) -> bool:
-    if not BLOCK_CRYPTO_LADDERS:
-        return False
-
-    t = (text or "").lower()
-    if not any(k in t for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol"]):
-        return False
-
-    ladder_phrases = [
-        "price of bitcoin be above",
-        "price of bitcoin be below",
-        "price of ethereum be above",
-        "price of ethereum be below",
-        "price of solana be above",
-        "price of solana be below",
-        "will bitcoin reach",
-        "will ethereum reach",
-        "will solana reach",
-        "will bitcoin hit",
-        "will ethereum hit",
-        "will solana hit",
-        "between $",
-        "above $",
-        "below $",
-        "dip to",
-    ]
-    return any(p in t for p in ladder_phrases)
-
-
-def looks_like_strike_ladder_market(text: str) -> bool:
-    t = (text or "").lower()
-    if not t:
-        return False
-
-    obvious_phrases = [
-        "hit (high)",
-        "hit (low)",
-        "(high)",
-        "(low)",
-        "all time high",
-        "all-time-high",
-        "ath by",
-        "price target",
-        "target by",
-    ]
-    if any(p in t for p in obvious_phrases):
-        return True
-
-    trigger_words = ["hit", "reach", "above", "below", "between", "touch"]
-    assets = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crude oil", "oil", "wti", "gold", "sp500", "s&p", "nasdaq", "dow"]
-    date_words = ["by end of", "by friday", "by saturday", "by sunday", "by monday", "by tuesday", "by wednesday", "by thursday"] + rolling_date_terms()
-    if any(w in t for w in trigger_words) and any(a in t for a in assets) and any(d in t for d in date_words):
-        if "$" in t or " all time high" in t or " ath " in f" {t} ":
-            return True
-
+def is_yes_no_market(market: Dict[str, Any]) -> bool:
+    outcomes = market.get("outcomes")
+    if isinstance(outcomes, list):
+        cleaned = [compact_text(str(x)).lower() for x in outcomes]
+        return cleaned == ["yes", "no"] or cleaned == ["no", "yes"]
+    tokens = market.get("tokens") or []
+    if len(tokens) == 2:
+        labels = [compact_text(str(t.get("outcome", ""))).lower() for t in tokens]
+        return sorted(labels) == ["no", "yes"]
     return False
 
 
-def canonical_market_family_key(slug: str, question: str) -> str:
-    combined = f"{slug or ''} {question or ''}".lower().strip()
-    if not combined:
-        return ""
-
-    normalized = combined
-    replacements = {
-        "(high)": "",
-        "(low)": "",
-        "all time high": "ath",
-        "all-time-high": "ath",
-        " by friday": " by_date",
-        " by saturday": " by_date",
-        " by sunday": " by_date",
-        " by monday": " by_date",
-        " by tuesday": " by_date",
-        " by wednesday": " by_date",
-        " by thursday": " by_date",
-    }
-    for a, b in replacements.items():
-        normalized = normalized.replace(a, b)
-    for term in rolling_date_terms():
-        normalized = normalized.replace(f" by {term}", " by_date")
-        normalized = normalized.replace(f" end of {term}", " by_date")
-        if term.startswith("by "):
-            normalized = normalized.replace(term, "by_date")
-
-    for token in ["$100", "$105", "$110", "$115", "$120", "$125", "$130", "$150", "$200", "$40", "$50", "$60", "$70", "$80", "$85", "$90", "$95", "$100k", "$120k"]:
-        normalized = normalized.replace(token.lower(), "$x")
-
-    words = normalized.replace("?", " ").replace(",", " ").split()
-    if not words:
-        return ""
-
-    if looks_like_crypto_ladder_market(normalized) or looks_like_strike_ladder_market(normalized):
-        keep = []
-        for w in words:
-            if w in {"will", "the", "a", "an", "to", "of", "in", "on", "and", "or", "by_date", "by", "end"}:
-                continue
-            keep.append(w)
-        return "family:" + " ".join(keep[:8])
-
-    return "market:" + " ".join(words[:10])
-
-
-def extract_asset_family_bucket(text: str) -> str:
-    t = (text or "").lower()
-    if any(k in t for k in ["ftx", "bankruptcy", "payout", "relaunch", "sentencing"]):
-        return "asset:ftx"
-    if any(k in t for k in ["election", "primary", "vote", "debate", "president", "senate", "house", "governor"]):
-        return "asset:politics"
-    if any(k in t for k in ["fed", "fomc", "cpi", "ppi", "unemployment", "rates", "tariff", "shutdown"]):
-        return "asset:macro"
-    if any(k in t for k in ["crude oil", " oil ", " wti", "wti "]):
-        return "asset:oil"
-    if any(k in t for k in ["bitcoin", " btc"]):
-        return "asset:btc"
-    if any(k in t for k in ["ethereum", " eth"]):
-        return "asset:eth"
-    if any(k in t for k in ["solana", " sol"]):
-        return "asset:sol"
-    if "gold" in t:
-        return "asset:gold"
-    if any(k in t for k in ["sp500", "s&p", "nasdaq", "dow"]):
-        return "asset:index"
-    if any(k in t for k in ["fed", "fomc", "cpi", "ppi", "unemployment", "tariff", "shutdown", "vote", "debate", "primary", "approval", "ruling", "hearing", "decision"]):
-        return "asset:event"
-    return ""
-
-
-def looks_like_shell_price_market(text: str) -> bool:
-    t = (text or "").lower()
-    if not t:
-        return False
-    shell_phrases = [
-        "all time high", "all-time-high", "ath by", "price target", "target by",
-        "by end of", "end of",
-    ]
-    if any(p in t for p in shell_phrases) and any(a in t for a in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crude oil", "oil", "wti", "gold", "sp500", "s&p", "nasdaq", "dow"]):
-        if any(w in t for w in ["hit", "reach", "above", "below", "between", "touch", "high", "low"]):
-            return True
-    return False
-
-
-def looks_like_short_window_price_market(text: str) -> bool:
-    t = (text or "").lower()
-    if not t:
-        return False
-    short_window_phrases = [
-        "up or down", "price to beat", "fdv above", "fdv below",
-        "one day after launch", "5 minutes", "15 minutes", "30 minutes", "4 hour", "4 hours",
-    ]
-    return any(p in t for p in short_window_phrases)
-
-
-def should_hard_skip_discovery_market(text: str) -> Tuple[bool, str]:
-    t = (text or "").lower()
-    if not t:
-        return False, ""
-    if looks_like_short_window_price_market(t):
-        return True, "hard_skip_short_window_price_market"
-    if looks_like_ranking_market(t):
-        return True, "hard_skip_ranking_market"
-    if looks_like_crypto_ladder_market(t):
-        return True, "hard_skip_crypto_ladder"
-    if looks_like_strike_ladder_market(t):
-        return True, "hard_skip_strike_ladder"
-    if looks_like_shell_price_market(t):
-        return True, "hard_skip_shell_price_market"
-    return False, ""
-
-
-def is_event_bound_market(text: str) -> bool:
-    t = (text or "").lower()
-    core_terms = [
-        "decision", "announce", "approval", "ruling", "hearing", "vote", "debate",
-        "primary", "meeting", "today", "tonight", "tomorrow", "this week",
-        "cpi", "ppi", "fomc", "fed", "rates", "tariff",
-        "shutdown", "legal", "etf", "policy", "court", "judge", "sentencing",
-        "bankruptcy", "payout", "relaunch", "sec", "election"
-    ]
-    return any(k in t for k in core_terms) or is_rolling_window_phrase(t)
-
-
-def curated_catalyst_score(text: str) -> float:
-    t = (text or "").lower()
-    if not t:
-        return 0.0
-
-    score = 0.0
-    event_hits = sum(1 for term in CURATED_EVENT_TERMS if term in t)
-    special_hits = sum(1 for term in CURATED_SPECIAL_TERMS if term in t)
-
-    if event_hits:
-        score += min(0.45, 0.12 * event_hits)
-    if special_hits:
-        score += min(0.25, 0.10 * special_hits)
-    if is_rolling_window_phrase(t):
-        score += 0.22
-    if " by " in t or "by-" in t or "deadline" in t:
-        score += 0.08
-    if any(k in t for k in ["out as", "out by", "delisted", "delist", "approval", "ruling", "hearing", "vote", "debate", "payout", "sentencing"]):
-        score += 0.10
-    if looks_like_low_urgency_theme_market(t) or looks_like_ranking_market(t):
-        score -= 0.50
-    if any(k in t for k in ["best model", "leaderboard", "top model"]):
-        score -= 0.50
-    return round(score, 4)
-
-
-def is_curated_catalyst_market(text: str) -> bool:
-    t = (text or "").lower()
-    if not t:
-        return False
-    if not is_allowed_topic(t):
-        return False
-    if not is_event_bound_market(t) and not is_secondary_special_situation(t):
-        return False
-    return curated_catalyst_score(t) >= 0.34
-
-
-def is_dead_extreme_book(best_bid: float, best_ask: float) -> bool:
-    if best_bid <= 0 or best_ask <= 0:
-        return False
-    return best_bid <= 0.002 and best_ask >= 0.998 and (best_ask - best_bid) >= 0.90
-
-
-# =========================================
-# MARKET HELPERS
-# =========================================
-def normalize_outcomes(market_data: Dict[str, Any]) -> List[str]:
-    outcomes = market_data.get("outcomes")
-    if outcomes:
-        parsed = parse_jsonish_list(outcomes)
-        if parsed:
-            return [str(x).strip() for x in parsed if str(x).strip()]
-
-    tokens = market_data.get("tokens") or []
-    if isinstance(tokens, list):
-        result = []
-        for t in tokens:
-            outcome = t.get("outcome")
-            if outcome is not None:
-                result.append(str(outcome).strip())
-        if result:
-            return result
-
-    return []
-
-
-def is_yes_no_market(market_data: Dict[str, Any]) -> bool:
-    outcomes = normalize_outcomes(market_data)
-    cleaned = {x.lower() for x in outcomes if x}
-    return cleaned == {"yes", "no"}
-
-
-def is_dead_book(best_bid: float, best_ask: float) -> Tuple[bool, str]:
-    if best_bid <= 0:
-        return True, "no-bid"
-    if best_ask <= 0:
-        return True, "no-ask"
-
-    spread = best_ask - best_bid
-    if spread <= 0:
-        return True, "no-spread"
-    if best_bid < EARLY_MIN_BID:
-        return True, "bid-too-low-early"
-    if best_ask > EARLY_MAX_ASK:
-        return True, "ask-too-high-early"
-    if spread > EARLY_MAX_SPREAD:
-        return True, "spread-too-wide-early"
-
-    midpoint = (best_bid + best_ask) / 2.0
-    if midpoint < MID_PRICE_MIN or midpoint > MID_PRICE_MAX:
-        return True, "one-sided-midpoint"
-
-    return False, ""
-
-
-def keyword_list() -> List[str]:
-    raw = (DISCOVER_KEYWORDS or "").strip().strip('"').strip("'")
-    base = [x.strip().lower() for x in raw.split(",") if x.strip()]
-    return sorted(set(base + rolling_date_terms()))
-
-
-def matches_keywords(text: str) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    if looks_like_ranking_market(t):
-        return False
-    return any(k in t for k in keyword_list())
-
-
-def parse_watchlist_line(line: str) -> Optional[Dict[str, Any]]:
-    raw = line.strip()
-    if not raw or raw.startswith("#"):
-        return None
-    parts = [p.strip() for p in raw.split("|")]
-    slug = parts[0]
-    baseline = BASELINE_PROB
-    if len(parts) >= 2 and parts[1]:
-        baseline = to_float(parts[1], BASELINE_PROB)
-    return {"slug": slug, "baseline_prob": baseline}
-
-
-def level_size(level: Dict[str, Any]) -> float:
-    for key in ("size", "amount", "quantity"):
-        if key in level:
-            return to_float(level.get(key), 0.0)
+def market_volume(market: Dict[str, Any]) -> float:
+    for k in ["volumeNum", "volume", "oneDayVolume", "liquidityClob", "volumeClob"]:
+        if k in market:
+            return safe_float(market.get(k), 0.0)
     return 0.0
 
 
-def top_depth(levels: List[Dict[str, Any]], count: int) -> float:
-    return round(sum(level_size(x) for x in levels[:count]), 6)
+def market_liquidity(market: Dict[str, Any]) -> float:
+    for k in ["liquidityNum", "liquidity", "liquidityClob"]:
+        if k in market:
+            return safe_float(market.get(k), 0.0)
+    return 0.0
 
 
-def best_level_size(levels: List[Dict[str, Any]]) -> float:
-    if not levels:
-        return 0.0
-    return round(level_size(levels[0]), 6)
+def event_priority(market: Dict[str, Any]) -> float:
+    txt = title_slug_text(market)
+    score = 1.0
+    sports_terms = [
+        "game", "match", "final", "series", "playoff", "tournament", "championship",
+        "world series", "nba", "nfl", "mlb", "nhl", "ncaa", "ufc", "fight", "goal", "touchdown"
+    ]
+    catalyst_terms = [
+        "vote", "hearing", "ruling", "approval", "decision", "debate", "primary", "sentencing",
+        "payout", "tariff", "shutdown", "cpi", "ppi", "fomc", "fed", "rates", "jobs report", "bankruptcy"
+    ]
+    for t in sports_terms:
+        if t in txt:
+            score += 0.18
+    for t in catalyst_terms:
+        if t in txt:
+            score += 0.14
+    for p in rolling_date_phrases():
+        if p in txt:
+            score += 0.03
+            break
+    if "ftx" in txt:
+        score += 0.06
+    return score
 
 
-# =========================================
-# DISCOVERY / RESOLUTION
-# =========================================
-def fetch_market_by_slug(slug: str) -> Optional[Dict[str, Any]]:
+def is_ranking_market(market: Dict[str, Any]) -> bool:
+    txt = title_slug_text(market)
+    patterns = [
+        "top ai model", "best ai model", "second-best", "second best", "leaderboard", "ranked",
+        "have the top", "have the second-best", "have the second best", "best model"
+    ]
+    return any(p in txt for p in patterns)
+
+
+def is_crypto_ladder(market: Dict[str, Any]) -> bool:
+    txt = title_slug_text(market)
+    if not BLOCK_CRYPTO_LADDERS:
+        return False
+    crypto_terms = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "doge"]
+    ladder_terms = ["all time high", "hit $", "by march", "by april", "high)", "low)"]
+    return any(c in txt for c in crypto_terms) and any(l in txt for l in ladder_terms)
+
+
+def is_strike_or_shell(market: Dict[str, Any]) -> bool:
+    txt = title_slug_text(market)
+    patterns = [
+        r"hit \(high\)", r"hit \(low\)", r"all time high", r"hit \$\d+", r"price target",
+        r"high\) \$", r"low\) \$"
+    ]
+    return any(re.search(p, txt) for p in patterns)
+
+
+def is_non_curated(market: Dict[str, Any]) -> bool:
+    txt = title_slug_text(market)
+    curated_terms = [
+        "game", "match", "final", "series", "playoff", "championship", "tournament", "winner",
+        "vote", "hearing", "ruling", "approval", "decision", "debate", "primary", "election",
+        "cpi", "ppi", "fomc", "fed", "rates", "tariff", "shutdown", "ftx", "bankruptcy",
+        "sentencing", "payout", "delisted", "policy"
+    ]
+    return not any(t in txt for t in curated_terms)
+
+
+def family_bucket(market: Dict[str, Any]) -> str:
+    txt = title_slug_text(market)
+    if any(x in txt for x in ["trump", "hegseth", "zelenskyy", "president", "secretary of defense"]):
+        return "politics-personnel"
+    if any(x in txt for x in ["tariff", "shutdown", "fed", "fomc", "cpi", "ppi", "rates"]):
+        return "macro-policy"
+    if "ftx" in txt or "bankruptcy" in txt or "payout" in txt or "sentencing" in txt:
+        return "legal-special"
+    if any(x in txt for x in ["game", "match", "series", "playoff", "championship", "winner"]):
+        return "sports"
+    return "other"
+
+
+def market_family_key(market: Dict[str, Any]) -> str:
+    txt = title_slug_text(market)
+    txt = re.sub(r"\bby\s+[a-z]+\s+\d{1,2}\b", "", txt)
+    txt = re.sub(r"\$\d+[kKmM]?", "$X", txt)
+    txt = re.sub(r"\d{4}", "YEAR", txt)
+    words = [w for w in re.split(r"[^a-z0-9$]+", txt) if w]
+    return " ".join(words[:8])
+
+
+def fetch_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_gamma_markets(limit: int) -> List[Dict[str, Any]]:
+    urls = [
+        (f"{GAMMA_BASE}/markets", {"limit": limit}),
+        (f"{GAMMA_BASE}/markets", {"closed": "false", "limit": limit}),
+    ]
+    for url, params in urls:
+        try:
+            data = fetch_json(url, params=params)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for k in ["markets", "data"]:
+                    if isinstance(data.get(k), list):
+                        return data[k]
+        except Exception:
+            continue
+    return []
+
+
+def fetch_manual_slugs() -> List[str]:
+    if not MARKETS_URL:
+        return []
     try:
-        return safe_get_json(f"{GAMMA_BASE}/markets/slug/{slug}")
+        r = requests.get(MARKETS_URL, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        slugs = []
+        for line in r.text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                slugs.append(line)
+        return slugs
     except Exception:
-        return None
+        return []
 
 
-def fetch_event_by_slug(slug: str) -> Optional[Dict[str, Any]]:
-    try:
-        return safe_get_json(f"{GAMMA_BASE}/events/slug/{slug}")
-    except Exception:
-        return None
-
-
-def pick_best_market_from_event(event_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    markets = event_data.get("markets") or []
-    if not isinstance(markets, list) or not markets:
-        return None
-
-    filtered = []
+def find_market_by_slug(markets: List[Dict[str, Any]], slug: str) -> Optional[Dict[str, Any]]:
+    slug = (slug or "").strip().lower()
     for m in markets:
-        active = bool(m.get("active", True))
-        closed = bool(m.get("closed", False))
-        liquidity = to_float(m.get("liquidityClob", m.get("liquidity", 0.0)), 0.0)
-        text = f"{m.get('slug', '')} {m.get('question', '')} {m.get('title', '')}".lower()
-
-        if ENABLE_YES_NO_ONLY and not is_yes_no_market(m):
-            continue
-        if SHORT_TERM_ONLY and not is_within_short_term_window(m):
-            continue
-        if is_blocked_topic(text):
-            continue
-        if looks_like_crypto_ladder_market(text) or looks_like_strike_ladder_market(text):
-            continue
-        if not is_allowed_topic(text):
-            continue
-        if active and not closed:
-            filtered.append((liquidity, m))
-
-    if filtered:
-        filtered.sort(key=lambda x: x[0], reverse=True)
-        return filtered[0][1]
+        if (m.get("slug") or "").lower() == slug:
+            return m
     return None
 
 
-def extract_yes_token_id(market_data: Dict[str, Any]) -> Optional[str]:
-    token_ids = parse_jsonish_list(market_data.get("clobTokenIds"))
-    outcomes = normalize_outcomes(market_data)
-
-    if token_ids and len(token_ids) >= 1:
-        if outcomes and len(outcomes) == len(token_ids):
-            for outcome, token_id in zip(outcomes, token_ids):
-                if str(outcome).strip().lower() == "yes":
-                    return str(token_id)
-        return str(token_ids[0])
-
-    token_id = market_data.get("clobTokenId") or market_data.get("asset_id")
-    if token_id:
-        return str(token_id)
-    return None
+def extract_yes_no_tokens(market: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    tokens = market.get("tokens") or []
+    yes_token = None
+    no_token = None
+    for t in tokens:
+        outcome = compact_text(str(t.get("outcome", ""))).lower()
+        token_id = t.get("token_id") or t.get("tokenId") or t.get("id")
+        if outcome == "yes":
+            yes_token = str(token_id)
+        elif outcome == "no":
+            no_token = str(token_id)
+    return yes_token, no_token
 
 
-def fetch_order_book(token_id: str) -> Dict[str, Any]:
-    return safe_get_json(f"{CLOB_BASE}/book", params={"token_id": token_id})
-
-
-def resolve_slug_to_market(slug: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    market = fetch_market_by_slug(slug)
-    if market:
-        text = f"{market.get('slug', '')} {market.get('question', '')} {market.get('title', '')}".lower()
-        if ENABLE_YES_NO_ONLY and not is_yes_no_market(market):
-            return None, None
-        if SHORT_TERM_ONLY and not is_within_short_term_window(market):
-            return None, None
-        if is_blocked_topic(text):
-            return None, None
-        if looks_like_crypto_ladder_market(text) or looks_like_strike_ladder_market(text):
-            return None, None
-        if not is_allowed_topic(text):
-            return None, None
-        return market, "market"
-
-    event = fetch_event_by_slug(slug)
-    if event:
-        best_market = pick_best_market_from_event(event)
-        if best_market:
-            return best_market, "event"
-
-    return None, None
-
-
-def preflight_book_check(market_data: Dict[str, Any], token_id: str) -> Optional[Dict[str, Any]]:
-    label = market_data.get("question") or market_data.get("title") or market_data.get("slug") or ""
-
-    try:
-        book = fetch_order_book(token_id)
-    except Exception:
-        return {"ok": False, "reason": "book_fetch_failed", "label": label, "distance_to_pass": 999.0}
-
+def normalize_book(book: Dict[str, Any]) -> Dict[str, List[Dict[str, float]]]:
     bids = book.get("bids") or []
     asks = book.get("asks") or []
-
-    best_bid = to_float(bids[0].get("price")) if bids else 0.0
-    best_ask = to_float(asks[0].get("price")) if asks else 0.0
-    bid_depth = top_depth(bids, BOOK_LEVELS)
-    ask_depth = top_depth(asks, BOOK_LEVELS)
-    spread = max(0.0, best_ask - best_bid) if best_bid > 0 and best_ask > 0 else 0.0
-    midpoint = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
-
-    side_hint = "YES" if ask_depth >= bid_depth else "NO"
-
-    base = {
-        "label": label,
-        "best_bid": round(best_bid, 6),
-        "best_ask": round(best_ask, 6),
-        "spread": round(spread, 6),
-        "bid_depth": round(bid_depth, 6),
-        "ask_depth": round(ask_depth, 6),
-        "midpoint": round(midpoint, 6),
-        "side_hint": side_hint,
-    }
-
-    if is_dead_extreme_book(best_bid, best_ask):
-        return {
-            **base,
-            "ok": False,
-            "reason": "preflight_dead_extreme_book",
-            "distance_to_pass": 999.0,
-            "distance_note": "book pinned at extremes",
-        }
-
-    if best_bid <= 0:
-        return {**base, "ok": False, "reason": "preflight_no_bid", "distance_to_pass": 999.0}
-    if best_ask <= 0:
-        return {**base, "ok": False, "reason": "preflight_no_ask", "distance_to_pass": 999.0}
-    if spread <= 0:
-        return {**base, "ok": False, "reason": "preflight_no_spread", "distance_to_pass": 999.0}
-    if best_bid < PREFLIGHT_MIN_BID:
-        return {
-            **base,
-            "ok": False,
-            "reason": "preflight_bid_too_low",
-            "distance_to_pass": round(PREFLIGHT_MIN_BID - best_bid, 6),
-            "distance_note": f"bid short by {round(PREFLIGHT_MIN_BID - best_bid, 6)}",
-        }
-    if best_ask > PREFLIGHT_MAX_ASK:
-        return {
-            **base,
-            "ok": False,
-            "reason": "preflight_ask_too_high",
-            "distance_to_pass": round(best_ask - PREFLIGHT_MAX_ASK, 6),
-            "distance_note": f"ask above cap by {round(best_ask - PREFLIGHT_MAX_ASK, 6)}",
-        }
-    if spread > PREFLIGHT_MAX_SPREAD:
-        return {
-            **base,
-            "ok": False,
-            "reason": "preflight_spread_too_wide",
-            "distance_to_pass": round(spread - PREFLIGHT_MAX_SPREAD, 6),
-            "distance_note": f"spread wide by {round(spread - PREFLIGHT_MAX_SPREAD, 6)}",
-        }
-    if bid_depth < MIN_TOP_DEPTH:
-        return {
-            **base,
-            "ok": False,
-            "reason": "preflight_bid_depth_thin",
-            "distance_to_pass": round(MIN_TOP_DEPTH - bid_depth, 6),
-            "distance_note": f"bid depth short by {round(MIN_TOP_DEPTH - bid_depth, 6)}",
-        }
-    if ask_depth < MIN_TOP_DEPTH:
-        return {
-            **base,
-            "ok": False,
-            "reason": "preflight_ask_depth_thin",
-            "distance_to_pass": round(MIN_TOP_DEPTH - ask_depth, 6),
-            "distance_note": f"ask depth short by {round(MIN_TOP_DEPTH - ask_depth, 6)}",
-        }
-    if midpoint < MID_PRICE_MIN or midpoint > MID_PRICE_MAX:
-        midpoint_distance = (MID_PRICE_MIN - midpoint) if midpoint < MID_PRICE_MIN else (midpoint - MID_PRICE_MAX)
-        return {
-            **base,
-            "ok": False,
-            "reason": "preflight_midpoint_outside",
-            "distance_to_pass": round(midpoint_distance, 6),
-            "distance_note": f"midpoint outside by {round(midpoint_distance, 6)}",
-        }
-
-    resolved_text = f"{market_data.get('slug', '')} {market_data.get('question', '')} {market_data.get('title', '')}".lower()
-
-    return {
-        **base,
-        "ok": True,
-        "reason": "ok",
-        "book": book,
-        "topic_category": classify_topic(resolved_text),
-        "label": label,
-        "resolved_text": resolved_text,
-        "distance_to_pass": 0.0,
-        "side_hint": side_hint,
-    }
+    norm = {"bids": [], "asks": []}
+    for side_name, raw in [("bids", bids), ("asks", asks)]:
+        rows = []
+        for row in raw:
+            if isinstance(row, dict):
+                price = safe_float(row.get("price"))
+                size = safe_float(row.get("size") or row.get("quantity"))
+            elif isinstance(row, list) and len(row) >= 2:
+                price = safe_float(row[0])
+                size = safe_float(row[1])
+            else:
+                continue
+            rows.append({"price": price, "size": size})
+        rows.sort(key=lambda x: x["price"], reverse=(side_name == "bids"))
+        norm[side_name] = rows
+    return norm
 
 
-def record_preflight_near_pass(stats: Dict[str, Any], candidate: Dict[str, Any], bucket_key: str) -> None:
-    if not candidate or candidate.get("ok"):
-        return
-
-    reason = candidate.get("reason", "unknown")
-    if reason in {"resolve_failed", "token_missing", "book_fetch_failed"}:
-        return
-
-    micro = candidate.get("micro") or {}
-    label = micro.get("label") or candidate.get("slug") or ""
-    entry = {
-        "label": label,
-        "slug": candidate.get("slug", ""),
-        "reason": reason,
-        "distance_to_pass": to_float(micro.get("distance_to_pass"), 999.0),
-        "distance_note": micro.get("distance_note", ""),
-        "best_bid": to_float(micro.get("best_bid"), 0.0),
-        "best_ask": to_float(micro.get("best_ask"), 0.0),
-        "spread": to_float(micro.get("spread"), 0.0),
-        "bid_depth": to_float(micro.get("bid_depth"), 0.0),
-        "ask_depth": to_float(micro.get("ask_depth"), 0.0),
-        "midpoint": to_float(micro.get("midpoint"), 0.0),
-        "side_hint": micro.get("side_hint", ""),
-    }
-
-    combined_text = f"{entry['slug']} {entry['label']}".lower()
-
-    if reason == "preflight_dead_extreme_book":
-        return
-    if looks_like_crypto_ladder_market(combined_text) or looks_like_strike_ladder_market(combined_text):
-        return
-    if entry["best_bid"] < 0.003:
-        return
-    if entry["spread"] > 0.25:
-        return
-    if is_dead_extreme_book(entry["best_bid"], entry["best_ask"]):
-        return
-
-    key = f"{bucket_key}_near_passes"
-    arr = stats.setdefault(key, [])
-    arr.append(entry)
-    arr.sort(key=lambda x: (to_float(x.get("distance_to_pass"), 999.0), to_float(x.get("spread"), 999.0), -max(to_float(x.get("bid_depth"), 0.0), to_float(x.get("ask_depth"), 0.0))))
-    if len(arr) > 5:
-        del arr[5:]
-
-
-def discovery_priority(combined: str) -> float:
-    topic = classify_topic(combined)
-    base = {
-        "politics_event": 1.02,
-        "legal_special": 0.99,
-        "macro": 0.97,
-        "crypto_event": 0.84,
-        "other": 0.62,
-    }.get(topic, 0.62)
-
-    base += min(0.20, curated_catalyst_score(combined))
-
-    if is_event_bound_market(combined):
-        base += 0.08
-    if is_secondary_special_situation(combined):
-        base += 0.04
-    if any(k in combined for k in ["approval", "decision", "ruling", "hearing", "vote", "debate", "cpi", "ppi", "fomc", "fed", "sentencing", "payout", "delisted"]):
-        base += 0.05
-    if is_rolling_window_phrase(combined):
-        base += 0.04
-    if any(k in combined for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "oil", "crude", "wti", "gold", "sp500", "s&p", "nasdaq", "dow"]):
-        base -= 0.06
-    if looks_like_short_window_price_market(combined):
-        base -= 0.50
-    if looks_like_crypto_ladder_market(combined):
-        base -= 0.55
-    if looks_like_strike_ladder_market(combined):
-        base -= 0.60
-    if looks_like_shell_price_market(combined):
-        base -= 0.60
-
-    return round(base, 4)
-
-
-def build_candidate_from_slug(
-    slug: str,
-    baseline_prob: float,
-    discovery_priority_value: float,
-    source_bucket: str,
-) -> Dict[str, Any]:
-    market_data, source_type = resolve_slug_to_market(slug)
-    if not market_data:
-        return {"ok": False, "reason": "resolve_failed", "slug": slug}
-
-    token_id = extract_yes_token_id(market_data)
+def fetch_book(token_id: str) -> Optional[Dict[str, Any]]:
     if not token_id:
-        return {"ok": False, "reason": "token_missing", "slug": slug, "market_data": market_data, "source_type": source_type}
+        return None
+    urls = [
+        (f"{CLOB_BASE}/book", {"token_id": token_id}),
+        (f"{CLOB_BASE}/book", {"tokenId": token_id}),
+    ]
+    for url, params in urls:
+        try:
+            data = fetch_json(url, params=params)
+            return normalize_book(data if isinstance(data, dict) else {})
+        except Exception:
+            continue
+    return None
 
-    micro = preflight_book_check(market_data, token_id)
-    if not micro.get("ok"):
-        return {
-            "ok": False,
-            "reason": micro.get("reason", "preflight_failed"),
-            "slug": slug,
-            "market_data": market_data,
-            "source_type": source_type,
-            "token_id": token_id,
-            "micro": micro,
-        }
 
+def top_levels(book: Optional[Dict[str, Any]], levels: int = BOOK_LEVELS) -> Tuple[float, float, float, float]:
+    if not book:
+        return 0.0, 0.0, 0.0, 0.0
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    best_bid = safe_float(bids[0]["price"]) if bids else 0.0
+    best_ask = safe_float(asks[0]["price"]) if asks else 0.0
+    bid_depth = sum(safe_float(x["size"]) for x in bids[:levels])
+    ask_depth = sum(safe_float(x["size"]) for x in asks[:levels])
+    return best_bid, best_ask, bid_depth, ask_depth
+
+
+def compute_fill_confidence(best_bid: float, best_ask: float, bid_depth: float, ask_depth: float) -> float:
+    if best_bid <= 0 or best_ask <= 0:
+        return 0.0
+    spread = max(0.0, best_ask - best_bid)
+    depth_component = min(1.0, (bid_depth + ask_depth) / max(20.0, TARGET_MAX_TEST_POSITION_USD * 8.0))
+    spread_penalty = max(0.0, 1.0 - (spread / max(PREFLIGHT_MAX_SPREAD, 0.0001)))
+    return round(max(0.0, min(1.0, 0.6 * depth_component + 0.4 * spread_penalty)), 3)
+
+
+def dead_extreme_book(best_bid: float, best_ask: float) -> bool:
+    return best_bid <= 0.002 and best_ask >= 0.998
+
+
+def preflight_check(market: Dict[str, Any], book: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    best_bid, best_ask, bid_depth, ask_depth = top_levels(book)
+    spread = round(max(0.0, best_ask - best_bid), 6) if best_ask and best_bid else 0.0
+    midpoint = round((best_bid + best_ask) / 2.0, 6) if best_bid and best_ask else 0.0
+    fill_conf = compute_fill_confidence(best_bid, best_ask, bid_depth, ask_depth)
+    metrics = {
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread": spread,
+        "midpoint": midpoint,
+        "bid_depth": round(bid_depth, 2),
+        "ask_depth": round(ask_depth, 2),
+        "fill_confidence": fill_conf,
+    }
+    if best_bid <= 0 and best_ask <= 0:
+        return False, "preflight_no_bid", metrics
+    if best_bid <= 0:
+        return False, "preflight_no_bid", metrics
+    if best_ask <= 0:
+        return False, "preflight_no_ask", metrics
+    if dead_extreme_book(best_bid, best_ask):
+        return False, "preflight_dead_extreme_book", metrics
+    if best_bid < PREFLIGHT_MIN_BID:
+        return False, "preflight_bid_too_low", metrics
+    if best_ask > PREFLIGHT_MAX_ASK:
+        return False, "preflight_ask_too_high", metrics
+    if spread > PREFLIGHT_MAX_SPREAD:
+        return False, "preflight_spread_too_wide", metrics
+    return True, "ok", metrics
+
+
+def observation_candidate(metrics: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    bid = metrics["best_bid"]
+    ask = metrics["best_ask"]
+    spread = metrics["spread"]
+    if dead_extreme_book(bid, ask):
+        return None
+    if bid <= 0 or ask <= 0:
+        return None
+    if bid < 0.003:
+        return None
+    if spread > 0.25:
+        return None
+    if metrics["bid_depth"] + metrics["ask_depth"] < 8:
+        return None
+    blockers = []
+    if bid < MIN_BID:
+        blockers.append("bid below production floor")
+    if ask > MAX_ASK:
+        blockers.append("ask above production cap")
+    if spread > MAX_SPREAD:
+        blockers.append("spread too wide for production")
+    if metrics["fill_confidence"] < MIN_FILL_CONFIDENCE:
+        blockers.append("fill confidence too weak")
+    if not blockers:
+        return None
+    reason = blockers[0]
+    txt = title_slug_text(market)
+    catalyst = "event clock"
+    if any(x in txt for x in ["game", "match", "playoff", "series", "championship"]):
+        catalyst = "sports timing"
+    elif any(x in txt for x in ["vote", "hearing", "ruling", "approval", "debate", "primary"]):
+        catalyst = "decision window"
+    elif any(x in txt for x in ["ftx", "bankruptcy", "payout", "sentencing"]):
+        catalyst = "legal milestone"
+    score = round(0.45 * min(1.0, bid / max(MIN_BID, 0.0001)) + 0.30 * max(0.0, 1 - spread / 0.25) + 0.25 * metrics["fill_confidence"], 3)
     return {
-        "ok": True,
-        "slug": slug,
-        "baseline_prob": baseline_prob,
-        "discovery_priority": discovery_priority_value,
-        "source_bucket": source_bucket,
-        "source_type": source_type,
-        "topic_category": micro["topic_category"],
-        "preflight_spread": micro["spread"],
-        "preflight_midpoint": micro["midpoint"],
-        "preflight_bid_depth": micro["bid_depth"],
-        "preflight_ask_depth": micro["ask_depth"],
-        "cached_market_data": market_data,
-        "cached_token_id": token_id,
-        "cached_book": micro["book"],
-        "cached_book_ts": time.time(),
-        "cached_label": micro["label"],
-        "cached_resolved_text": micro["resolved_text"],
+        "slug": market.get("slug", ""),
+        "question": market.get("question", market.get("title", "")),
+        "bid": bid,
+        "ask": ask,
+        "spread": spread,
+        "bid_depth": metrics["bid_depth"],
+        "ask_depth": metrics["ask_depth"],
+        "reason": reason,
+        "catalyst": catalyst,
+        "score": score,
     }
 
 
-def discover_markets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    prelim: List[Dict[str, Any]] = []
-    seen = set()
-    offset = 0
+def production_side_scores(metrics_yes: Dict[str, Any], metrics_no: Dict[str, Any]) -> Tuple[str, float, Dict[str, Any]]:
+    def side_score(m: Dict[str, Any]) -> float:
+        bid = m["best_bid"]
+        ask = m["best_ask"]
+        spread = m["spread"]
+        depth = m["bid_depth"] + m["ask_depth"]
+        fill = m["fill_confidence"]
+        if bid < MIN_BID or ask > MAX_ASK or spread > MAX_SPREAD or fill < MIN_FILL_CONFIDENCE or m["midpoint"] < MID_PRICE_MIN or m["midpoint"] > MID_PRICE_MAX:
+            return -1.0
+        return round(0.35 * fill + 0.25 * min(1.0, depth / 25.0) + 0.20 * max(0.0, 1 - spread / max(MAX_SPREAD, 0.0001)) + 0.20 * min(1.0, bid / max(MIN_BID, 0.0001)), 4)
+    yes_score = side_score(metrics_yes)
+    no_score = side_score(metrics_no)
+    if yes_score >= no_score:
+        return "YES", yes_score, metrics_yes
+    return "NO", no_score, metrics_no
 
+
+def send_telegram(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=REQUEST_TIMEOUT)
+        return r.ok
+    except Exception:
+        return False
+
+
+def dedupe_key(prefix: str, slug: str) -> str:
+    return f"{prefix}:{slug}"
+
+
+def allow_send(key: str) -> bool:
+    now = utc_ts()
+    last = alert_dedupe.get(key, 0.0)
+    if now - last < DEDUP_SECONDS:
+        return False
+    alert_dedupe[key] = now
+    return True
+
+# =========================================================
+# Discovery
+# =========================================================
+def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     stats = {
         "discover_prelim": 0,
+        "discover_hard_skipped": 0,
+        "discover_non_curated_skips": 0,
+        "discover_family_skips": 0,
+        "discover_bucket_skips": 0,
         "discover_checked": 0,
         "discover_kept": 0,
         "discover_resolve_failures": 0,
         "discover_preflight_failures": 0,
         "discover_preflight_reason_counts": {},
         "discover_near_passes": [],
-        "discover_family_skips": 0,
-        "discover_hard_skipped": 0,
-        "discover_family_bucket_skips": 0,
         "discover_accept_samples": [],
         "discover_skip_samples": [],
-        "discover_non_curated_skips": 0,
-    }
-
-    print(
-        f"[{now_str()}] Discover start | "
-        f"limit={DISCOVER_LIMIT} page_size={DISCOVER_PAGE_SIZE} "
-        f"min_volume={DISCOVER_MIN_VOLUME} min_liquidity={DISCOVER_MIN_LIQUIDITY} "
-        f"short_term_only={SHORT_TERM_ONLY} max_days_to_end={MAX_DAYS_TO_END}"
-    )
-
-    family_seen = set()
-    family_bucket_seen = set()
-
-    while len(prelim) < DISCOVER_LIMIT:
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": DISCOVER_PAGE_SIZE,
-            "offset": offset,
-            "liquidity_num_min": DISCOVER_MIN_LIQUIDITY,
-            "volume_num_min": DISCOVER_MIN_VOLUME,
-        }
-
-        try:
-            batch = safe_get_json(f"{GAMMA_BASE}/markets", params=params)
-        except Exception as e:
-            print(f"[{now_str()}] Discover markets error: {e}")
-            break
-
-        if not isinstance(batch, list) or not batch:
-            break
-
-        for m in batch:
-            slug = (m.get("slug") or "").strip()
-            question = (m.get("question") or m.get("title") or "").strip()
-            combined = f"{slug} {question}".lower()
-
-            if not slug or slug in seen:
-                continue
-            if ENABLE_YES_NO_ONLY and not is_yes_no_market(m):
-                continue
-            if SHORT_TERM_ONLY and not is_within_short_term_window(m):
-                continue
-            if is_blocked_topic(combined):
-                continue
-            hard_skip, hard_reason = should_hard_skip_discovery_market(combined)
-            if hard_skip:
-                stats["discover_hard_skipped"] += 1
-                samples = stats.setdefault("discover_skip_samples", [])
-                if len(samples) < 5:
-                    samples.append({"slug": slug, "reason": hard_reason, "question": question})
-                continue
-            if not is_allowed_topic(combined):
-                continue
-            if not matches_keywords(combined):
-                continue
-            if not is_curated_catalyst_market(combined):
-                stats["discover_non_curated_skips"] += 1
-                samples = stats.setdefault("discover_skip_samples", [])
-                if len(samples) < 5:
-                    samples.append({"slug": slug, "reason": "hard_skip_non_curated_event", "question": question})
-                continue
-
-            family_key = canonical_market_family_key(slug, question)
-            family_bucket = extract_asset_family_bucket(combined) if family_key.startswith("family:") else ""
-            if family_key and family_key in family_seen:
-                stats["discover_family_skips"] += 1
-                continue
-            if family_bucket and family_bucket in family_bucket_seen:
-                stats["discover_family_bucket_skips"] += 1
-                continue
-
-            seen.add(slug)
-            if family_key:
-                family_seen.add(family_key)
-            if family_bucket:
-                family_bucket_seen.add(family_bucket)
-
-            prelim.append({
-                "slug": slug,
-                "baseline_prob": BASELINE_PROB,
-                "discovery_priority": discovery_priority(combined),
-                "family_key": family_key,
-                "family_bucket": family_bucket,
-                "question": question,
-            })
-            accept_samples = stats.setdefault("discover_accept_samples", [])
-            if len(accept_samples) < 5:
-                accept_samples.append({"slug": slug, "question": question, "priority": discovery_priority(combined)})
-            if len(prelim) >= DISCOVER_LIMIT:
-                break
-
-        offset += DISCOVER_PAGE_SIZE
-
-    stats["discover_prelim"] = len(prelim)
-    prelim.sort(key=lambda x: -to_float(x.get("discovery_priority"), 0.0))
-
-    kept: List[Dict[str, Any]] = []
-    for item in prelim:
-        if stats["discover_checked"] >= PREFLIGHT_MAX_CANDIDATES:
-            break
-
-        stats["discover_checked"] += 1
-        candidate = build_candidate_from_slug(
-            slug=item["slug"],
-            baseline_prob=to_float(item.get("baseline_prob"), BASELINE_PROB),
-            discovery_priority_value=to_float(item.get("discovery_priority"), 0.0),
-            source_bucket="discover",
-        )
-        if not candidate.get("ok"):
-            reason = candidate.get("reason", "unknown")
-            if reason in {"resolve_failed", "token_missing"}:
-                stats["discover_resolve_failures"] += 1
-            else:
-                stats["discover_preflight_failures"] += 1
-                reason_counts = stats.setdefault("discover_preflight_reason_counts", {})
-                reason_counts[reason] = reason_counts.get(reason, 0) + 1
-                record_preflight_near_pass(stats, candidate, "discover")
-            continue
-
-        kept.append(candidate)
-
-    stats["discover_kept"] = len(kept)
-
-    kept.sort(
-        key=lambda x: (
-            CATEGORY_PRIORITY.get(x.get("topic_category", "other"), 9),
-            -to_float(x.get("discovery_priority"), 0.0),
-            to_float(x.get("preflight_spread"), 9.0),
-            -min(to_float(x.get("preflight_bid_depth"), 0.0), to_float(x.get("preflight_ask_depth"), 0.0)),
-        )
-    )
-
-    print(
-        f"[{now_str()}] Discover complete | prelim={stats['discover_prelim']} "
-        f"checked={stats['discover_checked']} kept={stats['discover_kept']} family_skips={stats['discover_family_skips']} hard_skipped={stats['discover_hard_skipped']} non_curated={stats.get('discover_non_curated_skips', 0)} bucket_skips={stats['discover_family_bucket_skips']}"
-    )
-    return kept, stats
-
-
-def fetch_watchlist_file() -> List[Dict[str, Any]]:
-    try:
-        r = requests.get(MARKETS_URL, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        lines = [x.strip() for x in r.text.splitlines() if x.strip()]
-        items = []
-        family_seen = set()
-        family_bucket_seen = set()
-        for line in lines:
-            parsed = parse_watchlist_line(line)
-            if not parsed:
-                continue
-            slug_text = parsed["slug"].lower()
-            if is_blocked_topic(slug_text):
-                continue
-            hard_skip, _ = should_hard_skip_discovery_market(slug_text)
-            if hard_skip:
-                continue
-            if not is_allowed_topic(slug_text):
-                continue
-            family_key = canonical_market_family_key(parsed["slug"], parsed["slug"])
-            family_bucket = extract_asset_family_bucket(slug_text) if family_key.startswith("family:") else ""
-            if family_key and family_key in family_seen:
-                continue
-            if family_bucket and family_bucket in family_bucket_seen:
-                continue
-            if family_key:
-                family_seen.add(family_key)
-            if family_bucket:
-                family_bucket_seen.add(family_bucket)
-            items.append(parsed)
-        print(f"[{now_str()}] Watchlist file loaded | items={len(items)}")
-        return items
-    except Exception as e:
-        print(f"[{now_str()}] Watchlist fetch error: {e}")
-        return []
-
-
-def build_prefiltered_fallback_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    file_items = fetch_watchlist_file()
-    stats = {
-        "fallback_items": len(file_items),
+        "fallback_items": 0,
         "fallback_checked": 0,
         "fallback_kept": 0,
         "fallback_resolve_failures": 0,
         "fallback_preflight_failures": 0,
         "fallback_preflight_reason_counts": {},
         "fallback_used": False,
+        "watchlist_source": "none",
+        "scan_resolve_failures": 0,
+        "cache_used": 0,
+        "cache_refetched": 0,
     }
+    markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
+    selected: List[Dict[str, Any]] = []
+    family_seen = set()
+    bucket_counts: Dict[str, int] = {}
 
-    kept: List[Dict[str, Any]] = []
-    for item in file_items[:PREFLIGHT_MAX_CANDIDATES]:
-        stats["fallback_checked"] += 1
-        candidate = build_candidate_from_slug(
-            slug=item["slug"],
-            baseline_prob=to_float(item.get("baseline_prob"), BASELINE_PROB),
-            discovery_priority_value=0.50,
-            source_bucket="fallback",
-        )
-        if not candidate.get("ok"):
-            reason = candidate.get("reason", "unknown")
-            if reason in {"resolve_failed", "token_missing"}:
-                stats["fallback_resolve_failures"] += 1
-            else:
-                stats["fallback_preflight_failures"] += 1
-                reason_counts = stats.setdefault("fallback_preflight_reason_counts", {})
-                reason_counts[reason] = reason_counts.get(reason, 0) + 1
-                record_preflight_near_pass(stats, candidate, "fallback")
+    for m in markets:
+        stats["discover_prelim"] += 1
+        if not within_short_term(m):
+            stats["discover_hard_skipped"] += 1
             continue
-        kept.append(candidate)
+        if ENABLE_YES_NO_ONLY and not is_yes_no_market(m):
+            stats["discover_hard_skipped"] += 1
+            continue
+        if market_liquidity(m) < DISCOVER_MIN_LIQUIDITY and market_volume(m) < DISCOVER_MIN_VOLUME:
+            stats["discover_hard_skipped"] += 1
+            continue
+        if is_crypto_ladder(m):
+            stats["discover_hard_skipped"] += 1
+            if len(stats["discover_skip_samples"]) < 5:
+                stats["discover_skip_samples"].append({"slug": m.get("slug"), "reason": "hard_skip_crypto_ladder", "question": m.get("question")})
+            continue
+        if is_ranking_market(m):
+            stats["discover_hard_skipped"] += 1
+            if len(stats["discover_skip_samples"]) < 5:
+                stats["discover_skip_samples"].append({"slug": m.get("slug"), "reason": "hard_skip_ranking_market", "question": m.get("question")})
+            continue
+        if is_strike_or_shell(m):
+            stats["discover_hard_skipped"] += 1
+            if len(stats["discover_skip_samples"]) < 5:
+                stats["discover_skip_samples"].append({"slug": m.get("slug"), "reason": "hard_skip_strike_ladder", "question": m.get("question")})
+            continue
+        if is_non_curated(m):
+            stats["discover_non_curated_skips"] += 1
+            continue
+        fam = market_family_key(m)
+        if fam in family_seen:
+            stats["discover_family_skips"] += 1
+            continue
+        bucket = family_bucket(m)
+        if bucket_counts.get(bucket, 0) >= 6:
+            stats["discover_bucket_skips"] += 1
+            continue
+        family_seen.add(fam)
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        m["_priority"] = round(event_priority(m), 3)
+        selected.append(m)
 
-    stats["fallback_kept"] = len(kept)
-    if kept:
-        stats["fallback_used"] = True
+    selected.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
+    final_list = selected[:PREFLIGHT_MAX_CANDIDATES]
+    for m in final_list[:5]:
+        stats["discover_accept_samples"].append({
+            "slug": m.get("slug"),
+            "question": m.get("question"),
+            "priority": m.get("_priority", 1.0),
+        })
+    return final_list, stats
 
-    kept.sort(
-        key=lambda x: (
-            CATEGORY_PRIORITY.get(x.get("topic_category", "other"), 9),
-            to_float(x.get("preflight_spread"), 9.0),
-            -min(to_float(x.get("preflight_bid_depth"), 0.0), to_float(x.get("preflight_ask_depth"), 0.0)),
-        )
-    )
-    return kept, stats
+# =========================================================
+# Scan engine
+# =========================================================
+def scan_once() -> Dict[str, Any]:
+    global last_pipeline_stats, last_preflight_reason_counts, last_near_passes, last_observation_results
+    candidates, stats = discover_candidates()
+    observations: List[Dict[str, Any]] = []
+    prod_results: List[Dict[str, Any]] = []
+    near_passes: List[Dict[str, Any]] = []
+    reason_counts: Dict[str, int] = {}
 
+    for market in candidates:
+        stats["discover_checked"] += 1
+        slug = market.get("slug", "")
+        yes_token, no_token = extract_yes_no_tokens(market)
+        if not yes_token or not no_token:
+            stats["discover_resolve_failures"] += 1
+            continue
 
-def fetch_watchlist() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    if TEST_MARKET_SLUG:
-        candidate = build_candidate_from_slug(
-            slug=TEST_MARKET_SLUG,
-            baseline_prob=BASELINE_PROB,
-            discovery_priority_value=1.0,
-            source_bucket="test",
-        )
-        stats = {
-            "discover_prelim": 0,
-            "discover_checked": 0,
-            "discover_kept": 0,
-            "discover_resolve_failures": 0,
-            "discover_preflight_failures": 0,
-            "discover_preflight_reason_counts": {},
-            "fallback_items": 0,
-            "fallback_checked": 0,
-            "fallback_kept": 0,
-            "fallback_resolve_failures": 0,
-            "fallback_preflight_failures": 0,
-            "fallback_preflight_reason_counts": {},
-            "fallback_used": False,
-            "watchlist_source": "test",
-        }
-        return ([candidate] if candidate else []), stats
+        cache_key = slug or market.get("question", "")
+        cached = candidate_cache.get(cache_key)
+        use_cache = cached and (utc_ts() - cached.get("ts", 0) <= CANDIDATE_CACHE_TTL_SECONDS)
+        if use_cache:
+            yes_book = cached.get("yes_book")
+            no_book = cached.get("no_book")
+            stats["cache_used"] += 1
+        else:
+            yes_book = fetch_book(yes_token)
+            no_book = fetch_book(no_token)
+            if cached:
+                stats["cache_refetched"] += 1
+            candidate_cache[cache_key] = {"ts": utc_ts(), "yes_book": yes_book, "no_book": no_book}
+        if not yes_book or not no_book:
+            stats["discover_resolve_failures"] += 1
+            continue
 
-    discover_stats = {
-        "discover_prelim": 0,
-        "discover_checked": 0,
-        "discover_kept": 0,
-        "discover_resolve_failures": 0,
-        "discover_preflight_failures": 0,
-        "discover_preflight_reason_counts": {},
-        "discover_hard_skipped": 0,
-        "discover_family_skips": 0,
-        "discover_family_bucket_skips": 0,
-        "discover_accept_samples": [],
-        "discover_skip_samples": [],
-        "discover_non_curated_skips": 0,
-    }
+        yes_ok, yes_reason, yes_metrics = preflight_check(market, yes_book)
+        no_ok, no_reason, no_metrics = preflight_check(market, no_book)
 
-    if AUTO_DISCOVER:
-        discovered, discover_stats = discover_markets()
-        if discovered:
-            discover_stats.update({
-                "fallback_items": 0,
-                "fallback_checked": 0,
-                "fallback_kept": 0,
-                "fallback_resolve_failures": 0,
-                "fallback_preflight_failures": 0,
-                "fallback_preflight_reason_counts": {},
-                "fallback_used": False,
-                "watchlist_source": "discover",
-            })
-            return discovered, discover_stats
+        # Observation lane before production hard pass, but still clean.
+        obs_yes = observation_candidate(yes_metrics, market)
+        obs_no = observation_candidate(no_metrics, market)
+        if obs_yes:
+            obs_yes["side"] = "YES"
+            observations.append(obs_yes)
+        if obs_no:
+            obs_no["side"] = "NO"
+            observations.append(obs_no)
 
-    fallback, fallback_stats = build_prefiltered_fallback_candidates()
-    combined = {}
-    combined.update(discover_stats)
-    combined.update(fallback_stats)
-    combined["watchlist_source"] = "fallback" if fallback else "none"
-    return fallback, combined
+        if not yes_ok and not no_ok:
+            stats["discover_preflight_failures"] += 1
+            # use worst/common reason from yes side first, then no side
+            final_reason = yes_reason if yes_reason != "ok" else no_reason
+            reason_counts[final_reason] = reason_counts.get(final_reason, 0) + 1
+            if len(near_passes) < 5 and final_reason not in ["preflight_dead_extreme_book", "preflight_no_bid", "preflight_no_ask"]:
+                m = yes_metrics if yes_reason != "ok" else no_metrics
+                near_passes.append({
+                    "slug": slug,
+                    "question": market.get("question"),
+                    "reason": final_reason,
+                    "bid": m["best_bid"],
+                    "ask": m["best_ask"],
+                    "spread": m["spread"],
+                    "bid_depth": m["bid_depth"],
+                    "ask_depth": m["ask_depth"],
+                })
+            continue
 
+        side, score, chosen_metrics = production_side_scores(yes_metrics, no_metrics)
+        if score < 0:
+            # not ready for production; observation may still keep it.
+            continue
+        category = "ALERT" if score >= MICRO_ALERT_SCORE else ("WATCH" if score >= MICRO_WATCH_SCORE else "SKIP")
+        if category == "SKIP":
+            continue
+        prod_results.append({
+            "slug": slug,
+            "question": market.get("question"),
+            "side": side,
+            "score": score,
+            "bid": chosen_metrics["best_bid"],
+            "ask": chosen_metrics["best_ask"],
+            "spread": chosen_metrics["spread"],
+            "fill_confidence": chosen_metrics["fill_confidence"],
+            "category": category,
+        })
+        stats["discover_kept"] += 1
 
-# =========================================
-# LIVE MARKET DATA
-# =========================================
-def choose_live_prob(best_bid: float, best_ask: float, last_trade: float) -> Tuple[float, str]:
-    if best_bid > 0 and best_ask > 0 and best_ask >= best_bid:
-        midpoint = round((best_bid + best_ask) / 2, 6)
-        return midpoint, "midpoint"
-    if last_trade > 0:
-        return last_trade, "last_trade"
-    if best_bid > 0:
-        return best_bid, "best_bid"
-    if best_ask > 0:
-        return best_ask, "best_ask"
-    return 0.0, "none"
+    prod_results.sort(key=lambda x: x["score"], reverse=True)
+    observations.sort(key=lambda x: x["score"], reverse=True)
 
+    # Deduplicate observation entries by slug, keeping best score.
+    obs_map: Dict[str, Dict[str, Any]] = {}
+    for o in observations:
+        key = o["slug"] or o["question"]
+        if key not in obs_map or o["score"] > obs_map[key]["score"]:
+            prev = observation_seen.get(key)
+            trend = "new"
+            if prev:
+                bid_diff = round(o["bid"] - prev.get("bid", 0.0), 4)
+                spread_diff = round(prev.get("spread", 0.0) - o["spread"], 4)
+                if bid_diff > 0 or spread_diff > 0:
+                    trend = "improving"
+                else:
+                    trend = "flat"
+                session_summary["observation_repeats"] += 1
+            o["trend"] = trend
+            obs_map[key] = o
+            observation_seen[key] = {"bid": o["bid"], "spread": o["spread"], "ts": utc_ts()}
 
-def compute_order_book_microstructure(
-    bids: List[Dict[str, Any]],
-    asks: List[Dict[str, Any]],
-    best_bid: float,
-    best_ask: float,
-) -> Dict[str, float]:
-    bid_depth = top_depth(bids, BOOK_LEVELS)
-    ask_depth = top_depth(asks, BOOK_LEVELS)
-    best_bid_size = best_level_size(bids)
-    best_ask_size = best_level_size(asks)
+    final_observations = list(obs_map.values())[:5]
+    if final_observations:
+        session_summary["observation_hits"] += len(final_observations)
+        session_summary["unique_forming"] = len(observation_seen)
+        best = final_observations[0]
+        if not session_summary["best_forming"] or best["score"] > session_summary["best_forming"].get("score", -1):
+            session_summary["best_forming"] = best
 
-    total_depth = bid_depth + ask_depth
-    obi = 0.0
-    if total_depth > 0:
-        obi = (bid_depth - ask_depth) / total_depth
-
-    spread = max(0.0, best_ask - best_bid)
-    midpoint = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
+    last_pipeline_stats = stats.copy()
+    last_pipeline_stats["discover_preflight_reason_counts"] = reason_counts.copy()
+    last_preflight_reason_counts = {"discover": reason_counts.copy(), "fallback": {}}
+    last_near_passes = {"discover": near_passes[:5], "fallback": []}
+    last_observation_results = final_observations
 
     return {
-        "bid_depth": round(bid_depth, 6),
-        "ask_depth": round(ask_depth, 6),
-        "best_bid_size": round(best_bid_size, 6),
-        "best_ask_size": round(best_ask_size, 6),
-        "obi": round(obi, 6),
-        "midpoint": round(midpoint, 6),
-        "spread": round(spread, 6),
+        "timestamp": now_utc().isoformat(),
+        "pipeline": last_pipeline_stats,
+        "alerts": [x for x in prod_results if x["category"] == "ALERT"][:MAX_ALERTS_PER_SCAN],
+        "watches": [x for x in prod_results if x["category"] == "WATCH"][:MAX_ALERTS_PER_SCAN],
+        "observations": final_observations,
+        "near_passes": near_passes[:5],
+        "reason_counts": reason_counts,
     }
 
-
-def estimate_fill_confidence(entry_price: float, top_side_depth: float, spread: float, midpoint: float) -> Tuple[float, str]:
-    if entry_price <= 0:
-        return 0.0, "no-entry"
-    if spread <= 0:
-        return 0.0, "no-spread"
-    if top_side_depth <= 0:
-        return 0.0, "no-depth"
-
-    target_notional = TARGET_MAX_TEST_POSITION_USD
-    est_shares = target_notional / max(entry_price, 1e-9)
-    depth_ratio = top_side_depth / max(est_shares, 1e-9)
-
-    depth_score = clamp(depth_ratio / 3.0, 0.0, 1.0)
-    spread_score = clamp((0.10 - spread) / 0.10, 0.0, 1.0)
-    midpoint_score = 1.0 if MID_PRICE_MIN <= midpoint <= MID_PRICE_MAX else 0.0
-
-    score = (depth_score * 0.45) + (spread_score * 0.35) + (midpoint_score * 0.20)
-
-    if score >= 0.75:
-        note = "fill-strong"
-    elif score >= 0.55:
-        note = "fill-possible"
-    else:
-        note = "fill-weak"
-
-    return round(score, 4), note
-
-
-def estimate_test_position_quality(best_bid: float, best_ask: float, liquidity: float, midpoint: float) -> Tuple[float, str]:
-    if best_bid <= 0 or best_ask <= 0:
-        return 0.0, "no-two-sided-book"
-    if best_ask > EARLY_MAX_ASK:
-        return 0.0, "ask-pinned"
-    if best_bid < EARLY_MIN_BID:
-        return 0.0, "bid-dead"
-
-    spread = max(0.0, best_ask - best_bid)
-    spread_component = clamp((0.10 - spread) / 0.10, 0.0, 1.0)
-    liquidity_component = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 1.0)
-    midpoint_component = 1.0 if MID_PRICE_MIN <= midpoint <= MID_PRICE_MAX else 0.0
-
-    score = (spread_component * 0.45) + (liquidity_component * 0.25) + (midpoint_component * 0.30)
-
-    if score >= 0.75:
-        return round(score, 4), "small-size-friendly"
-    if score >= 0.55:
-        return round(score, 4), "small-size-possible"
-    return round(score, 4), "small-size-weak"
-
-
-def estimate_shares(total_usd: float, price_per_share: float) -> float:
-    if price_per_share <= 0:
-        return 0.0
-    return round(total_usd / price_per_share, 2)
-
-
-def time_to_event_score(end_iso: str) -> float:
-    dte = days_to_end(end_iso)
-    if dte is None or dte < 0:
-        return 0.0
-    if dte <= 1:
-        return 1.0
-    if dte <= 3:
-        return 0.90
-    if dte <= 7:
-        return 0.80
-    if dte <= 10:
-        return 0.65
-    if dte <= 14:
-        return 0.50
-    return 0.25
-
-
-def midpoint_zone_score(midpoint: float) -> float:
-    if 0.20 <= midpoint <= 0.80:
-        return 1.0
-    if 0.15 <= midpoint <= 0.85:
-        return 0.80
-    if MID_PRICE_MIN <= midpoint <= MID_PRICE_MAX:
-        return 0.55
-    return 0.0
-
-
-def fetch_live_market_data(item: Dict[str, Any], pipeline_stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    slug = item["slug"]
-    baseline_prob = to_float(item.get("baseline_prob"), BASELINE_PROB)
-
-    market_data = item.get("cached_market_data")
-    token_id = item.get("cached_token_id")
-    source_type = item.get("source_type", "unknown")
-    book = item.get("cached_book")
-    cached_book_ts = to_float(item.get("cached_book_ts"), 0.0)
-
-    if not market_data or not token_id:
-        raise ValueError("Cached candidate missing market/token")
-
-    cache_source = "candidate_cache"
-    cache_age_seconds = round(max(0.0, time.time() - cached_book_ts), 3) if cached_book_ts else None
-    stale_cache = bool(cached_book_ts and cache_age_seconds is not None and cache_age_seconds > CANDIDATE_CACHE_TTL_SECONDS)
-
-    if pipeline_stats is not None:
-        pipeline_stats.setdefault("cache_used", 0)
-        pipeline_stats.setdefault("cache_refetched", 0)
-        pipeline_stats.setdefault("cache_missing", 0)
-        pipeline_stats.setdefault("cache_fetch_failures", 0)
-        pipeline_stats.setdefault("cache_stale", 0)
-
-    if not isinstance(book, dict):
-        cache_source = "fresh_fetch_missing_cache"
-        if pipeline_stats is not None:
-            pipeline_stats["cache_missing"] += 1
-        try:
-            book = fetch_order_book(token_id)
-            item["cached_book"] = book
-            item["cached_book_ts"] = time.time()
-            cache_age_seconds = 0.0
-        except Exception:
-            if pipeline_stats is not None:
-                pipeline_stats["cache_fetch_failures"] += 1
-            raise
-    elif stale_cache:
-        cache_source = "fresh_fetch_stale_cache"
-        if pipeline_stats is not None:
-            pipeline_stats["cache_stale"] += 1
-            pipeline_stats["cache_refetched"] += 1
-        try:
-            book = fetch_order_book(token_id)
-            item["cached_book"] = book
-            item["cached_book_ts"] = time.time()
-            cache_age_seconds = 0.0
-        except Exception:
-            if pipeline_stats is not None:
-                pipeline_stats["cache_fetch_failures"] += 1
-            raise
-    else:
-        if pipeline_stats is not None:
-            pipeline_stats["cache_used"] += 1
-
-    bids = book.get("bids") or []
-    asks = book.get("asks") or []
-
-    best_bid = to_float(bids[0].get("price")) if bids else 0.0
-    best_ask = to_float(asks[0].get("price")) if asks else 0.0
-    last_trade = to_float(book.get("last_trade_price"), 0.0)
-
-    dead_book, dead_reason = is_dead_book(best_bid, best_ask)
-    spread = round(best_ask - best_bid, 6) if best_bid > 0 and best_ask > 0 else 0.0
-    live_prob, price_source = choose_live_prob(best_bid, best_ask, last_trade)
-    liquidity = to_float(market_data.get("liquidityClob", market_data.get("liquidity", 0.0)), 0.0)
-
-    label = market_data.get("question") or market_data.get("title") or market_data.get("slug") or slug
-    resolved_text = f"{market_data.get('slug', '')} {market_data.get('question', '')} {market_data.get('title', '')}".lower()
-    topic_category = classify_topic(resolved_text)
-
-    end_dt = extract_end_datetime(market_data)
-    end_iso = end_dt.isoformat() if end_dt else ""
-
-    micro = compute_order_book_microstructure(bids, asks, best_bid, best_ask)
-    tiny_position_score, tiny_position_note = estimate_test_position_quality(
-        best_bid, best_ask, liquidity, micro["midpoint"]
-    )
-
-    yes_entry_price = best_ask if best_ask > 0 else 0.0
-    no_entry_price = round(1.0 - best_bid, 6) if best_bid > 0 else 0.0
-
-    yes_fill_confidence, yes_fill_note = estimate_fill_confidence(
-        yes_entry_price, micro["ask_depth"], spread, micro["midpoint"]
-    )
-    no_fill_confidence, no_fill_note = estimate_fill_confidence(
-        no_entry_price, micro["bid_depth"], spread, 1.0 - micro["midpoint"] if micro["midpoint"] > 0 else 0.0
-    )
-
-    return {
-        "market_id": market_data.get("id", slug),
-        "slug": slug,
-        "source_type": source_type,
-        "source_bucket": item.get("source_bucket", "unknown"),
-        "topic_category": topic_category,
-        "price_source": price_source,
-        "label": label,
-        "live_prob": live_prob,
-        "baseline_prob": baseline_prob,
-        "liquidity": liquidity,
-        "best_bid": best_bid,
-        "best_ask": best_ask,
-        "spread": spread,
-        "last_trade_price": last_trade,
-        "token_id": token_id,
-        "end_dt": end_iso,
-        "tiny_position_score": tiny_position_score,
-        "tiny_position_note": tiny_position_note,
-        "dead_book": dead_book,
-        "dead_reason": dead_reason,
-        "yes_entry_price": yes_entry_price,
-        "no_entry_price": no_entry_price,
-        "resolved_text": resolved_text,
-        "bid_depth": micro["bid_depth"],
-        "ask_depth": micro["ask_depth"],
-        "best_bid_size": micro["best_bid_size"],
-        "best_ask_size": micro["best_ask_size"],
-        "obi": micro["obi"],
-        "midpoint": micro["midpoint"],
-        "yes_fill_confidence": yes_fill_confidence,
-        "yes_fill_note": yes_fill_note,
-        "no_fill_confidence": no_fill_confidence,
-        "no_fill_note": no_fill_note,
-        "time_score": time_to_event_score(end_iso),
-        "midpoint_zone_score": midpoint_zone_score(micro["midpoint"]),
-        "discovery_priority": to_float(item.get("discovery_priority"), 0.0),
-        "cache_source": cache_source,
-        "cache_age_seconds": cache_age_seconds,
-    }
-
-
-# =========================================
-# CLASSIFICATION / SCORING
-# =========================================
-def side_micro_score(
-    side: str,
-    live_prob: float,
-    baseline_prob: float,
-    spread: float,
-    liquidity: float,
-    tiny_position_score: float,
-    midpoint_zone: float,
-    time_score: float,
-    obi: float,
-    fill_confidence: float,
-    category: str,
-) -> Tuple[float, float]:
-    yes_edge = baseline_prob - live_prob
-    no_edge = live_prob - baseline_prob
-    edge = yes_edge if side == "YES" else no_edge
-
-    spread_score = clamp((MAX_SPREAD - spread) / max(MAX_SPREAD, 1e-9), 0.0, 1.0)
-    liquidity_score = min(liquidity / max(MIN_LIQUIDITY * 4.0, 1.0), 1.0)
-
-    if side == "YES":
-        pressure = clamp((obi + 1.0) / 2.0, 0.0, 1.0)
-    else:
-        pressure = clamp((1.0 - obi) / 2.0, 0.0, 1.0)
-
-    category_bonus = {
-        "crypto": 1.00,
-        "macro": 0.95,
-        "index_commodity": 0.92,
-        "politics_event": 0.86,
-        "other": 0.78,
-    }.get(category, 0.78)
-
-    edge_score = 0.0
-    if edge >= abs(ALERT_THRESHOLD):
-        edge_score = 1.0
-    elif edge >= abs(WATCH_THRESHOLD):
-        edge_score = 0.60
-    elif edge > 0:
-        edge_score = clamp(edge / abs(WATCH_THRESHOLD), 0.0, 0.45)
-
-    total = (
-        (tiny_position_score * 0.28) +
-        (pressure * 0.20) +
-        (fill_confidence * 0.18) +
-        (liquidity_score * 0.10) +
-        (spread_score * 0.08) +
-        (time_score * 0.10) +
-        (midpoint_zone * 0.06)
-    )
-
-    total = total * (0.85 + 0.15 * edge_score) * category_bonus
-    return round(total, 4), round(edge, 4)
-
-
-def classify_market(m: Dict[str, Any]) -> Tuple[str, Optional[str]]:
-    liquidity = to_float(m.get("liquidity", 0), 0.0)
-    spread = to_float(m.get("spread", 0), 0.0)
-    best_bid = to_float(m.get("best_bid", 0), 0.0)
-    best_ask = to_float(m.get("best_ask", 0), 0.0)
-    price_source = (m.get("price_source") or "").strip()
-    live_prob = to_float(m.get("live_prob", 0.0), 0.0)
-    baseline_prob = to_float(m.get("baseline_prob"), BASELINE_PROB)
-    tiny_position_score = to_float(m.get("tiny_position_score", 0.0), 0.0)
-    midpoint_zone = to_float(m.get("midpoint_zone_score", 0.0), 0.0)
-    time_score = to_float(m.get("time_score", 0.0), 0.0)
-    obi = to_float(m.get("obi", 0.0), 0.0)
-    category = m.get("topic_category", "other")
-    bid_depth = to_float(m.get("bid_depth", 0.0), 0.0)
-    ask_depth = to_float(m.get("ask_depth", 0.0), 0.0)
-
-    if m.get("dead_book"):
-        return "SKIP", f"Dead book ({m.get('dead_reason')})"
-    if liquidity < MIN_LIQUIDITY:
-        return "SKIP", "Liquidity too low"
-    if best_bid <= 0 or best_ask <= 0:
-        return "SKIP", "Incomplete book"
-    if best_bid < MIN_BID:
-        return "SKIP", "Bid too low"
-    if best_ask >= MAX_ASK:
-        return "SKIP", "Ask too high"
-    if spread > MAX_SPREAD:
-        return "SKIP", "Spread too wide"
-    if price_source == "last_trade":
-        return "SKIP", "Last trade only"
-    if bid_depth < MIN_TOP_DEPTH:
-        return "SKIP", "Bid depth too thin"
-    if ask_depth < MIN_TOP_DEPTH:
-        return "SKIP", "Ask depth too thin"
-    if tiny_position_score < 0.45:
-        return "SKIP", f"Small-size weak ({m.get('tiny_position_note', 'weak')})"
-    if midpoint_zone <= 0:
-        return "SKIP", "Midpoint outside tradable zone"
-
-    yes_score, yes_edge = side_micro_score(
-        "YES",
-        live_prob,
-        baseline_prob,
-        spread,
-        liquidity,
-        tiny_position_score,
-        midpoint_zone,
-        time_score,
-        obi,
-        to_float(m.get("yes_fill_confidence", 0.0), 0.0),
-        category,
-    )
-    no_score, no_edge = side_micro_score(
-        "NO",
-        live_prob,
-        baseline_prob,
-        spread,
-        liquidity,
-        tiny_position_score,
-        midpoint_zone,
-        time_score,
-        obi,
-        to_float(m.get("no_fill_confidence", 0.0), 0.0),
-        category,
-    )
-
-    if yes_score >= no_score:
-        side = "YES"
-        composite = yes_score
-        edge = yes_edge
-        fill_conf = to_float(m.get("yes_fill_confidence", 0.0), 0.0)
-        fill_note = m.get("yes_fill_note", "")
-        entry_price = to_float(m.get("yes_entry_price", 0.0), 0.0)
-        side_depth = ask_depth
-    else:
-        side = "NO"
-        composite = no_score
-        edge = no_edge
-        fill_conf = to_float(m.get("no_fill_confidence", 0.0), 0.0)
-        fill_note = m.get("no_fill_note", "")
-        entry_price = to_float(m.get("no_entry_price", 0.0), 0.0)
-        side_depth = bid_depth
-
-    m["signal_side"] = side
-    m["edge"] = edge
-    m["composite_score"] = round(composite, 4)
-    m["fill_confidence"] = fill_conf
-    m["fill_note"] = fill_note
-    m["entry_price"] = entry_price
-    m["side_depth"] = side_depth
-    m["yes_prob"] = live_prob
-    m["no_prob"] = 1.0 - live_prob
-    m["imbalance"] = live_prob - baseline_prob
-    m["est_shares_min"] = estimate_shares(TARGET_MIN_TEST_POSITION_USD, entry_price)
-    m["est_shares_max"] = estimate_shares(TARGET_MAX_TEST_POSITION_USD, entry_price)
-
-    if side_depth < MIN_TOP_DEPTH:
-        return "SKIP", "Chosen side depth too thin"
-    if fill_conf < MIN_FILL_CONFIDENCE:
-        return "SKIP", f"Fill confidence weak ({fill_note})"
-
-    if composite >= MICRO_ALERT_SCORE and edge > 0:
-        return "ALERT", f"{side} microstructure score={composite:.3f} edge={edge:.3f}"
-
-    if composite >= MICRO_WATCH_SCORE:
-        return "WATCH", f"{side} near-ready score={composite:.3f} edge={edge:.3f}"
-
-    return "SKIP", "No qualifying signal"
-
-
-# =========================================
-# OBSERVATION LANE
-# =========================================
-def observation_reason_from_market(m: Dict[str, Any]) -> str:
-    reasons = []
-    spread = to_float(m.get("spread", 0.0), 0.0)
-    best_bid = to_float(m.get("best_bid", 0.0), 0.0)
-    fill_conf = to_float(m.get("fill_confidence", 0.0), 0.0)
-    side_depth = to_float(m.get("side_depth", 0.0), 0.0)
-
-    if best_bid < MIN_BID:
-        reasons.append("bid still weak")
-    if spread > MAX_SPREAD:
-        reasons.append("spread still wide")
-    if side_depth < MIN_TOP_DEPTH:
-        reasons.append("side depth thin")
-    if fill_conf < MIN_FILL_CONFIDENCE:
-        reasons.append("fill confidence weak")
-    if not reasons:
-        reasons.append("not ready yet")
-    return ", ".join(reasons[:3])
-
-
-def classify_observation_market(m: Dict[str, Any], production_reason: Optional[str]) -> Tuple[bool, Optional[str]]:
-    if m.get("dead_book"):
-        return False, None
-    if to_float(m.get("liquidity", 0.0), 0.0) < MIN_LIQUIDITY:
-        return False, None
-
-    best_bid = to_float(m.get("best_bid", 0.0), 0.0)
-    best_ask = to_float(m.get("best_ask", 0.0), 0.0)
-    spread = to_float(m.get("spread", 0.0), 0.0)
-    bid_depth = to_float(m.get("bid_depth", 0.0), 0.0)
-    ask_depth = to_float(m.get("ask_depth", 0.0), 0.0)
-    midpoint = to_float(m.get("midpoint", 0.0), 0.0)
-    tiny_position_score = to_float(m.get("tiny_position_score", 0.0), 0.0)
-
-    if best_bid <= 0 or best_ask <= 0:
-        return False, None
-    if best_bid < 0.003:
-        return False, None
-    if best_ask >= 0.995:
-        return False, None
-    if spread > 0.20:
-        return False, None
-    if max(bid_depth, ask_depth) < 5.0:
-        return False, None
-    if tiny_position_score < 0.20:
-        return False, None
-    if midpoint <= 0 or midpoint < 0.01 or midpoint > 0.99:
-        return False, None
-
-    return True, observation_reason_from_market(m)
-
-
-def build_observation_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    obs = []
-    for r in results:
-        if r.get("category") in {"ALERT", "WATCH"}:
-            continue
-        ok, why_not_ready = classify_observation_market(r, r.get("reason"))
-        if not ok:
-            continue
-        item = dict(r)
-        item["observation_reason"] = why_not_ready
-        item["observation_interest"] = round(
-            (to_float(item.get("tiny_position_score", 0.0), 0.0) * 0.25) +
-            (to_float(item.get("fill_confidence", 0.0), 0.0) * 0.20) +
-            (to_float(item.get("time_score", 0.0), 0.0) * 0.20) +
-            (clamp((0.20 - to_float(item.get("spread", 0.0), 0.0)) / 0.20, 0.0, 1.0) * 0.15) +
-            (min(max(to_float(item.get("bid_depth", 0.0), 0.0), to_float(item.get("ask_depth", 0.0), 0.0)) / 25.0, 1.0) * 0.10) +
-            (abs(to_float(item.get("obi", 0.0), 0.0)) * 0.10),
-            4,
-        )
-        obs.append(item)
-    obs.sort(key=lambda x: (-to_float(x.get("observation_interest", 0.0), 0.0), -to_float(x.get("fill_confidence", 0.0), 0.0), -to_float(x.get("tiny_position_score", 0.0), 0.0), -to_float(x.get("time_score", 0.0), 0.0)))
-    return obs[:5]
-
-
-def update_session_tracking(scan: Dict[str, Any]) -> None:
-    global session_scan_count, session_empty_prod_scans, session_observation_hits, session_observation_repeat_hits, session_best_observation
-    session_scan_count += 1
-    prod = qualifying_results(scan)
-    if not prod:
-        session_empty_prod_scans += 1
-
-    obs = scan.get("observation_results", []) or []
-    session_observation_hits += len(obs)
-    for item in obs:
-        slug = item.get("slug", "")
-        prev = session_observation_seen.get(slug)
-        if prev:
-            session_observation_repeat_hits += 1
-        session_observation_seen[slug] = {
-            "bid": to_float(item.get("best_bid", 0.0), 0.0),
-            "spread": to_float(item.get("spread", 0.0), 0.0),
-            "depth": max(to_float(item.get("bid_depth", 0.0), 0.0), to_float(item.get("ask_depth", 0.0), 0.0)),
-            "label": item.get("label", ""),
-            "interest": to_float(item.get("observation_interest", 0.0), 0.0),
-        }
-        if not session_best_observation or to_float(item.get("observation_interest", 0.0), 0.0) > to_float(session_best_observation.get("observation_interest", 0.0), 0.0):
-            session_best_observation = {
-                "slug": slug,
-                "label": item.get("label", ""),
-                "observation_interest": to_float(item.get("observation_interest", 0.0), 0.0),
-                "best_bid": to_float(item.get("best_bid", 0.0), 0.0),
-                "spread": to_float(item.get("spread", 0.0), 0.0),
-            }
-
-
-def format_observation_block(r: Dict[str, Any]) -> str:
-    return (
-        f"FORMING | {r.get('label', '')}\n"
-        f"slug={r.get('slug', '')}\n"
-        f"topic={r.get('topic_category', 'other')} side={r.get('signal_side', '?')} interest={to_float(r.get('observation_interest', 0.0), 0.0):.3f}\n"
-        f"why interesting=real book forming around catalyst\n"
-        f"not ready because={r.get('observation_reason', 'not ready yet')}\n"
-        f"bid={to_float(r.get('best_bid', 0.0), 0.0):.3f} ask={to_float(r.get('best_ask', 0.0), 0.0):.3f} spread={to_float(r.get('spread', 0.0), 0.0):.3f}\n"
-        f"bid_depth={to_float(r.get('bid_depth', 0.0), 0.0):.2f} ask_depth={to_float(r.get('ask_depth', 0.0), 0.0):.2f} fill={to_float(r.get('fill_confidence', 0.0), 0.0):.3f} tiny={to_float(r.get('tiny_position_score', 0.0), 0.0):.3f}"
-    )
-
-
-def format_session_summary() -> List[str]:
-    top_reason = "none"
-    if last_skip_counts:
-        k, v = last_skip_counts.most_common(1)[0]
-        top_reason = f"{k}:{v}"
-    best = "none"
-    if session_best_observation:
-        best = f"{session_best_observation.get('label', '')} | interest={to_float(session_best_observation.get('observation_interest', 0.0), 0.0):.3f}"
-    return [
-        "Session summary:",
-        f"scans={session_scan_count} | empty_prod_scans={session_empty_prod_scans} | unique_forming={len(session_observation_seen)}",
-        f"observation_hits={session_observation_hits} | observation_repeats={session_observation_repeat_hits}",
-        f"top_skip_reason={top_reason}",
-        f"best_forming={best}",
+# =========================================================
+# Formatting
+# =========================================================
+def format_health_text() -> str:
+    lines = [
+        "Health check",
+        f"script_version={SCRIPT_VERSION}",
+        f"rolling_discovery_days={ROLLING_DISCOVERY_DAYS}",
+        f"alert_threshold={ALERT_THRESHOLD}",
+        f"watch_threshold={WATCH_THRESHOLD}",
+        f"send_watch_alerts={SEND_WATCH_ALERTS}",
+        f"debug_scan_output={DEBUG_SCAN_OUTPUT}",
+        f"scan_every_seconds={SCAN_EVERY_SECONDS}",
+        f"short_term_only={SHORT_TERM_ONLY}",
+        f"max_days_to_end={MAX_DAYS_TO_END}",
+        f"discover_limit={DISCOVER_LIMIT}",
+        f"discover_min_volume={DISCOVER_MIN_VOLUME}",
+        f"discover_min_liquidity={DISCOVER_MIN_LIQUIDITY}",
+        f"min_liquidity={MIN_LIQUIDITY}",
+        f"max_spread={MAX_SPREAD}",
+        f"min_bid={MIN_BID}",
+        f"max_ask={MAX_ASK}",
+        f"early_min_bid={EARLY_MIN_BID}",
+        f"early_max_ask={EARLY_MAX_ASK}",
+        f"early_max_spread={EARLY_MAX_SPREAD}",
+        f"mid_price_min={MID_PRICE_MIN}",
+        f"mid_price_max={MID_PRICE_MAX}",
+        f"block_crypto_ladders={BLOCK_CRYPTO_LADDERS}",
+        f"book_levels={BOOK_LEVELS}",
+        f"min_top_depth={MIN_TOP_DEPTH}",
+        f"min_fill_confidence={MIN_FILL_CONFIDENCE}",
+        f"micro_alert_score={MICRO_ALERT_SCORE}",
+        f"micro_watch_score={MICRO_WATCH_SCORE}",
+        f"preflight_max_spread={PREFLIGHT_MAX_SPREAD}",
+        f"preflight_min_bid={PREFLIGHT_MIN_BID}",
+        f"preflight_max_ask={PREFLIGHT_MAX_ASK}",
+        f"preflight_max_candidates={PREFLIGHT_MAX_CANDIDATES}",
+        f"auto_discover={AUTO_DISCOVER}",
+        f"enable_yes_no_only={ENABLE_YES_NO_ONLY}",
+        f"manual_scan_in_progress={manual_scan_in_progress}",
+        f"target_min_test_position_usd={TARGET_MIN_TEST_POSITION_USD}",
+        f"target_max_test_position_usd={TARGET_MAX_TEST_POSITION_USD}",
+        f"test_market_slug={TEST_MARKET_SLUG or 'none'}",
+        f"candidate_cache_ttl_seconds={CANDIDATE_CACHE_TTL_SECONDS}",
+        f"last_pipeline_stats={last_pipeline_stats}",
+        f"last_preflight_reason_counts={last_preflight_reason_counts}",
+        f"last_near_passes={last_near_passes}",
+        f"last_observation_results={last_observation_results}",
+        f"session_summary={session_summary}",
     ]
+    return "\n".join(lines)
 
 
-# =========================================
-# SCAN
-# =========================================
-def scan_markets() -> Dict[str, Any]:
-    global last_skip_counts, last_pipeline_stats, last_preflight_reason_counts, last_near_passes, last_discovery_samples, last_observation_results
+def format_scan_text(scan: Dict[str, Any]) -> str:
+    pipeline = scan["pipeline"]
+    alerts = scan["alerts"]
+    watches = scan["watches"]
+    observations = scan["observations"]
+    reason_counts = scan["reason_counts"]
+    near_passes = scan["near_passes"]
 
-    watchlist, pipeline_stats = fetch_watchlist()
-    results: List[Dict[str, Any]] = []
-    counts = {"total": 0, "alert": 0, "watch": 0, "skip": 0}
-    skip_counter = Counter()
-    resolve_failures = 0
+    top_reason = "none"
+    if reason_counts:
+        k, v = sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[0]
+        top_reason = f"{k}:{v}"
 
-    print(f"[{now_str()}] Scan start | watchlist_items={len(watchlist)} source={pipeline_stats.get('watchlist_source')}")
+    lines = [
+        "Scan finished. No qualifying markets." if not alerts and not watches else "Scan finished.",
+        "",
+        f"Total: {len(alerts) + len(watches)}",
+        f"Alerts: {len(alerts)}",
+        f"Watch: {len(watches)}",
+        "Skip: 0",
+        (
+            "Pipeline: source=none | "
+            f"discover_prelim={pipeline.get('discover_prelim', 0)} | "
+            f"discover_hard_skipped={pipeline.get('discover_hard_skipped', 0)} | "
+            f"discover_non_curated_skips={pipeline.get('discover_non_curated_skips', 0)} | "
+            f"discover_family_skips={pipeline.get('discover_family_skips', 0)} | "
+            f"discover_bucket_skips={pipeline.get('discover_bucket_skips', 0)} | "
+            f"discover_checked={pipeline.get('discover_checked', 0)} | "
+            f"discover_kept={pipeline.get('discover_kept', 0)} | "
+            f"fallback_items={pipeline.get('fallback_items', 0)} | "
+            f"fallback_checked={pipeline.get('fallback_checked', 0)} | "
+            f"fallback_kept={pipeline.get('fallback_kept', 0)} | "
+            f"cache_used={pipeline.get('cache_used', 0)} | "
+            f"cache_refetched={pipeline.get('cache_refetched', 0)} | "
+            f"resolve_failures={pipeline.get('discover_resolve_failures', 0)} | "
+            f"top_preflight_discover={top_reason} | top_preflight_fallback=none"
+        ),
+        "",
+        "Near-miss summary: No skip reasons available." if not near_passes else "Near-miss summary:",
+    ]
+    if near_passes:
+        for n in near_passes:
+            lines.extend([
+                f"{n['question']}",
+                f"slug={n['slug']}",
+                f"reason={n['reason']}",
+                f"bid={n['bid']} ask={n['ask']} spread={n['spread']}",
+            ])
+    else:
+        lines.extend([
+            "",
+            "No tradable near-misses found.",
+            "Most candidates failed preflight, depth, fill confidence, or cached candidate resolution.",
+            f"Preflight detail: discover={reason_counts} fallback={{}}",
+        ])
 
-    for item in watchlist:
-        counts["total"] += 1
-        try:
-            m = fetch_live_market_data(item, pipeline_stats=pipeline_stats)
-            category, reason = classify_market(m)
-            m["category"] = category
-            m["reason"] = reason
-            results.append(m)
+    if alerts or watches:
+        lines.append("")
+        lines.append("Tradable now:")
+        for row in alerts + watches:
+            lines.extend([
+                f"{row['category']} | {row['question']}",
+                f"slug={row['slug']} side={row['side']} score={row['score']}",
+                f"bid={row['bid']} ask={row['ask']} spread={row['spread']} fill={row['fill_confidence']}",
+                "",
+            ])
 
-            if category == "ALERT":
-                counts["alert"] += 1
-            elif category == "WATCH":
-                counts["watch"] += 1
-            else:
-                counts["skip"] += 1
-                skip_counter[reason or "Unknown"] += 1
+    lines.append("")
+    if observations:
+        lines.append("Forming markets:")
+        for o in observations:
+            lines.extend([
+                f"FORMING | {o['question']}",
+                f"slug={o['slug']} side={o['side']} score={o['score']} trend={o['trend']}",
+                f"bid={o['bid']} ask={o['ask']} spread={o['spread']}",
+                f"bid_depth={o['bid_depth']} ask_depth={o['ask_depth']}",
+                f"interesting={o['catalyst']} | not_ready={o['reason']}",
+                "",
+            ])
+    else:
+        lines.append("Forming markets: none")
 
-        except Exception as e:
-            print(f"[{now_str()}] Market scan error for {item.get('slug')}: {e}")
-            counts["skip"] += 1
-            resolve_failures += 1
-            skip_counter["Fetch/resolve error"] += 1
+    lines.extend([
+        "",
+        "Session summary:",
+        f"scans={session_summary.get('scans', 0)} | empty_prod_scans={session_summary.get('empty_prod_scans', 0)} | unique_forming={session_summary.get('unique_forming', 0)}",
+        f"observation_hits={session_summary.get('observation_hits', 0)} | observation_repeats={session_summary.get('observation_repeats', 0)}",
+        f"top_skip_reason={top_reason if top_reason else 'none'}",
+        f"best_forming={session_summary.get('best_forming', {}) or 'none'}",
+    ])
+    return "\n".join(lines)
 
-    pipeline_stats["scan_resolve_failures"] = resolve_failures
-    pipeline_stats.setdefault("discover_preflight_reason_counts", {})
-    pipeline_stats.setdefault("fallback_preflight_reason_counts", {})
-    last_pipeline_stats = pipeline_stats
-    last_preflight_reason_counts = {
-        "discover": dict(pipeline_stats.get("discover_preflight_reason_counts", {})),
-        "fallback": dict(pipeline_stats.get("fallback_preflight_reason_counts", {})),
-    }
-    last_near_passes = {
-        "discover": list(pipeline_stats.get("discover_near_passes", []))[:5],
-        "fallback": list(pipeline_stats.get("fallback_near_passes", []))[:5],
-    }
-    last_discovery_samples = {
-        "accepted": list(pipeline_stats.get("discover_accept_samples", []))[:5],
-        "hard_skipped": list(pipeline_stats.get("discover_skip_samples", []))[:5],
-    }
-    last_skip_counts = skip_counter
 
-    observation_results = build_observation_results(results)
-    last_observation_results = observation_results
+def format_zero_summary() -> str:
+    reason_counts = last_preflight_reason_counts.get("discover", {}) or {}
+    top_reason = "none"
+    if reason_counts:
+        k, v = sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[0]
+        top_reason = f"{k}:{v}"
+    best_forming = session_summary.get("best_forming") or {}
+    best_forming_label = best_forming.get("question") if isinstance(best_forming, dict) else None
+    return "\n".join([
+        f"No qualifying markets in last {int(ZERO_SUMMARY_EVERY_SECONDS/60) + 2} minutes.",
+        f"Empty scans: {empty_scan_streak}",
+        f"Top preflight block: {top_reason}",
+        f"Hard-skipped in discovery: {last_pipeline_stats.get('discover_hard_skipped', 0)} | family skips: {last_pipeline_stats.get('discover_family_skips', 0)} | bucket skips: {last_pipeline_stats.get('discover_bucket_skips', 0)}",
+        "Closest near-pass: none" if not last_near_passes.get("discover") else f"Closest near-pass: {last_near_passes['discover'][0].get('question')}",
+        f"Top forming market: {best_forming_label or 'none'}",
+    ])
 
-    results.sort(
-        key=lambda x: (
-            0 if x.get("category") == "ALERT" else 1 if x.get("category") == "WATCH" else 2,
-            CATEGORY_PRIORITY.get(x.get("topic_category", "other"), 9),
-            0 if not x.get("dead_book") else 1,
-            -to_float(x.get("composite_score"), 0.0),
-            -to_float(x.get("fill_confidence"), 0.0),
-            -to_float(x.get("tiny_position_score"), 0.0),
-            -to_float(x.get("time_score"), 0.0),
-            -abs(to_float(x.get("obi"), 0.0)),
-        )
-    )
-
-    scan = {"counts": counts, "results": results[:30], "observation_results": observation_results[:5], "pipeline": pipeline_stats}
-    update_session_tracking(scan)
-    print(
-        f"[{now_str()}] Scan complete | "
-        f"total={counts['total']} alert={counts['alert']} "
-        f"watch={counts['watch']} skip={counts['skip']} obs={len(observation_results[:5])}"
-    )
+# =========================================================
+# Execution wrappers
+# =========================================================
+def run_scan_and_update() -> Dict[str, Any]:
+    global empty_scan_streak
+    scan = scan_once()
+    session_summary["scans"] += 1
+    if not scan["alerts"] and not scan["watches"]:
+        empty_scan_streak += 1
+        session_summary["empty_prod_scans"] += 1
+    else:
+        empty_scan_streak = 0
     return scan
 
 
-def qualifying_results(scan: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return [
-        r for r in scan["results"]
-        if r["category"] == "ALERT" or (r["category"] == "WATCH" and SEND_WATCH_ALERTS)
-    ]
-
-
-def summarize_skip_reasons(results: List[Dict[str, Any]]) -> str:
-    reasons = [r.get("reason", "Unknown") for r in results if r.get("category") == "SKIP"]
-    if not reasons:
-        reasons = list(last_skip_counts.elements())
-    if not reasons:
-        return "No skip reasons available."
-    top = Counter(reasons).most_common(6)
-    return " | ".join(f"{k}: {v}" for k, v in top)
-
-
-def near_miss_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    usable = [
-        r for r in results
-        if not r.get("dead_book")
-        and r.get("reason") not in {
-            "Bid too low",
-            "Ask too high",
-            "Spread too wide",
-            "Liquidity too low",
-            "Last trade only",
-            "Bid depth too thin",
-            "Ask depth too thin",
-            "Chosen side depth too thin",
-            "Fetch/resolve error",
-        }
-    ]
-    usable.sort(
-        key=lambda x: (
-            -to_float(x.get("composite_score"), 0.0),
-            -to_float(x.get("fill_confidence"), 0.0),
-            -to_float(x.get("tiny_position_score"), 0.0),
-            -to_float(x.get("time_score"), 0.0),
-        )
-    )
-    return usable[:3]
-
-
-def format_pipeline_stats(pipeline: Dict[str, Any]) -> str:
-    discover_reasons = pipeline.get("discover_preflight_reason_counts", {}) or {}
-    fallback_reasons = pipeline.get("fallback_preflight_reason_counts", {}) or {}
-
-    def top_reason(reason_counts: Dict[str, Any]) -> str:
-        if not reason_counts:
-            return "none"
-        top_key = max(reason_counts, key=lambda k: reason_counts.get(k, 0))
-        return f"{top_key}:{reason_counts.get(top_key, 0)}"
-
-    return (
-        f"Pipeline: source={pipeline.get('watchlist_source', 'unknown')} | "
-        f"discover_prelim={pipeline.get('discover_prelim', 0)} | "
-        f"discover_hard_skipped={pipeline.get('discover_hard_skipped', 0)} | "
-        f"discover_non_curated_skips={pipeline.get('discover_non_curated_skips', 0)} | "
-        f"discover_family_skips={pipeline.get('discover_family_skips', 0)} | "
-        f"discover_bucket_skips={pipeline.get('discover_family_bucket_skips', 0)} | "
-        f"discover_checked={pipeline.get('discover_checked', 0)} | "
-        f"discover_kept={pipeline.get('discover_kept', 0)} | "
-        f"fallback_items={pipeline.get('fallback_items', 0)} | "
-        f"fallback_checked={pipeline.get('fallback_checked', 0)} | "
-        f"fallback_kept={pipeline.get('fallback_kept', 0)} | "
-        f"cache_used={pipeline.get('cache_used', 0)} | "
-        f"cache_refetched={pipeline.get('cache_refetched', 0)} | "
-        f"resolve_failures={pipeline.get('scan_resolve_failures', 0)} | "
-        f"top_preflight_discover={top_reason(discover_reasons)} | "
-        f"top_preflight_fallback={top_reason(fallback_reasons)}"
-    )
-
-
-def format_market_block(r: Dict[str, Any]) -> str:
-    end_text = r.get("end_dt", "")
-    end_line = f"\nends={end_text}" if end_text else ""
-
-    return (
-        f"{r['category']} | {r['label']}\n"
-        f"slug={r.get('slug', '')}{end_line}\n"
-        f"topic={r.get('topic_category', 'other')} "
-        f"side={r.get('signal_side', '?')} "
-        f"score={r.get('composite_score', 0):.3f} "
-        f"edge={r.get('edge', 0):.3f}\n"
-        f"entry_price={r.get('entry_price', 0):.3f} "
-        f"test_size=${TARGET_MIN_TEST_POSITION_USD:.0f}-${TARGET_MAX_TEST_POSITION_USD:.0f} "
-        f"est_shares={r.get('est_shares_min', 0)}-{r.get('est_shares_max', 0)}\n"
-        f"fill={r.get('fill_note', '')} fill_score={r.get('fill_confidence', 0):.3f} "
-        f"tiny_size={r.get('tiny_position_note', '')} tiny_score={r.get('tiny_position_score', 0):.3f}\n"
-        f"obi={r.get('obi', 0):.3f} "
-        f"bid_depth={r.get('bid_depth', 0):.2f} "
-        f"ask_depth={r.get('ask_depth', 0):.2f} "
-        f"side_depth={r.get('side_depth', 0):.2f} "
-        f"time_score={r.get('time_score', 0):.2f}\n"
-        f"bid={r.get('best_bid', 0):.3f} "
-        f"ask={r.get('best_ask', 0):.3f} "
-        f"spread={r.get('spread', 0):.3f} "
-        f"liq={r.get('liquidity', 0):.0f} "
-        f"src={r.get('price_source', '')} "
-        f"cache={r.get('cache_source', '')}"
-    )
-
-
-
-
-def format_preflight_near_passes(pipeline: Dict[str, Any]) -> List[str]:
-    discover = list(pipeline.get("discover_near_passes", []) or [])
-    fallback = list(pipeline.get("fallback_near_passes", []) or [])
-    combined = []
-    for item in discover:
-        combined.append(("discover", item))
-    for item in fallback:
-        combined.append(("fallback", item))
-
-    if not combined:
-        return []
-
-    combined.sort(key=lambda x: (to_float(x[1].get("distance_to_pass"), 999.0), to_float(x[1].get("spread"), 999.0), -max(to_float(x[1].get("bid_depth"), 0.0), to_float(x[1].get("ask_depth"), 0.0))))
-    lines = ["Closest preflight near-passes:", ""]
-    for source, item in combined[:5]:
-        lines.append(
-            f"{source.upper()} | {item.get('label', '')}\n"
-            f"slug={item.get('slug', '')}\n"
-            f"reason={item.get('reason', '')} | {item.get('distance_note', '') or ('distance=' + str(item.get('distance_to_pass', '')))}\n"
-            f"bid={to_float(item.get('best_bid'), 0.0):.3f} ask={to_float(item.get('best_ask'), 0.0):.3f} spread={to_float(item.get('spread'), 0.0):.3f}\n"
-            f"bid_depth={to_float(item.get('bid_depth'), 0.0):.2f} ask_depth={to_float(item.get('ask_depth'), 0.0):.2f} midpoint={to_float(item.get('midpoint'), 0.0):.3f} side_hint={item.get('side_hint', '')}"
-        )
-        lines.append("")
-    return lines
-
-def format_zero_summary(zero_count: int, seconds_in_window: int) -> str:
-    minutes = max(1, round(seconds_in_window / 60))
-    pipeline = last_pipeline_stats or {}
-    discover_reasons = (last_preflight_reason_counts or {}).get("discover", {}) or {}
-    top_reason = "none"
-    if discover_reasons:
-        key = max(discover_reasons, key=lambda k: discover_reasons.get(k, 0))
-        top_reason = f"{key}:{discover_reasons.get(key, 0)}"
-    near = (last_near_passes or {}).get("discover", []) or []
-    near_text = "none"
-    if near:
-        first = near[0]
-        near_text = f"{first.get('reason', 'unknown')} ({first.get('distance_note', '') or first.get('distance_to_pass', '')})"
-    obs_text = "none"
-    if last_observation_results:
-        top_obs = last_observation_results[0]
-        obs_text = f"{top_obs.get('label', '')} | not ready: {top_obs.get('observation_reason', '')}"
-    return (
-        f"No qualifying markets in last {minutes} minutes.\n"
-        f"Empty scans: {zero_count}\n"
-        f"Top preflight block: {top_reason}\n"
-        f"Hard-skipped in discovery: {pipeline.get('discover_hard_skipped', 0)} | family skips: {pipeline.get('discover_family_skips', 0)} | bucket skips: {pipeline.get('discover_family_bucket_skips', 0)}\n"
-        f"Closest near-pass: {near_text}\n"
-        f"Top forming market: {obs_text}"
-    )
-
-
-def format_manual_scan(scan: Dict[str, Any]) -> Optional[str]:
-    top = qualifying_results(scan)
-    counts = scan.get("counts", {})
-    results = scan.get("results", [])
-    pipeline = scan.get("pipeline", {})
-
-    if top:
-        lines = [
-            "Scan complete",
-            "",
-            f"Total: {counts.get('total', 0)}",
-            f"Alerts: {counts.get('alert', 0)}",
-            f"Watch: {counts.get('watch', 0)}",
-            f"Skip: {counts.get('skip', 0)}",
-            format_pipeline_stats(pipeline),
-            "",
-            f"Qualifying markets: {len(top)}",
-            "",
-        ]
-        for r in top[:5]:
-            lines.append(format_market_block(r))
-            lines.append("")
-        return "\n".join(lines).strip()
-
-    if DEBUG_SCAN_OUTPUT:
-        lines = [
-            "Scan finished. No qualifying markets.",
-            "",
-            f"Total: {counts.get('total', 0)}",
-            f"Alerts: {counts.get('alert', 0)}",
-            f"Watch: {counts.get('watch', 0)}",
-            f"Skip: {counts.get('skip', 0)}",
-            format_pipeline_stats(pipeline),
-            "",
-            f"Near-miss summary: {summarize_skip_reasons(results)}",
-        ]
-
-        near = near_miss_results(results)
-        if near:
-            lines.extend(["", "Closest tradable near-misses:", ""])
-            for r in near:
-                lines.append(
-                    f"{r.get('category', 'SKIP')} | {r.get('label', '')}\n"
-                    f"slug={r.get('slug', '')}\n"
-                    f"reason={r.get('reason', 'No qualifying signal')}\n"
-                    f"topic={r.get('topic_category', 'other')} side={r.get('signal_side', '?')}\n"
-                    f"ends={r.get('end_dt', '') or 'unknown'}\n"
-                    f"entry_price={r.get('entry_price', 0):.3f} "
-                    f"est_shares={r.get('est_shares_min', 0)}-{r.get('est_shares_max', 0)}\n"
-                    f"fill={r.get('fill_note', '')} fill_score={r.get('fill_confidence', 0):.3f} "
-                    f"tiny={r.get('tiny_position_note', '')} tiny_score={r.get('tiny_position_score', 0):.3f}\n"
-                    f"obi={r.get('obi', 0):.3f} "
-                    f"bid_depth={r.get('bid_depth', 0):.2f} "
-                    f"ask_depth={r.get('ask_depth', 0):.2f} "
-                    f"spread={r.get('spread', 0):.3f} liq={r.get('liquidity', 0):.0f}"
-                )
-                lines.append("")
-        else:
-            lines.extend([
-                "",
-                "No tradable near-misses found.",
-                "Most candidates failed preflight, depth, fill confidence, or cached candidate resolution.",
-                f"Preflight detail: discover={pipeline.get('discover_preflight_reason_counts', {})} fallback={pipeline.get('fallback_preflight_reason_counts', {})}",
-            ])
-            preflight_near = format_preflight_near_passes(pipeline)
-            if preflight_near:
-                lines.extend([""] + preflight_near)
-
-        obs = scan.get("observation_results", []) or []
-        if obs:
-            lines.extend(["", "Forming markets:", ""])
-            for r in obs[:3]:
-                lines.append(format_observation_block(r))
-                lines.append("")
-        else:
-            lines.extend(["", "Forming markets: none"] )
-
-        lines.extend([""] + format_session_summary())
-        return "\n".join(lines).strip()
-
-    return None
-
-
-def run_manual_scan_async(chat_id: str) -> None:
+def handle_command(text: str) -> str:
     global manual_scan_in_progress
-    try:
-        scan = scan_markets()
-        msg = format_manual_scan(scan)
-        if msg:
-            send_telegram_message(chat_id, msg)
-    except Exception as e:
-        print(f"[{now_str()}] Manual scan error: {e}")
-        send_telegram_message(chat_id, f"Scan error: {e}")
-    finally:
-        with manual_scan_lock:
-            manual_scan_in_progress = False
-
-
-# =========================================
-# AUTO LOOP
-# =========================================
-def auto_scan_loop() -> None:
-    global zero_scan_count, zero_window_started_at
-
-    if not TELEGRAM_CHAT_ID:
-        print(f"[{now_str()}] Auto scan disabled: TELEGRAM_CHAT_ID not set")
-        return
-
-    if SCAN_EVERY_SECONDS <= 0:
-        print(f"[{now_str()}] Auto scan disabled: SCAN_EVERY_SECONDS <= 0")
-        return
-
-    print(f"[{now_str()}] Auto scan loop started. Every {SCAN_EVERY_SECONDS} seconds.")
-
-    while True:
+    cmd = (text or "").strip().lower()
+    if cmd.startswith("/health"):
+        return format_health_text()
+    if cmd.startswith("/scan"):
+        with state_lock:
+            manual_scan_in_progress = True
         try:
-            scan = scan_markets()
-            candidates = qualifying_results(scan)[:MAX_ALERTS_PER_SCAN]
-            now = time.time()
+            scan = run_scan_and_update()
+            return format_scan_text(scan)
+        finally:
+            with state_lock:
+                manual_scan_in_progress = False
+    return "Commands: /health, /scan"
 
-            if candidates:
-                zero_scan_count = 0
-                zero_window_started_at = now
 
-                for r in candidates:
-                    dedupe_key = f"{r.get('slug')}|{r.get('category')}|{r.get('signal_side')}"
-                    if already_sent(dedupe_key):
-                        continue
-                    send_telegram_message(TELEGRAM_CHAT_ID, format_market_block(r))
-                    mark_sent(dedupe_key)
+def background_loop() -> None:
+    global last_zero_summary_sent_at
+    while True:
+        time.sleep(max(30, SCAN_EVERY_SECONDS))
+        try:
+            scan = run_scan_and_update()
+            if scan["alerts"]:
+                text = format_scan_text(scan)
+                send_telegram(text)
+            elif SEND_WATCH_ALERTS and scan["watches"]:
+                text = format_scan_text(scan)
+                send_telegram(text)
             else:
-                zero_scan_count += 1
-                elapsed = now - zero_window_started_at
-                if elapsed >= ZERO_SUMMARY_EVERY_SECONDS and zero_scan_count > 0:
-                    send_telegram_message(
-                        TELEGRAM_CHAT_ID,
-                        format_zero_summary(zero_scan_count, int(elapsed)),
-                    )
-                    zero_scan_count = 0
-                    zero_window_started_at = now
-
-        except Exception as e:
-            print(f"[{now_str()}] Auto scan error: {e}")
-
-        time.sleep(SCAN_EVERY_SECONDS)
+                now = utc_ts()
+                if now - last_zero_summary_sent_at >= ZERO_SUMMARY_EVERY_SECONDS:
+                    send_telegram(format_zero_summary())
+                    last_zero_summary_sent_at = now
+        except Exception as exc:
+            send_telegram(f"Scan error: {exc}")
 
 
-def start_background_worker_once() -> None:
-    global _background_started
-    with _background_lock:
-        if _background_started:
-            return
-        _background_started = True
-        t = threading.Thread(target=auto_scan_loop, daemon=True)
-        t.start()
-        print(f"[{now_str()}] Background worker started.")
+def ensure_background_started() -> None:
+    global background_started
+    if background_started:
+        return
+    background_started = True
+    threading.Thread(target=background_loop, daemon=True).start()
 
-
-start_background_worker_once()
-
-
-# =========================================
-# ROUTES
-# =========================================
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({
-        "ok": True,
-        "service": BOT_LABEL,
-        "script_version": SCRIPT_VERSION,
-        "rolling_discovery_days": ROLLING_DISCOVERY_DAYS,
-        "auto_scan_enabled": bool(TELEGRAM_CHAT_ID and SCAN_EVERY_SECONDS > 0),
-        "scan_every_seconds": SCAN_EVERY_SECONDS,
-        "zero_summary_every_seconds": ZERO_SUMMARY_EVERY_SECONDS,
-        "short_term_only": SHORT_TERM_ONLY,
-        "max_days_to_end": MAX_DAYS_TO_END,
-    })
-
-
+# =========================================================
+# Flask routes
+# =========================================================
 @app.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "ok": True,
-        "service": BOT_LABEL,
-        "script_version": SCRIPT_VERSION,
-        "rolling_discovery_days": ROLLING_DISCOVERY_DAYS,
-        "alert_threshold": ALERT_THRESHOLD,
-        "watch_threshold": WATCH_THRESHOLD,
-        "send_watch_alerts": SEND_WATCH_ALERTS,
-        "debug_scan_output": DEBUG_SCAN_OUTPUT,
-        "scan_every_seconds": SCAN_EVERY_SECONDS,
-        "short_term_only": SHORT_TERM_ONLY,
-        "max_days_to_end": MAX_DAYS_TO_END,
-        "discover_limit": DISCOVER_LIMIT,
-        "discover_min_volume": DISCOVER_MIN_VOLUME,
-        "discover_min_liquidity": DISCOVER_MIN_LIQUIDITY,
-        "min_liquidity": MIN_LIQUIDITY,
-        "max_spread": MAX_SPREAD,
-        "min_bid": MIN_BID,
-        "max_ask": MAX_ASK,
-        "early_min_bid": EARLY_MIN_BID,
-        "early_max_ask": EARLY_MAX_ASK,
-        "early_max_spread": EARLY_MAX_SPREAD,
-        "mid_price_min": MID_PRICE_MIN,
-        "mid_price_max": MID_PRICE_MAX,
-        "block_crypto_ladders": BLOCK_CRYPTO_LADDERS,
-        "book_levels": BOOK_LEVELS,
-        "min_top_depth": MIN_TOP_DEPTH,
-        "min_fill_confidence": MIN_FILL_CONFIDENCE,
-        "micro_alert_score": MICRO_ALERT_SCORE,
-        "micro_watch_score": MICRO_WATCH_SCORE,
-        "preflight_max_spread": PREFLIGHT_MAX_SPREAD,
-        "preflight_min_bid": PREFLIGHT_MIN_BID,
-        "preflight_max_ask": PREFLIGHT_MAX_ASK,
-        "preflight_max_candidates": PREFLIGHT_MAX_CANDIDATES,
-        "auto_discover": AUTO_DISCOVER,
-        "enable_yes_no_only": ENABLE_YES_NO_ONLY,
-        "manual_scan_in_progress": manual_scan_in_progress,
-        "target_min_test_position_usd": TARGET_MIN_TEST_POSITION_USD,
-        "target_max_test_position_usd": TARGET_MAX_TEST_POSITION_USD,
-        "test_market_slug": TEST_MARKET_SLUG or "none",
-        "last_pipeline_stats": last_pipeline_stats,
-        "last_preflight_reason_counts": last_preflight_reason_counts,
-        "last_near_passes": last_near_passes,
-        "last_discovery_samples": last_discovery_samples,
-        "last_observation_results": last_observation_results[:5],
-        "session_summary": {
-            "scans": session_scan_count,
-            "empty_prod_scans": session_empty_prod_scans,
-            "observation_hits": session_observation_hits,
-            "observation_repeats": session_observation_repeat_hits,
-            "unique_forming": len(session_observation_seen),
-            "best_forming": session_best_observation,
-        },
-        "candidate_cache_ttl_seconds": CANDIDATE_CACHE_TTL_SECONDS,
-    })
+def health_route():
+    return format_health_text(), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.route("/scan", methods=["GET"])
 def scan_route():
-    try:
-        scan = scan_markets()
-        return jsonify({"ok": True, **scan})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    scan = run_scan_and_update()
+    return format_scan_text(scan), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.route("/webhook", methods=["POST"])
-def webhook():
-    global manual_scan_in_progress
-
-    data = request.get_json(silent=True) or {}
-    print(f"[{now_str()}] WEBHOOK HIT: {data}")
-
-    message = data.get("message", {})
-    chat = message.get("chat", {})
-    chat_id = str(chat.get("id", "")).strip()
-    text = (message.get("text") or "").strip()
-    command = normalize_command(text)
-
-    print(f"[{now_str()}] Command received | raw_text={text} normalized={command} chat_id={chat_id}")
-
-    if not chat_id or not text:
-        return jsonify({"ok": True, "ignored": True})
-
-    if command == "/start":
-        send_telegram_message(chat_id, "Bot is live.\nUse /scan or /health")
-        return jsonify({"ok": True})
-
-    if command == "/health":
-        msg = (
-            "Health check\n"
-            f"alert_threshold={ALERT_THRESHOLD}\n"
-            f"watch_threshold={WATCH_THRESHOLD}\n"
-            f"send_watch_alerts={SEND_WATCH_ALERTS}\n"
-            f"debug_scan_output={DEBUG_SCAN_OUTPUT}\n"
-            f"scan_every_seconds={SCAN_EVERY_SECONDS}\n"
-            f"short_term_only={SHORT_TERM_ONLY}\n"
-            f"max_days_to_end={MAX_DAYS_TO_END}\n"
-            f"discover_limit={DISCOVER_LIMIT}\n"
-            f"discover_min_volume={DISCOVER_MIN_VOLUME}\n"
-            f"discover_min_liquidity={DISCOVER_MIN_LIQUIDITY}\n"
-            f"min_liquidity={MIN_LIQUIDITY}\n"
-            f"max_spread={MAX_SPREAD}\n"
-            f"min_bid={MIN_BID}\n"
-            f"max_ask={MAX_ASK}\n"
-            f"early_min_bid={EARLY_MIN_BID}\n"
-            f"early_max_ask={EARLY_MAX_ASK}\n"
-            f"early_max_spread={EARLY_MAX_SPREAD}\n"
-            f"mid_price_min={MID_PRICE_MIN}\n"
-            f"mid_price_max={MID_PRICE_MAX}\n"
-            f"block_crypto_ladders={BLOCK_CRYPTO_LADDERS}\n"
-            f"book_levels={BOOK_LEVELS}\n"
-            f"min_top_depth={MIN_TOP_DEPTH}\n"
-            f"min_fill_confidence={MIN_FILL_CONFIDENCE}\n"
-            f"micro_alert_score={MICRO_ALERT_SCORE}\n"
-            f"micro_watch_score={MICRO_WATCH_SCORE}\n"
-            f"preflight_max_spread={PREFLIGHT_MAX_SPREAD}\n"
-            f"preflight_min_bid={PREFLIGHT_MIN_BID}\n"
-            f"preflight_max_ask={PREFLIGHT_MAX_ASK}\n"
-            f"preflight_max_candidates={PREFLIGHT_MAX_CANDIDATES}\n"
-            f"auto_discover={AUTO_DISCOVER}\n"
-            f"enable_yes_no_only={ENABLE_YES_NO_ONLY}\n"
-            f"manual_scan_in_progress={manual_scan_in_progress}\n"
-            f"target_min_test_position_usd={TARGET_MIN_TEST_POSITION_USD}\n"
-            f"target_max_test_position_usd={TARGET_MAX_TEST_POSITION_USD}\n"
-            f"test_market_slug={TEST_MARKET_SLUG or 'none'}\n"
-            f"candidate_cache_ttl_seconds={CANDIDATE_CACHE_TTL_SECONDS}\n"
-            f"last_pipeline_stats={last_pipeline_stats}\n"
-            f"last_preflight_reason_counts={last_preflight_reason_counts}\n"
-            f"last_near_passes={last_near_passes}\n"
-            f"last_observation_results={last_observation_results[:5]}\n"
-            f"session_summary={{'scans': {session_scan_count}, 'empty_prod_scans': {session_empty_prod_scans}, 'observation_hits': {session_observation_hits}, 'observation_repeats': {session_observation_repeat_hits}, 'unique_forming': {len(session_observation_seen)}, 'best_forming': {session_best_observation}}}"
-        )
-        send_telegram_message(chat_id, msg)
-        return jsonify({"ok": True})
-
-    if command == "/scan":
-        with manual_scan_lock:
-            if manual_scan_in_progress:
-                send_telegram_message(chat_id, "Scan already running. Wait for result.")
-                return jsonify({"ok": True})
-            manual_scan_in_progress = True
-
-        send_telegram_message(chat_id, "Running scan...")
-        threading.Thread(target=run_manual_scan_async, args=(chat_id,), daemon=True).start()
-        return jsonify({"ok": True})
-
+def webhook_route():
+    payload = request.get_json(silent=True) or {}
+    msg = payload.get("message") or payload.get("edited_message") or {}
+    chat_id = msg.get("chat", {}).get("id")
+    text = msg.get("text", "")
+    reply = handle_command(text)
+    if TELEGRAM_BOT_TOKEN and chat_id:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": reply},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except Exception:
+            pass
     return jsonify({"ok": True})
 
 
+@app.route("/", methods=["GET"])
+def root_route():
+    return jsonify({"ok": True, "script_version": SCRIPT_VERSION})
+
+
+ensure_background_started()
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)

@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v13.1-discovery-failopen-debug"
+SCRIPT_VERSION = "v13.2-timefield-fix"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -107,6 +107,59 @@ background_started = False
 # =========================================================
 def now_utc() -> datetime:
     return datetime.now(tz=UTC)
+
+
+def get_market_end_dt(market: Dict[str, Any]) -> Tuple[Optional[datetime], str]:
+    """
+    Try multiple possible time fields used by Polymarket/Gamma/event objects.
+    Returns (datetime_or_none, source_field_name).
+    """
+    candidates = [
+        ("endDate", market.get("endDate")),
+        ("end_date", market.get("end_date")),
+        ("end_date_iso", market.get("end_date_iso")),
+        ("endTime", market.get("endTime")),
+        ("end_time", market.get("end_time")),
+        ("closeTime", market.get("closeTime")),
+        ("close_time", market.get("close_time")),
+        ("gameStartTime", market.get("gameStartTime")),
+        ("game_start_time", market.get("game_start_time")),
+        ("startDate", market.get("startDate")),
+        ("start_date", market.get("start_date")),
+        ("startTime", market.get("startTime")),
+        ("start_time", market.get("start_time")),
+    ]
+
+    event_obj = market.get("event") or {}
+    if isinstance(event_obj, dict):
+        candidates.extend([
+            ("event.endDate", event_obj.get("endDate")),
+            ("event.end_date", event_obj.get("end_date")),
+            ("event.endTime", event_obj.get("endTime")),
+            ("event.startDate", event_obj.get("startDate")),
+            ("event.start_time", event_obj.get("start_time")),
+            ("event.startTime", event_obj.get("startTime")),
+            ("event.gameStartTime", event_obj.get("gameStartTime")),
+        ])
+
+    for key, value in candidates:
+        dt = parse_iso_datetime(value)
+        if dt is not None:
+            return dt, key
+    return None, "missing"
+
+
+def classify_time_window(market: Dict[str, Any]) -> Tuple[bool, str, Optional[datetime], str]:
+    end_dt, source = get_market_end_dt(market)
+    if end_dt is None:
+        return False, "hard_skip_missing_time", None, source
+    now_dt = datetime.now(timezone.utc)
+    delta_days = (end_dt - now_dt).total_seconds() / 86400.0
+    if delta_days < 0:
+        return False, "hard_skip_past_event", end_dt, source
+    if delta_days > MAX_DAYS_TO_END:
+        return False, "hard_skip_outside_window", end_dt, source
+    return True, "ok", end_dt, source
 
 
 def utc_ts() -> float:
@@ -620,8 +673,17 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         sports_like = is_sports_or_highflow_market(m)
         curated_like = is_curated_catalyst_market(m)
         event_like = sports_like or curated_like
-        if not within_short_term(m):
-            add_hard_skip("hard_skip_outside_window", m)
+        allowed_time, time_reason, time_dt, time_source = classify_time_window(m)
+        if not allowed_time:
+            add_hard_skip(time_reason, m)
+            if len(stats.get("discover_reject_samples", [])) < 5:
+                stats.setdefault("discover_reject_samples", []).append({
+                    "slug": market_slug(m),
+                    "reason": time_reason,
+                    "time_source": time_source,
+                    "time_value": time_dt.isoformat() if time_dt else "missing",
+                    "question": market_question(m),
+                })
             continue
         if ENABLE_YES_NO_ONLY and not is_yes_no_market(m):
             add_hard_skip("hard_skip_not_yes_no", m)
@@ -639,6 +701,14 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         # fail-open candidate pool for discovery debugging:
         # if a market is short-term, yes/no, and not obvious junk, let it be considered later
         failopen_pool.append(m)
+        if len(stats.get("discover_time_debug", [])) < 5:
+            _dt, _src = get_market_end_dt(m)
+            stats.setdefault("discover_time_debug", []).append({
+                "slug": market_slug(m),
+                "question": market_question(m),
+                "time_source": _src,
+                "time_value": _dt.isoformat() if _dt else "missing",
+            })
 
         liq = market_liquidity(m)
         vol = market_volume(m)

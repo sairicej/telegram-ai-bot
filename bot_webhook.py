@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v13.8-token-resolution-fix"
+SCRIPT_VERSION = "v13.9-scan-resolution-debug"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -1248,7 +1248,7 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"fallback_kept={pipeline.get('fallback_kept', 0)} | "
             f"cache_used={pipeline.get('cache_used', 0)} | "
             f"cache_refetched={pipeline.get('cache_refetched', 0)} | "
-            f"resolve_failures={pipeline.get('discover_resolve_failures', 0)} | "
+            f"resolve_failures={pipeline.get('discover_resolve_failures', 0)} | "f"resolve_samples={len(pipeline.get('resolve_failure_samples', []) or [])} | "f"book_samples={len(pipeline.get('book_failure_samples', []) or [])} | "
             f"top_preflight_discover={top_reason} | top_preflight_fallback=none"
         ),
         "",
@@ -1269,6 +1269,28 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             "Most candidates failed preflight, depth, fill confidence, or cached candidate resolution.",
             f"Preflight detail: discover={reason_counts} fallback={{}}",
         ])
+        resolve_samples = pipeline.get("resolve_failure_samples", []) or []
+        book_samples = pipeline.get("book_failure_samples", []) or []
+        if resolve_samples:
+            lines.append("")
+            lines.append("Resolve failure samples:")
+            for s in resolve_samples[:3]:
+                lines.extend([
+                    f"{s.get('question') or 'unknown'}",
+                    f"slug={s.get('slug', '')}",
+                    f"yes_token={s.get('yes_token')} no_token={s.get('no_token')}",
+                    f"outcomes={s.get('outcomes')}",
+                ])
+        if book_samples:
+            lines.append("")
+            lines.append("Book failure samples:")
+            for s in book_samples[:3]:
+                lines.extend([
+                    f"{s.get('question') or 'unknown'}",
+                    f"slug={s.get('slug', '')}",
+                    f"yes_token={s.get('yes_token')} no_token={s.get('no_token')}",
+                    f"yes_book_ok={s.get('yes_book_ok')} no_book_ok={s.get('no_book_ok')}",
+                ])
 
     if alerts or watches:
         lines.append("")

@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v11-sports-highflow"
+SCRIPT_VERSION = "v12-sports-highflow-discovery-fix"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -193,8 +193,10 @@ def market_liquidity(market: Dict[str, Any]) -> float:
 
 
 def event_priority(market: Dict[str, Any]) -> float:
-    txt = title_slug_text(market)
+    txt = full_market_text(market)
     score = 1.0
+    if is_sports_or_highflow_market(market):
+        score += 0.22
     sports_terms = [
         "game", "match", "final", "series", "playoff", "tournament", "championship",
         "world series", "nba", "nfl", "mlb", "nhl", "ncaa", "ufc", "fight", "goal", "touchdown"
@@ -219,7 +221,7 @@ def event_priority(market: Dict[str, Any]) -> float:
 
 
 def is_ranking_market(market: Dict[str, Any]) -> bool:
-    txt = title_slug_text(market)
+    txt = full_market_text(market)
     patterns = [
         "top ai model", "best ai model", "second-best", "second best", "leaderboard", "ranked",
         "have the top", "have the second-best", "have the second best", "best model"
@@ -228,7 +230,7 @@ def is_ranking_market(market: Dict[str, Any]) -> bool:
 
 
 def is_crypto_ladder(market: Dict[str, Any]) -> bool:
-    txt = title_slug_text(market)
+    txt = full_market_text(market)
     if not BLOCK_CRYPTO_LADDERS:
         return False
     crypto_terms = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "doge"]
@@ -237,7 +239,7 @@ def is_crypto_ladder(market: Dict[str, Any]) -> bool:
 
 
 def is_strike_or_shell(market: Dict[str, Any]) -> bool:
-    txt = title_slug_text(market)
+    txt = full_market_text(market)
     patterns = [
         r"hit \(high\)", r"hit \(low\)", r"all time high", r"hit \$\d+", r"price target",
         r"high\) \$", r"low\) \$"
@@ -246,18 +248,17 @@ def is_strike_or_shell(market: Dict[str, Any]) -> bool:
 
 
 def is_non_curated(market: Dict[str, Any]) -> bool:
-    txt = title_slug_text(market)
-    curated_terms = [
-        "game", "match", "final", "series", "playoff", "championship", "tournament", "winner",
-        "vote", "hearing", "ruling", "approval", "decision", "debate", "primary", "election",
-        "cpi", "ppi", "fomc", "fed", "rates", "tariff", "shutdown", "ftx", "bankruptcy",
-        "sentencing", "payout", "delisted", "policy"
-    ]
-    return not any(t in txt for t in curated_terms)
+    if is_sports_or_highflow_market(market):
+        return False
+    if is_curated_catalyst_market(market):
+        return False
+    txt = full_market_text(market)
+    soft_terms = ["today", "tonight", "tomorrow", "this week", "this month", "by ", "before ", "after "]
+    return not any(t in txt for t in soft_terms)
 
 
 def family_bucket(market: Dict[str, Any]) -> str:
-    txt = title_slug_text(market)
+    txt = full_market_text(market)
     if any(x in txt for x in ["trump", "hegseth", "zelenskyy", "president", "secretary of defense"]):
         return "politics-personnel"
     if any(x in txt for x in ["tariff", "shutdown", "fed", "fomc", "cpi", "ppi", "rates"]):
@@ -270,7 +271,7 @@ def family_bucket(market: Dict[str, Any]) -> str:
 
 
 def market_family_key(market: Dict[str, Any]) -> str:
-    txt = title_slug_text(market)
+    txt = full_market_text(market)
     txt = re.sub(r"\bby\s+[a-z]+\s+\d{1,2}\b", "", txt)
     txt = re.sub(r"\$\d+[kKmM]?", "$X", txt)
     txt = re.sub(r"\d{4}", "YEAR", txt)
@@ -460,7 +461,7 @@ def observation_candidate(metrics: Dict[str, Any], market: Dict[str, Any]) -> Op
     if not blockers:
         return None
     reason = blockers[0]
-    txt = title_slug_text(market)
+    txt = full_market_text(market)
     catalyst = "event clock"
     if any(x in txt for x in ["game", "match", "playoff", "series", "championship"]):
         catalyst = "sports timing"
@@ -530,6 +531,7 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     stats = {
         "discover_prelim": 0,
         "discover_hard_skipped": 0,
+        "discover_hard_skip_reason_counts": {},
         "discover_non_curated_skips": 0,
         "discover_family_skips": 0,
         "discover_bucket_skips": 0,
@@ -558,41 +560,50 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     family_seen = set()
     bucket_counts: Dict[str, int] = {}
 
+    def add_hard_skip(reason: str, market: Dict[str, Any]):
+        stats["discover_hard_skipped"] += 1
+        stats["discover_hard_skip_reason_counts"][reason] = stats["discover_hard_skip_reason_counts"].get(reason, 0) + 1
+        if len(stats["discover_skip_samples"]) < 8:
+            stats["discover_skip_samples"].append({"slug": market.get("slug"), "reason": reason, "question": market.get("question")})
+
+    bucket_caps = {"sports": 18, "macro-policy": 8, "legal-special": 8, "politics-personnel": 8, "other": 4}
+
     for m in markets:
         stats["discover_prelim"] += 1
+        sports_like = is_sports_or_highflow_market(m)
+        curated_like = is_curated_catalyst_market(m)
         if not within_short_term(m):
-            stats["discover_hard_skipped"] += 1
+            add_hard_skip("hard_skip_outside_window", m)
             continue
         if ENABLE_YES_NO_ONLY and not is_yes_no_market(m):
-            stats["discover_hard_skipped"] += 1
+            add_hard_skip("hard_skip_not_yes_no", m)
             continue
-        if market_liquidity(m) < DISCOVER_MIN_LIQUIDITY and market_volume(m) < DISCOVER_MIN_VOLUME:
-            stats["discover_hard_skipped"] += 1
+        min_liq = DISCOVER_MIN_LIQUIDITY * (0.5 if sports_like else 1.0)
+        min_vol = DISCOVER_MIN_VOLUME * (0.5 if sports_like else 1.0)
+        if market_liquidity(m) < min_liq and market_volume(m) < min_vol:
+            add_hard_skip("hard_skip_low_liq_vol", m)
             continue
         if is_crypto_ladder(m):
-            stats["discover_hard_skipped"] += 1
-            if len(stats["discover_skip_samples"]) < 5:
-                stats["discover_skip_samples"].append({"slug": m.get("slug"), "reason": "hard_skip_crypto_ladder", "question": m.get("question")})
+            add_hard_skip("hard_skip_crypto_ladder", m)
             continue
         if is_ranking_market(m):
-            stats["discover_hard_skipped"] += 1
-            if len(stats["discover_skip_samples"]) < 5:
-                stats["discover_skip_samples"].append({"slug": m.get("slug"), "reason": "hard_skip_ranking_market", "question": m.get("question")})
+            add_hard_skip("hard_skip_ranking_market", m)
             continue
         if is_strike_or_shell(m):
-            stats["discover_hard_skipped"] += 1
-            if len(stats["discover_skip_samples"]) < 5:
-                stats["discover_skip_samples"].append({"slug": m.get("slug"), "reason": "hard_skip_strike_ladder", "question": m.get("question")})
+            add_hard_skip("hard_skip_strike_ladder", m)
             continue
-        if is_non_curated(m):
+        if (not sports_like) and (not curated_like) and is_non_curated(m):
             stats["discover_non_curated_skips"] += 1
+            if len(stats["discover_skip_samples"]) < 8:
+                stats["discover_skip_samples"].append({"slug": m.get("slug"), "reason": "non_curated_skip", "question": m.get("question")})
             continue
         fam = market_family_key(m)
         if fam in family_seen:
             stats["discover_family_skips"] += 1
             continue
         bucket = family_bucket(m)
-        if bucket_counts.get(bucket, 0) >= 6:
+        cap = bucket_caps.get(bucket, 4)
+        if bucket_counts.get(bucket, 0) >= cap:
             stats["discover_bucket_skips"] += 1
             continue
         family_seen.add(fam)

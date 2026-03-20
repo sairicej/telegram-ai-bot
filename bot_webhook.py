@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v13.7-yesno-recognition-fix"
+SCRIPT_VERSION = "v13.8-token-resolution-fix"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -562,17 +562,79 @@ def find_market_by_slug(markets: List[Dict[str, Any]], slug: str) -> Optional[Di
 
 
 def extract_yes_no_tokens(market: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    tokens = market.get("tokens") or []
+    """
+    Resolve YES/NO token ids from messy Gamma payloads without widening beyond YES/NO markets.
+    Tries multiple label fields and multiple token-id fields.
+    """
+    def clean_label(v: Any) -> str:
+        return compact_text(str(v or "")).lower()
+
+    def extract_token_id_from_dict(d: Dict[str, Any]) -> Optional[str]:
+        for key in [
+            "token_id", "tokenId", "id", "asset_id", "assetId",
+            "clobTokenId", "clob_token_id", "outcomeTokenId", "outcome_token_id"
+        ]:
+            val = d.get(key)
+            if val not in (None, ""):
+                return str(val)
+        # Some payloads keep ids in nested token-ish objects
+        for nested_key in ["token", "asset", "clobToken", "clob_token"]:
+            nested = d.get(nested_key)
+            if isinstance(nested, dict):
+                nested_id = extract_token_id_from_dict(nested)
+                if nested_id:
+                    return nested_id
+        return None
+
+    def extract_label_from_dict(d: Dict[str, Any]) -> str:
+        for key in ["outcome", "name", "title", "label", "side"]:
+            val = d.get(key)
+            if val not in (None, ""):
+                return clean_label(val)
+        return ""
+
     yes_token = None
     no_token = None
-    for t in tokens:
-        outcome = compact_text(str(t.get("outcome", ""))).lower()
-        token_id = t.get("token_id") or t.get("tokenId") or t.get("id")
-        if outcome == "yes":
-            yes_token = str(token_id)
-        elif outcome == "no":
-            no_token = str(token_id)
+
+    tokens = market.get("tokens") or []
+    if isinstance(tokens, list):
+        for t in tokens:
+            if isinstance(t, dict):
+                label = extract_label_from_dict(t)
+                token_id = extract_token_id_from_dict(t)
+                if label == "yes" and token_id:
+                    yes_token = token_id
+                elif label == "no" and token_id:
+                    no_token = token_id
+
+    # Fallback: some markets expose parallel clob token id arrays
+    if (not yes_token or not no_token):
+        outcomes = market.get("outcomes")
+        clob_ids = (
+            market.get("clobTokenIds")
+            or market.get("clob_token_ids")
+            or market.get("tokenIds")
+            or market.get("token_ids")
+        )
+        if isinstance(outcomes, str):
+            try:
+                import json
+                parsed = json.loads(outcomes)
+                if isinstance(parsed, list):
+                    outcomes = parsed
+            except Exception:
+                outcomes = [p.strip().strip('"\'') for p in outcomes.strip("[]").split(",") if p.strip()]
+        if isinstance(outcomes, list) and isinstance(clob_ids, list) and len(outcomes) == 2 and len(clob_ids) == 2:
+            labels = [clean_label(x) for x in outcomes]
+            ids = [str(x) for x in clob_ids]
+            for label, token_id in zip(labels, ids):
+                if label == "yes":
+                    yes_token = yes_token or token_id
+                elif label == "no":
+                    no_token = no_token or token_id
+
     return yes_token, no_token
+
 
 
 def normalize_book(book: Dict[str, Any]) -> Dict[str, List[Dict[str, float]]]:
@@ -953,6 +1015,17 @@ def scan_once() -> Dict[str, Any]:
         yes_token, no_token = extract_yes_no_tokens(market)
         if not yes_token or not no_token:
             stats["discover_resolve_failures"] += 1
+            if len(stats.setdefault("resolve_failure_samples", [])) < 5:
+                raw_tokens = market.get("tokens") or []
+                token_sample = raw_tokens[:2] if isinstance(raw_tokens, list) else raw_tokens
+                stats["resolve_failure_samples"].append({
+                    "slug": market.get("slug", ""),
+                    "question": market.get("question", market.get("title", "")),
+                    "yes_token": yes_token,
+                    "no_token": no_token,
+                    "outcomes": market.get("outcomes"),
+                    "token_sample": token_sample,
+                })
             continue
 
         cache_key = slug or market.get("question", "")
@@ -970,6 +1043,15 @@ def scan_once() -> Dict[str, Any]:
             candidate_cache[cache_key] = {"ts": utc_ts(), "yes_book": yes_book, "no_book": no_book}
         if not yes_book or not no_book:
             stats["discover_resolve_failures"] += 1
+            if len(stats.setdefault("book_failure_samples", [])) < 5:
+                stats["book_failure_samples"].append({
+                    "slug": market.get("slug", ""),
+                    "question": market.get("question", market.get("title", "")),
+                    "yes_token": yes_token,
+                    "no_token": no_token,
+                    "yes_book_ok": bool(yes_book),
+                    "no_book_ok": bool(no_book),
+                })
             continue
 
         yes_ok, yes_reason, yes_metrics = preflight_check(market, yes_book)
@@ -1118,6 +1200,8 @@ def format_health_text() -> str:
         f"preflight_reasons={list(last_preflight_reason_counts.get('discover', {}).keys())[:3]}",
         f"near_passes_count={len(last_near_passes.get('discover', []))}",
         f"observation_count={len(last_observation_results)}",
+        f"resolve_failure_samples={len((last_pipeline_stats or {}).get('resolve_failure_samples', []))}",
+        f"book_failure_samples={len((last_pipeline_stats or {}).get('book_failure_samples', []))}",
         f"session_summary={session_summary}",
     ]
     return "\n".join(lines)

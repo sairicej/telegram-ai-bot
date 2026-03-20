@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v12.1-sports-highflow-discovery-fix-async"
+SCRIPT_VERSION = "v13-discovery-admission-debug"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -590,6 +590,8 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "discover_near_passes": [],
         "discover_accept_samples": [],
         "discover_skip_samples": [],
+        "discover_relaxed_admits": 0,
+        "discover_low_flow_candidates": 0,
         "fallback_items": 0,
         "fallback_checked": 0,
         "fallback_kept": 0,
@@ -603,9 +605,8 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "cache_refetched": 0,
     }
     markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
-    selected: List[Dict[str, Any]] = []
-    family_seen = set()
-    bucket_counts: Dict[str, int] = {}
+    primary_pool: List[Dict[str, Any]] = []
+    relaxed_pool: List[Dict[str, Any]] = []
 
     def add_hard_skip(reason: str, market: Dict[str, Any]):
         stats["discover_hard_skipped"] += 1
@@ -613,22 +614,16 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         if len(stats["discover_skip_samples"]) < 8:
             stats["discover_skip_samples"].append({"slug": market.get("slug"), "reason": reason, "question": market.get("question")})
 
-    bucket_caps = {"sports": 18, "macro-policy": 8, "legal-special": 8, "politics-personnel": 8, "other": 4}
-
     for m in markets:
         stats["discover_prelim"] += 1
         sports_like = is_sports_or_highflow_market(m)
         curated_like = is_curated_catalyst_market(m)
+        event_like = sports_like or curated_like
         if not within_short_term(m):
             add_hard_skip("hard_skip_outside_window", m)
             continue
         if ENABLE_YES_NO_ONLY and not is_yes_no_market(m):
             add_hard_skip("hard_skip_not_yes_no", m)
-            continue
-        min_liq = DISCOVER_MIN_LIQUIDITY * (0.5 if sports_like else 1.0)
-        min_vol = DISCOVER_MIN_VOLUME * (0.5 if sports_like else 1.0)
-        if market_liquidity(m) < min_liq and market_volume(m) < min_vol:
-            add_hard_skip("hard_skip_low_liq_vol", m)
             continue
         if is_crypto_ladder(m):
             add_hard_skip("hard_skip_crypto_ladder", m)
@@ -639,32 +634,75 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         if is_strike_or_shell(m):
             add_hard_skip("hard_skip_strike_ladder", m)
             continue
-        if (not sports_like) and (not curated_like) and is_non_curated(m):
+
+        liq = market_liquidity(m)
+        vol = market_volume(m)
+        min_liq = DISCOVER_MIN_LIQUIDITY * (0.35 if sports_like else 0.5 if curated_like else 1.0)
+        min_vol = DISCOVER_MIN_VOLUME * (0.35 if sports_like else 0.5 if curated_like else 1.0)
+        low_flow = (liq < min_liq and vol < min_vol)
+
+        # Only skip weakly-themed markets. Let sports/catalyst names reach preflight even if low-flow.
+        if (not event_like) and is_non_curated(m):
             stats["discover_non_curated_skips"] += 1
             if len(stats["discover_skip_samples"]) < 8:
                 stats["discover_skip_samples"].append({"slug": m.get("slug"), "reason": "non_curated_skip", "question": m.get("question")})
             continue
+
+        m["_priority"] = round(event_priority(m), 3)
+        m["_low_flow"] = low_flow
+        m["_sports_like"] = sports_like
+        m["_curated_like"] = curated_like
+        if low_flow:
+            stats["discover_low_flow_candidates"] += 1
+            relaxed_pool.append(m)
+        else:
+            primary_pool.append(m)
+
+    primary_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
+    relaxed_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
+
+    selected: List[Dict[str, Any]] = []
+    family_seen = set()
+    bucket_counts: Dict[str, int] = {}
+    bucket_caps = {"sports": 36, "macro-policy": 18, "legal-special": 18, "politics-personnel": 18, "other": 10}
+
+    def try_add(m: Dict[str, Any], relaxed: bool = False):
         fam = market_family_key(m)
         if fam in family_seen:
             stats["discover_family_skips"] += 1
-            continue
+            return False
         bucket = family_bucket(m)
-        cap = bucket_caps.get(bucket, 4)
+        cap = bucket_caps.get(bucket, 10)
         if bucket_counts.get(bucket, 0) >= cap:
             stats["discover_bucket_skips"] += 1
-            continue
+            return False
         family_seen.add(fam)
         bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
-        m["_priority"] = round(event_priority(m), 3)
+        if relaxed:
+            stats["discover_relaxed_admits"] += 1
         selected.append(m)
+        return True
 
-    selected.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
-    final_list = selected[:PREFLIGHT_MAX_CANDIDATES]
+    target = PREFLIGHT_MAX_CANDIDATES
+    for m in primary_pool:
+        if len(selected) >= target:
+            break
+        try_add(m, relaxed=False)
+
+    # If the front door is still too narrow, let some low-flow event markets reach preflight.
+    if len(selected) < min(target, 24):
+        for m in relaxed_pool:
+            if len(selected) >= target:
+                break
+            try_add(m, relaxed=True)
+
+    final_list = selected[:target]
     for m in final_list[:5]:
         stats["discover_accept_samples"].append({
             "slug": m.get("slug"),
             "question": m.get("question"),
             "priority": m.get("_priority", 1.0),
+            "relaxed": bool(m.get("_low_flow", False)),
         })
     return final_list, stats
 

@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v17.1-near-endtime-timing-pass"
+SCRIPT_VERSION = "v17.2-hydrate-weak-timing"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -424,16 +424,25 @@ def event_proximity_priority(market: Dict[str, Any]) -> float:
     return -0.5
 
 
-def has_near_end_time(market: Dict[str, Any]) -> bool:
+def has_near_end_time(market: Dict[str, Any], hydrate_if_missing: bool = False) -> bool:
     end_dt, _ = get_market_end_dt(market)
+    hydrated_market = market
+
+    if end_dt is None and hydrate_if_missing:
+        detail = fetch_market_detail(market)
+        if isinstance(detail, dict) and detail:
+            hydrated_market = merge_market_records(market, detail)
+            end_dt, _ = get_market_end_dt(hydrated_market)
+
     if end_dt is None:
         return False
+
     delta_hours = (end_dt - now_utc()).total_seconds() / 3600.0
     if delta_hours < 0:
         return False
     if delta_hours <= 72:
         return True
-    if delta_hours <= 7 * 24 and catalyst_signal_score(market) >= 1.5:
+    if delta_hours <= 7 * 24 and catalyst_signal_score(hydrated_market) >= 1.5:
         return True
     return False
 
@@ -1183,6 +1192,7 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "bad_family_skips": 0,
         "weak_timing_skips": 0,
         "low_catalyst_skips": 0,
+        "timing_hydration_checks": 0,
     }
     markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
     primary_pool: List[Dict[str, Any]] = []
@@ -1239,6 +1249,9 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         strong_time = has_strong_time_signal(m)
         near_end_time = has_near_end_time(m)
         catalyst_score = catalyst_signal_score(m)
+        if not strong_time and not near_end_time:
+            stats["timing_hydration_checks"] += 1
+            near_end_time = has_near_end_time(m, hydrate_if_missing=True)
         if not strong_time and not near_end_time:
             stats["weak_timing_skips"] += 1
             if len(stats["discover_skip_samples"]) < 8:
@@ -1668,6 +1681,7 @@ def format_health_text() -> str:
         f"bad_family_skips={(last_pipeline_stats or {}).get('bad_family_skips', 0)}",
         f"weak_timing_skips={(last_pipeline_stats or {}).get('weak_timing_skips', 0)}",
         f"low_catalyst_skips={(last_pipeline_stats or {}).get('low_catalyst_skips', 0)}",
+        f"timing_hydration_checks={(last_pipeline_stats or {}).get('timing_hydration_checks', 0)}",
         f"unresolved_slug_count={len(unresolved_slug_failures)}",
         f"top_unresolved_families={sorted(unresolved_family_failures.items(), key=lambda x: x[1], reverse=True)[:3]}",
         f"session_summary={session_summary}",
@@ -1714,6 +1728,7 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"bad_family_skips={pipeline.get('bad_family_skips', 0)} | "
             f"weak_timing_skips={pipeline.get('weak_timing_skips', 0)} | "
             f"low_catalyst_skips={pipeline.get('low_catalyst_skips', 0)} | "
+            f"timing_hydration_checks={pipeline.get('timing_hydration_checks', 0)} | "
             f"adaptive_intake_level={pipeline.get('adaptive_intake_level', 0)} | "
             f"discover_checked={pipeline.get('discover_checked', 0)} | "
             f"discover_kept={pipeline.get('discover_kept', 0)} | "

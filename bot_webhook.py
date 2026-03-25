@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v17.3-targeted-first-discovery"
+SCRIPT_VERSION = "v18-query-seeded-discovery"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -52,6 +52,10 @@ DISCOVER_KEYWORDS = os.getenv(
     "DISCOVER_KEYWORDS",
     "sports,game,match,final,win,series,playoff,tournament,championship,opening day,tonight,tomorrow,this week,hearing,ruling,vote,approval,cpi,ppi,fomc,fed,rates,tariff,shutdown,ftx,payout,sentencing"
 )
+DISCOVERY_QUERY_TERMS = [x.strip() for x in os.getenv(
+    "DISCOVERY_QUERY_TERMS",
+    "cpi,ppi,fomc,fed,vote,ruling,approval,hearing,deadline,etf,tariff,shutdown,bitcoin,ethereum,solana"
+).split(",") if x.strip()]
 
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "10000"))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.05"))
@@ -755,6 +759,51 @@ def deep_find_yes_no_tokens(obj: Any) -> Tuple[Optional[str], Optional[str]]:
     return yes_token, no_token
 
 
+def fetch_gamma_markets_by_query(term: str, limit: int) -> List[Dict[str, Any]]:
+    urls = [
+        (f"{GAMMA_BASE}/markets", {"query": term, "limit": limit}),
+        (f"{GAMMA_BASE}/markets", {"search": term, "limit": limit}),
+        (f"{GAMMA_BASE}/markets", {"q": term, "limit": limit}),
+    ]
+    for url, params in urls:
+        try:
+            data = fetch_json(url, params=params)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for k in ["markets", "data"]:
+                    if isinstance(data.get(k), list):
+                        return data[k]
+        except Exception:
+            continue
+    return []
+
+
+def dedupe_markets(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for m in markets:
+        slug = str(m.get("slug") or "").strip().lower()
+        key = slug or str(m.get("id") or m.get("market_id") or m.get("marketId") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(m)
+    return out
+
+
+def fetch_targeted_discovery_markets(total_limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    per_term = max(8, min(25, total_limit // max(1, len(DISCOVERY_QUERY_TERMS))))
+    pooled: List[Dict[str, Any]] = []
+    hit_counts: Dict[str, int] = {}
+    for term in DISCOVERY_QUERY_TERMS:
+        rows = fetch_gamma_markets_by_query(term, per_term)
+        hit_counts[term] = len(rows)
+        pooled.extend(rows)
+    deduped = dedupe_markets(pooled)
+    return deduped[:total_limit], hit_counts
+
+
 def fetch_manual_slugs() -> List[str]:
     if not MARKETS_URL:
         return []
@@ -1211,13 +1260,21 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "targeted_prelim": 0,
         "targeted_kept": 0,
         "broad_backup_used": 0,
+        "query_seed_count": 0,
+        "query_hit_counts": {},
     }
-    markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
+    query_hit_counts: Dict[str, int] = {}
+    broad_markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
+    targeted_seed_markets, query_hit_counts = fetch_targeted_discovery_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else ([], {})
+    markets = dedupe_markets(targeted_seed_markets + broad_markets)
     targeted_primary_pool: List[Dict[str, Any]] = []
     targeted_relaxed_pool: List[Dict[str, Any]] = []
     broad_primary_pool: List[Dict[str, Any]] = []
     broad_relaxed_pool: List[Dict[str, Any]] = []
     failopen_pool: List[Dict[str, Any]] = []
+
+    stats["query_seed_count"] = len(targeted_seed_markets)
+    stats["query_hit_counts"] = query_hit_counts.copy()
 
     def add_hard_skip(reason: str, market: Dict[str, Any]):
         stats["discover_hard_skipped"] += 1
@@ -1341,7 +1398,14 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 stats["discover_skip_samples"].append({"slug": m.get("slug"), "reason": "non_curated_skip", "question": m.get("question")})
             continue
 
-        is_targeted = is_targeted_high_signal_market(m)
+        query_seeded = False
+        txt = full_market_text(m)
+        for term in DISCOVERY_QUERY_TERMS:
+            if term.lower() in txt:
+                query_seeded = True
+                break
+
+        is_targeted = is_targeted_high_signal_market(m) or query_seeded
         if is_targeted:
             stats["targeted_prelim"] += 1
 
@@ -1738,6 +1802,8 @@ def format_health_text() -> str:
         f"targeted_prelim={(last_pipeline_stats or {}).get('targeted_prelim', 0)}",
         f"targeted_kept={(last_pipeline_stats or {}).get('targeted_kept', 0)}",
         f"broad_backup_used={(last_pipeline_stats or {}).get('broad_backup_used', 0)}",
+        f"query_seed_count={(last_pipeline_stats or {}).get('query_seed_count', 0)}",
+        f"query_hit_counts={(last_pipeline_stats or {}).get('query_hit_counts', {})}",
         f"unresolved_slug_count={len(unresolved_slug_failures)}",
         f"top_unresolved_families={sorted(unresolved_family_failures.items(), key=lambda x: x[1], reverse=True)[:3]}",
         f"session_summary={session_summary}",
@@ -1788,6 +1854,7 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"targeted_prelim={pipeline.get('targeted_prelim', 0)} | "
             f"targeted_kept={pipeline.get('targeted_kept', 0)} | "
             f"broad_backup_used={pipeline.get('broad_backup_used', 0)} | "
+            f"query_seed_count={pipeline.get('query_seed_count', 0)} | "
             f"adaptive_intake_level={pipeline.get('adaptive_intake_level', 0)} | "
             f"discover_checked={pipeline.get('discover_checked', 0)} | "
             f"discover_kept={pipeline.get('discover_kept', 0)} | "
@@ -1874,6 +1941,9 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"Recurring unresolved slugs: {repeated_unresolved if repeated_unresolved else 'none'}")
     lines.append(f"Recurring unresolved families: {top_fams if top_fams else 'none'}")
+    query_hits = pipeline.get("query_hit_counts", {}) or {}
+    top_query_hits = sorted(query_hits.items(), key=lambda x: x[1], reverse=True)[:5]
+    lines.append(f"Top discovery query hits: {top_query_hits if top_query_hits else 'none'}")
 
     lines.extend([
         "",

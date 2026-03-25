@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v18.2-events-tags-orderbook"
+SCRIPT_VERSION = "v19-staged-exploration-engine"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -88,6 +88,10 @@ TARGET_MIN_TEST_POSITION_USD = float(os.getenv("TARGET_MIN_TEST_POSITION_USD", "
 TARGET_MAX_TEST_POSITION_USD = float(os.getenv("TARGET_MAX_TEST_POSITION_USD", "5"))
 TEST_MARKET_SLUG = os.getenv("TEST_MARKET_SLUG", "")
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "3"))
+FORCE_EVAL_COUNT = int(os.getenv("FORCE_EVAL_COUNT", "3"))
+EXPLORATION_FILL_CONFIDENCE = float(os.getenv("EXPLORATION_FILL_CONFIDENCE", "0.25"))
+EXPLORATION_MAX_SPREAD = float(os.getenv("EXPLORATION_MAX_SPREAD", "0.22"))
+EXPLORATION_MIN_BID = float(os.getenv("EXPLORATION_MIN_BID", "0.003"))
 
 # =========================================================
 # Runtime state
@@ -113,6 +117,7 @@ alert_dedupe: Dict[str, float] = {}
 candidate_cache: Dict[str, Dict[str, Any]] = {}
 unresolved_slug_failures: Dict[str, int] = {}
 unresolved_family_failures: Dict[str, int] = {}
+market_lifecycle: Dict[str, Dict[str, Any]] = {}
 background_started = False
 
 # =========================================================
@@ -1227,6 +1232,54 @@ def is_near_pass_metrics(metrics: Dict[str, Any]) -> bool:
     return spread_close and fill_close and bid_close
 
 
+def classify_market_stage(metrics: Dict[str, Any]) -> str:
+    bid = metrics.get("best_bid", 0.0)
+    ask = metrics.get("best_ask", 0.0)
+    spread = metrics.get("spread", 0.0)
+    fill = metrics.get("fill_confidence", 0.0)
+    depth = metrics.get("bid_depth", 0.0) + metrics.get("ask_depth", 0.0)
+    if bid <= 0 or ask <= 0:
+        return "structural"
+    if dead_extreme_book(bid, ask):
+        return "structural"
+    if bid >= MIN_BID and ask <= MAX_ASK and spread <= MAX_SPREAD and fill >= MIN_FILL_CONFIDENCE:
+        return "tradable"
+    if bid >= EXPLORATION_MIN_BID and spread <= EXPLORATION_MAX_SPREAD and fill >= EXPLORATION_FILL_CONFIDENCE and depth >= 6:
+        return "forming"
+    return "staged"
+
+
+def raw_opportunity_score(metrics: Dict[str, Any], market: Dict[str, Any]) -> float:
+    bid = metrics.get("best_bid", 0.0)
+    ask = metrics.get("best_ask", 0.0)
+    spread = metrics.get("spread", 0.0)
+    fill = metrics.get("fill_confidence", 0.0)
+    imbalance = max(0.0, metrics.get("imbalance", 0.0))
+    pressure = max(0.0, metrics.get("pressure", 0.0))
+    proximity = max(0.0, event_proximity_priority(market))
+    catalyst = max(0.0, catalyst_signal_score(market))
+    score = (
+        0.18 * min(1.0, bid / max(EXPLORATION_MIN_BID, 0.0001)) +
+        0.18 * max(0.0, 1.0 - (spread / max(EXPLORATION_MAX_SPREAD, 0.0001))) +
+        0.18 * fill +
+        0.16 * pressure +
+        0.12 * imbalance +
+        0.10 * min(1.0, proximity) +
+        0.08 * min(1.0, catalyst / 2.0)
+    )
+    return round(max(0.0, min(1.0, score)), 4)
+
+
+def should_force_evaluate(metrics: Dict[str, Any], market: Dict[str, Any]) -> bool:
+    if metrics.get("best_bid", 0.0) <= 0 or metrics.get("best_ask", 0.0) <= 0:
+        return False
+    if dead_extreme_book(metrics.get("best_bid", 0.0), metrics.get("best_ask", 0.0)):
+        return False
+    if metrics.get("spread", 0.0) > 0.30:
+        return False
+    return raw_opportunity_score(metrics, market) >= 0.38
+
+
 def dead_extreme_book(best_bid: float, best_ask: float) -> bool:
     return best_bid <= 0.002 and best_ask >= 0.998
 
@@ -1359,6 +1412,28 @@ def allow_send(key: str) -> bool:
         return False
     alert_dedupe[key] = now
     return True
+
+def update_market_lifecycle(slug: str, market: Dict[str, Any], metrics: Dict[str, Any], stage: str) -> Dict[str, Any]:
+    prev = market_lifecycle.get(slug, {})
+    seen = int(prev.get("seen", 0)) + 1
+    prev_fill = float(prev.get("fill_confidence", 0.0))
+    prev_spread = float(prev.get("spread", 1.0))
+    improvement = 0
+    if metrics.get("fill_confidence", 0.0) > prev_fill:
+        improvement += 1
+    if metrics.get("spread", 1.0) < prev_spread:
+        improvement += 1
+    record = {
+        "seen": seen,
+        "fill_confidence": metrics.get("fill_confidence", 0.0),
+        "spread": metrics.get("spread", 1.0),
+        "stage": stage,
+        "improvement": improvement,
+        "last_seen": utc_ts(),
+    }
+    market_lifecycle[slug] = record
+    return record
+
 
 # =========================================================
 # Discovery
@@ -1691,6 +1766,8 @@ def scan_once() -> Dict[str, Any]:
     candidates, stats = discover_candidates()
     observations: List[Dict[str, Any]] = []
     structural_observations: List[Dict[str, Any]] = []
+    staged_candidates: List[Dict[str, Any]] = []
+    forced_eval_candidates: List[Dict[str, Any]] = []
     prod_results: List[Dict[str, Any]] = []
     near_passes: List[Dict[str, Any]] = []
     reason_counts: Dict[str, int] = {}
@@ -1774,14 +1851,25 @@ def scan_once() -> Dict[str, Any]:
         yes_ok, yes_reason, yes_metrics = preflight_check(market, yes_book)
         no_ok, no_reason, no_metrics = preflight_check(market, no_book)
 
+        yes_stage = classify_market_stage(yes_metrics)
+        no_stage = classify_market_stage(no_metrics)
+        yes_raw_score = raw_opportunity_score(yes_metrics, market)
+        no_raw_score = raw_opportunity_score(no_metrics, market)
+
         # Observation lane before production hard pass, but still clean.
         obs_yes = observation_candidate(yes_metrics, market, lane="forming")
         obs_no = observation_candidate(no_metrics, market, lane="forming")
         if obs_yes:
             obs_yes["side"] = "YES"
+            obs_yes["stage"] = yes_stage
+            obs_yes["raw_score"] = yes_raw_score
+            obs_yes["lifecycle"] = update_market_lifecycle(slug or market.get("question", ""), market, yes_metrics, yes_stage)
             observations.append(obs_yes)
         if obs_no:
             obs_no["side"] = "NO"
+            obs_no["stage"] = no_stage
+            obs_no["raw_score"] = no_raw_score
+            obs_no["lifecycle"] = update_market_lifecycle(slug or market.get("question", ""), market, no_metrics, no_stage)
             observations.append(obs_no)
 
         if not yes_ok and not no_ok:
@@ -1811,7 +1899,25 @@ def scan_once() -> Dict[str, Any]:
                 obs = observation_candidate(m, market, lane="near_pass")
                 if obs:
                     obs["side"] = side_name
+                    obs["stage"] = classify_market_stage(m)
+                    obs["raw_score"] = raw_opportunity_score(m, market)
+                    obs["lifecycle"] = update_market_lifecycle(slug or market.get("question", ""), market, m, obs["stage"])
                     observations.append(obs)
+                if len(staged_candidates) < 5 and should_force_evaluate(m, market):
+                    staged_candidates.append({
+                        "slug": slug,
+                        "question": market.get("question"),
+                        "side": side_name,
+                        "stage": classify_market_stage(m),
+                        "raw_score": raw_opportunity_score(m, market),
+                        "reason": classify_trade_failure(m),
+                        "bid": m["best_bid"],
+                        "ask": m["best_ask"],
+                        "spread": m["spread"],
+                        "fill_confidence": m["fill_confidence"],
+                        "imbalance": m.get("imbalance", 0.0),
+                        "pressure": m.get("pressure", 0.0),
+                    })
             continue
 
         side, score, chosen_metrics = production_side_scores(yes_metrics, no_metrics)
@@ -1833,7 +1939,25 @@ def scan_once() -> Dict[str, Any]:
             obs = observation_candidate(chosen_metrics, market, lane="near_pass")
             if obs:
                 obs["side"] = side
+                obs["stage"] = classify_market_stage(chosen_metrics)
+                obs["raw_score"] = raw_opportunity_score(chosen_metrics, market)
+                obs["lifecycle"] = update_market_lifecycle(slug or market.get("question", ""), market, chosen_metrics, obs["stage"])
                 observations.append(obs)
+            if len(staged_candidates) < 5 and should_force_evaluate(chosen_metrics, market):
+                staged_candidates.append({
+                    "slug": slug,
+                    "question": market.get("question"),
+                    "side": side,
+                    "stage": classify_market_stage(chosen_metrics),
+                    "raw_score": raw_opportunity_score(chosen_metrics, market),
+                    "reason": classify_trade_failure(chosen_metrics),
+                    "bid": chosen_metrics["best_bid"],
+                    "ask": chosen_metrics["best_ask"],
+                    "spread": chosen_metrics["spread"],
+                    "fill_confidence": chosen_metrics["fill_confidence"],
+                    "imbalance": chosen_metrics.get("imbalance", 0.0),
+                    "pressure": chosen_metrics.get("pressure", 0.0),
+                })
             continue
         category = "ALERT" if score >= MICRO_ALERT_SCORE else ("WATCH" if score >= MICRO_WATCH_SCORE else "SKIP")
         if category == "SKIP":
@@ -1852,6 +1976,10 @@ def scan_once() -> Dict[str, Any]:
             "category": category,
         })
         stats["discover_kept"] += 1
+
+    if not prod_results and staged_candidates:
+        staged_candidates.sort(key=lambda x: x["raw_score"], reverse=True)
+        forced_eval_candidates = staged_candidates[:FORCE_EVAL_COUNT]
 
     prod_results.sort(key=lambda x: x["score"], reverse=True)
     observations.extend(structural_observations)
@@ -1884,6 +2012,8 @@ def scan_once() -> Dict[str, Any]:
         if not session_summary["best_forming"] or best["score"] > session_summary["best_forming"].get("score", -1):
             session_summary["best_forming"] = best
 
+    stats["staged_candidates"] = len(staged_candidates)
+    stats["forced_eval_count"] = len(forced_eval_candidates)
     last_pipeline_stats = stats.copy()
     last_pipeline_stats["discover_preflight_reason_counts"] = reason_counts.copy()
     last_pipeline_stats["structural_reason_counts"] = structural_reason_counts.copy()
@@ -1898,6 +2028,7 @@ def scan_once() -> Dict[str, Any]:
         "watches": [x for x in prod_results if x["category"] == "WATCH"][:MAX_ALERTS_PER_SCAN],
         "observations": final_observations,
         "near_passes": near_passes[:5],
+        "staged_candidates": forced_eval_candidates[:5],
         "reason_counts": reason_counts,
         "structural_reason_counts": structural_reason_counts,
     }
@@ -1968,6 +2099,8 @@ def format_health_text() -> str:
         f"events_seeded_candidates={(last_pipeline_stats or {}).get('events_seeded_candidates', 0)}",
         f"tag_seeded_candidates={(last_pipeline_stats or {}).get('tag_seeded_candidates', 0)}",
         f"orderbook_disabled_skips={(last_pipeline_stats or {}).get('orderbook_disabled_skips', 0)}",
+        f"staged_candidates={(last_pipeline_stats or {}).get('staged_candidates', 0)}",
+        f"forced_eval_count={(last_pipeline_stats or {}).get('forced_eval_count', 0)}",
         f"local_target_term_hits={(last_pipeline_stats or {}).get('local_target_term_hits', {})}",
         f"unresolved_slug_count={len(unresolved_slug_failures)}",
         f"top_unresolved_families={sorted(unresolved_family_failures.items(), key=lambda x: x[1], reverse=True)[:3]}",
@@ -1983,6 +2116,7 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
     observations = scan["observations"]
     reason_counts = scan["reason_counts"]
     near_passes = scan["near_passes"]
+    staged_candidates = scan.get("staged_candidates", []) or []
     structural_reason_counts = scan.get("structural_reason_counts", {}) or {}
 
     top_reason = "none"
@@ -2023,6 +2157,8 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"events_seeded_candidates={pipeline.get('events_seeded_candidates', 0)} | "
             f"tag_seeded_candidates={pipeline.get('tag_seeded_candidates', 0)} | "
             f"orderbook_disabled_skips={pipeline.get('orderbook_disabled_skips', 0)} | "
+            f"staged_candidates={pipeline.get('staged_candidates', 0)} | "
+            f"forced_eval_count={pipeline.get('forced_eval_count', 0)} | "
             f"adaptive_intake_level={pipeline.get('adaptive_intake_level', 0)} | "
             f"discover_checked={pipeline.get('discover_checked', 0)} | "
             f"discover_kept={pipeline.get('discover_kept', 0)} | "
@@ -2078,6 +2214,18 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
                     f"yes_book_ok={s.get('yes_book_ok')} no_book_ok={s.get('no_book_ok')}",
                 ])
 
+    if staged_candidates:
+        lines.append("")
+        lines.append("Forced evaluation candidates:")
+        for s in staged_candidates[:5]:
+            lines.extend([
+                f"{s['question']}",
+                f"slug={s['slug']}",
+                f"side={s.get('side', '?')} stage={s.get('stage', 'staged')} raw_score={s.get('raw_score', 0.0)}",
+                f"bid={s['bid']} ask={s['ask']} spread={s['spread']} fill={s['fill_confidence']} imbalance={s.get('imbalance', 0.0)} pressure={s.get('pressure', 0.0)}",
+                f"reason={s['reason']}",
+            ])
+
     if alerts or watches:
         lines.append("")
         lines.append("Tradable now:")
@@ -2095,9 +2243,9 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
         for o in observations:
             lines.extend([
                 f"FORMING | {o['question']}",
-                f"slug={o['slug']} side={o.get('side', '?')} lane={o.get('lane', 'forming')} score={o['score']} trend={o['trend']}",
+                f"slug={o['slug']} side={o.get('side', '?')} lane={o.get('lane', 'forming')} stage={o.get('stage', 'n/a')} score={o['score']} raw={o.get('raw_score', 0.0)} trend={o['trend']}",
                 f"bid={o.get('bid', 0.0)} ask={o.get('ask', 0.0)} spread={o.get('spread', 0.0)} imbalance={o.get('imbalance', 0.0)} pressure={o.get('pressure', 0.0)}",
-                f"bid_depth={o.get('bid_depth', 0.0)} ask_depth={o.get('ask_depth', 0.0)}",
+                f"bid_depth={o.get('bid_depth', 0.0)} ask_depth={o.get('ask_depth', 0.0)} seen={o.get('lifecycle', {}).get('seen', 0)} improve={o.get('lifecycle', {}).get('improvement', 0)}",
                 f"interesting={o['catalyst']} | not_ready={o['reason']}",
                 "",
             ])

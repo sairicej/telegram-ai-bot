@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v14.1-force-hydration-on-missing-tokens"
+SCRIPT_VERSION = "v15-adaptive-intake-observation"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -772,6 +772,48 @@ def compute_fill_confidence(best_bid: float, best_ask: float, bid_depth: float, 
     return round(max(0.0, min(1.0, 0.6 * depth_component + 0.4 * spread_penalty)), 3)
 
 
+def compute_book_imbalance(bid_depth: float, ask_depth: float) -> float:
+    total = max(0.0001, bid_depth + ask_depth)
+    return round((bid_depth - ask_depth) / total, 4)
+
+
+def compute_pressure_score(best_bid: float, best_ask: float, bid_depth: float, ask_depth: float) -> float:
+    if best_bid <= 0 or best_ask <= 0:
+        return 0.0
+    spread = max(0.0001, best_ask - best_bid)
+    imbalance = compute_book_imbalance(bid_depth, ask_depth)
+    tightness = max(0.0, 1.0 - (spread / max(PREFLIGHT_MAX_SPREAD, 0.0001)))
+    raw = 0.55 * max(0.0, imbalance) + 0.45 * tightness
+    return round(max(0.0, min(1.0, raw)), 4)
+
+
+def classify_trade_failure(metrics: Dict[str, Any]) -> str:
+    if metrics["best_bid"] < MIN_BID:
+        return "bid below production floor"
+    if metrics["best_ask"] > MAX_ASK:
+        return "ask above production cap"
+    if metrics["spread"] > MAX_SPREAD:
+        return "spread too wide for production"
+    if metrics["fill_confidence"] < MIN_FILL_CONFIDENCE:
+        return "fill confidence too weak"
+    if metrics["midpoint"] < MID_PRICE_MIN or metrics["midpoint"] > MID_PRICE_MAX:
+        return "midpoint outside production band"
+    return "not ready yet"
+
+
+def is_near_pass_metrics(metrics: Dict[str, Any]) -> bool:
+    if metrics["best_bid"] <= 0 or metrics["best_ask"] <= 0:
+        return False
+    if dead_extreme_book(metrics["best_bid"], metrics["best_ask"]):
+        return False
+    if metrics["spread"] > max(0.25, MAX_SPREAD * 3.5):
+        return False
+    spread_close = metrics["spread"] <= max(MAX_SPREAD * 1.5, 0.08)
+    fill_close = metrics["fill_confidence"] >= max(0.30, MIN_FILL_CONFIDENCE - 0.15)
+    bid_close = metrics["best_bid"] >= max(0.005, MIN_BID * 0.65)
+    return spread_close and fill_close and bid_close
+
+
 def dead_extreme_book(best_bid: float, best_ask: float) -> bool:
     return best_bid <= 0.002 and best_ask >= 0.998
 
@@ -789,6 +831,8 @@ def preflight_check(market: Dict[str, Any], book: Dict[str, Any]) -> Tuple[bool,
         "bid_depth": round(bid_depth, 2),
         "ask_depth": round(ask_depth, 2),
         "fill_confidence": fill_conf,
+        "imbalance": compute_book_imbalance(bid_depth, ask_depth),
+        "pressure": compute_pressure_score(best_bid, best_ask, bid_depth, ask_depth),
     }
     if best_bid <= 0 and best_ask <= 0:
         return False, "preflight_no_bid", metrics
@@ -807,7 +851,7 @@ def preflight_check(market: Dict[str, Any], book: Dict[str, Any]) -> Tuple[bool,
     return True, "ok", metrics
 
 
-def observation_candidate(metrics: Dict[str, Any], market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def observation_candidate(metrics: Dict[str, Any], market: Dict[str, Any], lane: str = "forming") -> Optional[Dict[str, Any]]:
     bid = metrics["best_bid"]
     ask = metrics["best_ask"]
     spread = metrics["spread"]
@@ -821,18 +865,7 @@ def observation_candidate(metrics: Dict[str, Any], market: Dict[str, Any]) -> Op
         return None
     if metrics["bid_depth"] + metrics["ask_depth"] < 8:
         return None
-    blockers = []
-    if bid < MIN_BID:
-        blockers.append("bid below production floor")
-    if ask > MAX_ASK:
-        blockers.append("ask above production cap")
-    if spread > MAX_SPREAD:
-        blockers.append("spread too wide for production")
-    if metrics["fill_confidence"] < MIN_FILL_CONFIDENCE:
-        blockers.append("fill confidence too weak")
-    if not blockers:
-        return None
-    reason = blockers[0]
+    reason = classify_trade_failure(metrics)
     txt = full_market_text(market)
     catalyst = "event clock"
     if any(x in txt for x in ["game", "match", "playoff", "series", "championship"]):
@@ -841,7 +874,14 @@ def observation_candidate(metrics: Dict[str, Any], market: Dict[str, Any]) -> Op
         catalyst = "decision window"
     elif any(x in txt for x in ["ftx", "bankruptcy", "payout", "sentencing"]):
         catalyst = "legal milestone"
-    score = round(0.45 * min(1.0, bid / max(MIN_BID, 0.0001)) + 0.30 * max(0.0, 1 - spread / 0.25) + 0.25 * metrics["fill_confidence"], 3)
+    score = round(
+        0.28 * min(1.0, bid / max(MIN_BID, 0.0001)) +
+        0.22 * max(0.0, 1 - spread / 0.25) +
+        0.20 * metrics["fill_confidence"] +
+        0.15 * max(0.0, metrics.get("pressure", 0.0)) +
+        0.15 * max(0.0, metrics.get("imbalance", 0.0)),
+        3
+    )
     return {
         "slug": market.get("slug", ""),
         "question": market.get("question", market.get("title", "")),
@@ -850,8 +890,11 @@ def observation_candidate(metrics: Dict[str, Any], market: Dict[str, Any]) -> Op
         "spread": spread,
         "bid_depth": metrics["bid_depth"],
         "ask_depth": metrics["ask_depth"],
+        "imbalance": metrics.get("imbalance", 0.0),
+        "pressure": metrics.get("pressure", 0.0),
         "reason": reason,
         "catalyst": catalyst,
+        "lane": lane,
         "score": score,
     }
 
@@ -865,7 +908,15 @@ def production_side_scores(metrics_yes: Dict[str, Any], metrics_no: Dict[str, An
         fill = m["fill_confidence"]
         if bid < MIN_BID or ask > MAX_ASK or spread > MAX_SPREAD or fill < MIN_FILL_CONFIDENCE or m["midpoint"] < MID_PRICE_MIN or m["midpoint"] > MID_PRICE_MAX:
             return -1.0
-        return round(0.35 * fill + 0.25 * min(1.0, depth / 25.0) + 0.20 * max(0.0, 1 - spread / max(MAX_SPREAD, 0.0001)) + 0.20 * min(1.0, bid / max(MIN_BID, 0.0001)), 4)
+        return round(
+            0.28 * fill +
+            0.22 * min(1.0, depth / 25.0) +
+            0.18 * max(0.0, 1 - spread / max(MAX_SPREAD, 0.0001)) +
+            0.12 * min(1.0, bid / max(MIN_BID, 0.0001)) +
+            0.10 * max(0.0, m.get("pressure", 0.0)) +
+            0.10 * max(0.0, m.get("imbalance", 0.0)),
+            4
+        )
     yes_score = side_score(metrics_yes)
     no_score = side_score(metrics_no)
     if yes_score >= no_score:
@@ -1025,7 +1076,24 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     selected: List[Dict[str, Any]] = []
     family_seen = set()
     bucket_counts: Dict[str, int] = {}
-    bucket_caps = {"sports": 36, "macro-policy": 18, "legal-special": 18, "politics-personnel": 18, "other": 10}
+    adaptive_level = 0
+    bucket_multiplier = 1.0
+    target_bonus = 0
+    if empty_scan_streak >= 10:
+        adaptive_level = 1
+        bucket_multiplier = 1.35
+        target_bonus = 12
+    if empty_scan_streak >= 20:
+        adaptive_level = 2
+        bucket_multiplier = 1.75
+        target_bonus = 24
+    if empty_scan_streak >= 35:
+        adaptive_level = 3
+        bucket_multiplier = 2.4
+        target_bonus = 36
+    stats["adaptive_intake_level"] = adaptive_level
+    base_bucket_caps = {"sports": 36, "macro-policy": 18, "legal-special": 18, "politics-personnel": 18, "other": 10}
+    bucket_caps = {k: max(v, int(round(v * bucket_multiplier))) for k, v in base_bucket_caps.items()}
 
     def try_add(m: Dict[str, Any], relaxed: bool = False):
         fam = market_family_key(m)
@@ -1044,7 +1112,7 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         selected.append(m)
         return True
 
-    target = PREFLIGHT_MAX_CANDIDATES
+    target = min(DISCOVER_LIMIT, PREFLIGHT_MAX_CANDIDATES + target_bonus)
     for m in primary_pool:
         if len(selected) >= target:
             break
@@ -1082,9 +1150,11 @@ def scan_once() -> Dict[str, Any]:
     global last_pipeline_stats, last_preflight_reason_counts, last_near_passes, last_observation_results
     candidates, stats = discover_candidates()
     observations: List[Dict[str, Any]] = []
+    structural_observations: List[Dict[str, Any]] = []
     prod_results: List[Dict[str, Any]] = []
     near_passes: List[Dict[str, Any]] = []
     reason_counts: Dict[str, int] = {}
+    structural_reason_counts: Dict[str, int] = {}
 
     for market in candidates:
         stats["discover_checked"] += 1
@@ -1098,6 +1168,15 @@ def scan_once() -> Dict[str, Any]:
         yes_token, no_token = extract_yes_no_tokens(hydrated_market)
         if not yes_token or not no_token:
             stats["discover_resolve_failures"] += 1
+            structural_reason_counts["missing_token_ids"] = structural_reason_counts.get("missing_token_ids", 0) + 1
+            structural_observations.append({
+                "slug": hydrated_market.get("slug", ""),
+                "question": hydrated_market.get("question", hydrated_market.get("title", "")),
+                "lane": "structural",
+                "reason": "missing token ids",
+                "catalyst": "market plumbing",
+                "score": 0.2,
+            })
             if len(stats.setdefault("resolve_failure_samples", [])) < 5:
                 raw_tokens = hydrated_market.get("tokens") or []
                 token_sample = raw_tokens[:2] if isinstance(raw_tokens, list) else raw_tokens
@@ -1128,6 +1207,15 @@ def scan_once() -> Dict[str, Any]:
             candidate_cache[cache_key] = {"ts": utc_ts(), "yes_book": yes_book, "no_book": no_book}
         if not yes_book or not no_book:
             stats["discover_resolve_failures"] += 1
+            structural_reason_counts["book_lookup_failed"] = structural_reason_counts.get("book_lookup_failed", 0) + 1
+            structural_observations.append({
+                "slug": market.get("slug", ""),
+                "question": market.get("question", market.get("title", "")),
+                "lane": "structural",
+                "reason": "book lookup failed",
+                "catalyst": "market plumbing",
+                "score": 0.25,
+            })
             if len(stats.setdefault("book_failure_samples", [])) < 5:
                 stats["book_failure_samples"].append({
                     "slug": market.get("slug", ""),
@@ -1143,8 +1231,8 @@ def scan_once() -> Dict[str, Any]:
         no_ok, no_reason, no_metrics = preflight_check(market, no_book)
 
         # Observation lane before production hard pass, but still clean.
-        obs_yes = observation_candidate(yes_metrics, market)
-        obs_no = observation_candidate(no_metrics, market)
+        obs_yes = observation_candidate(yes_metrics, market, lane="forming")
+        obs_no = observation_candidate(no_metrics, market, lane="forming")
         if obs_yes:
             obs_yes["side"] = "YES"
             observations.append(obs_yes)
@@ -1154,26 +1242,54 @@ def scan_once() -> Dict[str, Any]:
 
         if not yes_ok and not no_ok:
             stats["discover_preflight_failures"] += 1
-            # use worst/common reason from yes side first, then no side
             final_reason = yes_reason if yes_reason != "ok" else no_reason
             reason_counts[final_reason] = reason_counts.get(final_reason, 0) + 1
-            if len(near_passes) < 5 and final_reason not in ["preflight_dead_extreme_book", "preflight_no_bid", "preflight_no_ask"]:
-                m = yes_metrics if yes_reason != "ok" else no_metrics
-                near_passes.append({
-                    "slug": slug,
-                    "question": market.get("question"),
-                    "reason": final_reason,
-                    "bid": m["best_bid"],
-                    "ask": m["best_ask"],
-                    "spread": m["spread"],
-                    "bid_depth": m["bid_depth"],
-                    "ask_depth": m["ask_depth"],
-                })
+            candidate_metrics = []
+            if is_near_pass_metrics(yes_metrics):
+                candidate_metrics.append(("YES", yes_metrics, yes_reason))
+            if is_near_pass_metrics(no_metrics):
+                candidate_metrics.append(("NO", no_metrics, no_reason))
+            for side_name, m, side_reason in candidate_metrics[:2]:
+                if len(near_passes) < 5:
+                    near_passes.append({
+                        "slug": slug,
+                        "question": market.get("question"),
+                        "side": side_name,
+                        "reason": classify_trade_failure(m) if side_reason == "ok" else side_reason,
+                        "bid": m["best_bid"],
+                        "ask": m["best_ask"],
+                        "spread": m["spread"],
+                        "bid_depth": m["bid_depth"],
+                        "ask_depth": m["ask_depth"],
+                        "imbalance": m.get("imbalance", 0.0),
+                        "pressure": m.get("pressure", 0.0),
+                    })
+                obs = observation_candidate(m, market, lane="near_pass")
+                if obs:
+                    obs["side"] = side_name
+                    observations.append(obs)
             continue
 
         side, score, chosen_metrics = production_side_scores(yes_metrics, no_metrics)
         if score < 0:
-            # not ready for production; observation may still keep it.
+            if is_near_pass_metrics(chosen_metrics) and len(near_passes) < 5:
+                near_passes.append({
+                    "slug": slug,
+                    "question": market.get("question"),
+                    "side": side,
+                    "reason": classify_trade_failure(chosen_metrics),
+                    "bid": chosen_metrics["best_bid"],
+                    "ask": chosen_metrics["best_ask"],
+                    "spread": chosen_metrics["spread"],
+                    "bid_depth": chosen_metrics["bid_depth"],
+                    "ask_depth": chosen_metrics["ask_depth"],
+                    "imbalance": chosen_metrics.get("imbalance", 0.0),
+                    "pressure": chosen_metrics.get("pressure", 0.0),
+                })
+            obs = observation_candidate(chosen_metrics, market, lane="near_pass")
+            if obs:
+                obs["side"] = side
+                observations.append(obs)
             continue
         category = "ALERT" if score >= MICRO_ALERT_SCORE else ("WATCH" if score >= MICRO_WATCH_SCORE else "SKIP")
         if category == "SKIP":
@@ -1187,11 +1303,14 @@ def scan_once() -> Dict[str, Any]:
             "ask": chosen_metrics["best_ask"],
             "spread": chosen_metrics["spread"],
             "fill_confidence": chosen_metrics["fill_confidence"],
+            "imbalance": chosen_metrics.get("imbalance", 0.0),
+            "pressure": chosen_metrics.get("pressure", 0.0),
             "category": category,
         })
         stats["discover_kept"] += 1
 
     prod_results.sort(key=lambda x: x["score"], reverse=True)
+    observations.extend(structural_observations)
     observations.sort(key=lambda x: x["score"], reverse=True)
 
     # Deduplicate observation entries by slug, keeping best score.
@@ -1202,8 +1321,8 @@ def scan_once() -> Dict[str, Any]:
             prev = observation_seen.get(key)
             trend = "new"
             if prev:
-                bid_diff = round(o["bid"] - prev.get("bid", 0.0), 4)
-                spread_diff = round(prev.get("spread", 0.0) - o["spread"], 4)
+                bid_diff = round(o.get("bid", 0.0) - prev.get("bid", 0.0), 4)
+                spread_diff = round(prev.get("spread", 0.0) - o.get("spread", 0.0), 4)
                 if bid_diff > 0 or spread_diff > 0:
                     trend = "improving"
                 else:
@@ -1211,7 +1330,7 @@ def scan_once() -> Dict[str, Any]:
                 session_summary["observation_repeats"] += 1
             o["trend"] = trend
             obs_map[key] = o
-            observation_seen[key] = {"bid": o["bid"], "spread": o["spread"], "ts": utc_ts()}
+            observation_seen[key] = {"bid": o.get("bid", 0.0), "spread": o.get("spread", 0.0), "ts": utc_ts()}
 
     final_observations = list(obs_map.values())[:5]
     if final_observations:
@@ -1223,6 +1342,7 @@ def scan_once() -> Dict[str, Any]:
 
     last_pipeline_stats = stats.copy()
     last_pipeline_stats["discover_preflight_reason_counts"] = reason_counts.copy()
+    last_pipeline_stats["structural_reason_counts"] = structural_reason_counts.copy()
     last_preflight_reason_counts = {"discover": reason_counts.copy(), "fallback": {}}
     last_near_passes = {"discover": near_passes[:5], "fallback": []}
     last_observation_results = final_observations
@@ -1235,6 +1355,7 @@ def scan_once() -> Dict[str, Any]:
         "observations": final_observations,
         "near_passes": near_passes[:5],
         "reason_counts": reason_counts,
+        "structural_reason_counts": structural_reason_counts,
     }
 
 # =========================================================
@@ -1289,6 +1410,8 @@ def format_health_text() -> str:
         f"book_failure_samples={len((last_pipeline_stats or {}).get('book_failure_samples', []))}",
         f"hydrated_detail_hits={(last_pipeline_stats or {}).get('hydrated_detail_hits', 0)}",
         f"hydrated_detail_misses={(last_pipeline_stats or {}).get('hydrated_detail_misses', 0)}",
+        f"adaptive_intake_level={(last_pipeline_stats or {}).get('adaptive_intake_level', 0)}",
+        f"structural_reasons={list((last_pipeline_stats or {}).get('structural_reason_counts', {}).keys())[:3]}",
         f"session_summary={session_summary}",
     ]
     return "\n".join(lines)
@@ -1301,6 +1424,7 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
     observations = scan["observations"]
     reason_counts = scan["reason_counts"]
     near_passes = scan["near_passes"]
+    structural_reason_counts = scan.get("structural_reason_counts", {}) or {}
 
     top_reason = "none"
     if reason_counts:
@@ -1328,6 +1452,7 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"discover_failopen_admits={pipeline.get('discover_failopen_admits', 0)} | "
             f"discover_family_skips={pipeline.get('discover_family_skips', 0)} | "
             f"discover_bucket_skips={pipeline.get('discover_bucket_skips', 0)} | "
+            f"adaptive_intake_level={pipeline.get('adaptive_intake_level', 0)} | "
             f"discover_checked={pipeline.get('discover_checked', 0)} | "
             f"discover_kept={pipeline.get('discover_kept', 0)} | "
             f"fallback_items={pipeline.get('fallback_items', 0)} | "
@@ -1335,7 +1460,9 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"fallback_kept={pipeline.get('fallback_kept', 0)} | "
             f"cache_used={pipeline.get('cache_used', 0)} | "
             f"cache_refetched={pipeline.get('cache_refetched', 0)} | "
-            f"resolve_failures={pipeline.get('discover_resolve_failures', 0)} | "f"resolve_samples={len(pipeline.get('resolve_failure_samples', []) or [])} | "f"book_samples={len(pipeline.get('book_failure_samples', []) or [])} | "f"hydrated_hits={pipeline.get('hydrated_detail_hits', 0)} | "f"hydrated_misses={pipeline.get('hydrated_detail_misses', 0)} | "
+            f"resolve_failures={pipeline.get('discover_resolve_failures', 0)} | "
+            f"structural_top={sorted(structural_reason_counts.items(), key=lambda x: x[1], reverse=True)[0][0] + ':' + str(sorted(structural_reason_counts.items(), key=lambda x: x[1], reverse=True)[0][1]) if structural_reason_counts else 'none'} | "
+            f"resolve_samples={len(pipeline.get('resolve_failure_samples', []) or [])} | "f"book_samples={len(pipeline.get('book_failure_samples', []) or [])} | "f"hydrated_hits={pipeline.get('hydrated_detail_hits', 0)} | "f"hydrated_misses={pipeline.get('hydrated_detail_misses', 0)} | "
             f"top_preflight_discover={top_reason} | top_preflight_fallback=none"
         ),
         "",
@@ -1346,8 +1473,8 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             lines.extend([
                 f"{n['question']}",
                 f"slug={n['slug']}",
-                f"reason={n['reason']}",
-                f"bid={n['bid']} ask={n['ask']} spread={n['spread']}",
+                f"side={n.get('side', '?')} reason={n['reason']}",
+                f"bid={n['bid']} ask={n['ask']} spread={n['spread']} imbalance={n.get('imbalance', 0.0)} pressure={n.get('pressure', 0.0)}",
             ])
     else:
         lines.extend([
@@ -1387,7 +1514,7 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             lines.extend([
                 f"{row['category']} | {row['question']}",
                 f"slug={row['slug']} side={row['side']} score={row['score']}",
-                f"bid={row['bid']} ask={row['ask']} spread={row['spread']} fill={row['fill_confidence']}",
+                f"bid={row['bid']} ask={row['ask']} spread={row['spread']} fill={row['fill_confidence']} imbalance={row.get('imbalance', 0.0)} pressure={row.get('pressure', 0.0)}",
                 "",
             ])
 
@@ -1397,9 +1524,9 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
         for o in observations:
             lines.extend([
                 f"FORMING | {o['question']}",
-                f"slug={o['slug']} side={o['side']} score={o['score']} trend={o['trend']}",
-                f"bid={o['bid']} ask={o['ask']} spread={o['spread']}",
-                f"bid_depth={o['bid_depth']} ask_depth={o['ask_depth']}",
+                f"slug={o['slug']} side={o.get('side', '?')} lane={o.get('lane', 'forming')} score={o['score']} trend={o['trend']}",
+                f"bid={o.get('bid', 0.0)} ask={o.get('ask', 0.0)} spread={o.get('spread', 0.0)} imbalance={o.get('imbalance', 0.0)} pressure={o.get('pressure', 0.0)}",
+                f"bid_depth={o.get('bid_depth', 0.0)} ask_depth={o.get('ask_depth', 0.0)}",
                 f"interesting={o['catalyst']} | not_ready={o['reason']}",
                 "",
             ])

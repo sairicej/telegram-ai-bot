@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v15-adaptive-intake-observation"
+SCRIPT_VERSION = "v16-resolver-hardening-cooldowns"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -100,6 +100,8 @@ session_summary: Dict[str, Any] = {
 observation_seen: Dict[str, Dict[str, Any]] = {}
 alert_dedupe: Dict[str, float] = {}
 candidate_cache: Dict[str, Dict[str, Any]] = {}
+unresolved_slug_failures: Dict[str, int] = {}
+unresolved_family_failures: Dict[str, int] = {}
 background_started = False
 
 # =========================================================
@@ -537,6 +539,106 @@ def fetch_gamma_markets(limit: int) -> List[Dict[str, Any]]:
     return []
 
 
+def market_family_hint(market: Dict[str, Any]) -> str:
+    txt = full_market_text(market)
+    if any(x in txt for x in ["nba finals", "nfl", "mlb", "nhl", "world series", "championship", "will the "]):
+        return "sports-futures"
+    if any(x in txt for x in ["gta vi", "novelty", "special", "before "]):
+        return "novelty-special"
+    return family_bucket(market)
+
+
+def should_cooldown_slug(market: Dict[str, Any]) -> Tuple[bool, str]:
+    slug = str(market.get("slug") or "")
+    if not slug:
+        return False, "no_slug"
+    slug_failures = unresolved_slug_failures.get(slug, 0)
+    fam = market_family_hint(market)
+    fam_failures = unresolved_family_failures.get(fam, 0)
+    if slug_failures >= 3:
+        return True, "slug_repeat_unresolved"
+    if fam_failures >= 10 and "sports-futures" in fam:
+        return True, "family_repeat_unresolved"
+    return False, "ok"
+
+
+def record_unresolved_market_failure(market: Dict[str, Any]) -> None:
+    slug = str(market.get("slug") or "")
+    if slug:
+        unresolved_slug_failures[slug] = unresolved_slug_failures.get(slug, 0) + 1
+    fam = market_family_hint(market)
+    unresolved_family_failures[fam] = unresolved_family_failures.get(fam, 0) + 1
+
+
+def record_market_resolved_success(market: Dict[str, Any]) -> None:
+    slug = str(market.get("slug") or "")
+    if slug in unresolved_slug_failures:
+        unresolved_slug_failures[slug] = max(0, unresolved_slug_failures.get(slug, 0) - 1)
+        if unresolved_slug_failures[slug] == 0:
+            unresolved_slug_failures.pop(slug, None)
+
+
+def deep_find_yes_no_tokens(obj: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Look through messy nested payloads for YES/NO labels paired with token ids.
+    This stays inside current architecture. It just hardens resolution.
+    """
+    yes_token = None
+    no_token = None
+
+    def clean(v: Any) -> str:
+        return compact_text(str(v or "")).lower()
+
+    def extract_token_id_from_dict(d: Dict[str, Any]) -> Optional[str]:
+        for key in [
+            "token_id", "tokenId", "id", "asset_id", "assetId",
+            "clobTokenId", "clob_token_id", "outcomeTokenId", "outcome_token_id",
+            "token", "asset"
+        ]:
+            val = d.get(key)
+            if isinstance(val, dict):
+                nested = extract_token_id_from_dict(val)
+                if nested:
+                    return nested
+            elif val not in (None, "", [], {}):
+                return str(val)
+        return None
+
+    def extract_label_from_dict(d: Dict[str, Any]) -> str:
+        for key in ["outcome", "name", "title", "label", "side"]:
+            val = d.get(key)
+            if val not in (None, "", [], {}):
+                return clean(val)
+        return ""
+
+    def walk(node: Any):
+        nonlocal yes_token, no_token
+        if yes_token and no_token:
+            return
+        if isinstance(node, dict):
+            label = extract_label_from_dict(node)
+            token_id = extract_token_id_from_dict(node)
+            if label == "yes" and token_id and not yes_token:
+                yes_token = token_id
+            elif label == "no" and token_id and not no_token:
+                no_token = token_id
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    walk(item)
+
+    walk(obj)
+    if not yes_token or not no_token:
+        deep_yes, deep_no = deep_find_yes_no_tokens(market)
+        yes_token = yes_token or deep_yes
+        no_token = no_token or deep_no
+
+    return yes_token, no_token
+
+
 def fetch_manual_slugs() -> List[str]:
     if not MARKETS_URL:
         return []
@@ -585,8 +687,10 @@ def fetch_market_detail(market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if slug:
         urls.extend([
             (f"{GAMMA_BASE}/markets", {"slug": slug}),
+            (f"{GAMMA_BASE}/markets", {"slug": slug, "limit": 1}),
             (f"{GAMMA_BASE}/markets/{slug}", None),
             (f"{GAMMA_BASE}/markets/slug/{slug}", None),
+            (f"{GAMMA_BASE}/events", {"slug": slug}),
         ])
     if market_id not in (None, ""):
         market_id = str(market_id)
@@ -607,6 +711,10 @@ def fetch_market_detail(market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 for key in ["market", "data"]:
                     if isinstance(data.get(key), dict):
                         return data[key]
+                for key in ["markets", "events"]:
+                    val = data.get(key)
+                    if isinstance(val, list) and val and isinstance(val[0], dict):
+                        return val[0]
                 return data
         except Exception:
             continue
@@ -979,6 +1087,7 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "scan_resolve_failures": 0,
         "cache_used": 0,
         "cache_refetched": 0,
+        "cooldown_skips": 0,
     }
     markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
     primary_pool: List[Dict[str, Any]] = []
@@ -1007,6 +1116,17 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                     "time_source": "status",
                     "time_value": "status-gate",
                     "question": market_question(m),
+                })
+            continue
+
+        cooldown_skip, cooldown_reason = should_cooldown_slug(m)
+        if cooldown_skip:
+            stats["cooldown_skips"] += 1
+            if len(stats["discover_skip_samples"]) < 8:
+                stats["discover_skip_samples"].append({
+                    "slug": m.get("slug"),
+                    "reason": cooldown_reason,
+                    "question": m.get("question"),
                 })
             continue
 
@@ -1169,6 +1289,7 @@ def scan_once() -> Dict[str, Any]:
         if not yes_token or not no_token:
             stats["discover_resolve_failures"] += 1
             structural_reason_counts["missing_token_ids"] = structural_reason_counts.get("missing_token_ids", 0) + 1
+            record_unresolved_market_failure(hydrated_market)
             structural_observations.append({
                 "slug": hydrated_market.get("slug", ""),
                 "question": hydrated_market.get("question", hydrated_market.get("title", "")),
@@ -1208,6 +1329,7 @@ def scan_once() -> Dict[str, Any]:
         if not yes_book or not no_book:
             stats["discover_resolve_failures"] += 1
             structural_reason_counts["book_lookup_failed"] = structural_reason_counts.get("book_lookup_failed", 0) + 1
+            record_unresolved_market_failure(market)
             structural_observations.append({
                 "slug": market.get("slug", ""),
                 "question": market.get("question", market.get("title", "")),
@@ -1226,6 +1348,8 @@ def scan_once() -> Dict[str, Any]:
                     "no_book_ok": bool(no_book),
                 })
             continue
+
+        record_market_resolved_success(market)
 
         yes_ok, yes_reason, yes_metrics = preflight_check(market, yes_book)
         no_ok, no_reason, no_metrics = preflight_check(market, no_book)
@@ -1412,6 +1536,9 @@ def format_health_text() -> str:
         f"hydrated_detail_misses={(last_pipeline_stats or {}).get('hydrated_detail_misses', 0)}",
         f"adaptive_intake_level={(last_pipeline_stats or {}).get('adaptive_intake_level', 0)}",
         f"structural_reasons={list((last_pipeline_stats or {}).get('structural_reason_counts', {}).keys())[:3]}",
+        f"cooldown_skips={(last_pipeline_stats or {}).get('cooldown_skips', 0)}",
+        f"unresolved_slug_count={len(unresolved_slug_failures)}",
+        f"top_unresolved_families={sorted(unresolved_family_failures.items(), key=lambda x: x[1], reverse=True)[:3]}",
         f"session_summary={session_summary}",
     ]
     return "\n".join(lines)
@@ -1452,6 +1579,7 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"discover_failopen_admits={pipeline.get('discover_failopen_admits', 0)} | "
             f"discover_family_skips={pipeline.get('discover_family_skips', 0)} | "
             f"discover_bucket_skips={pipeline.get('discover_bucket_skips', 0)} | "
+            f"cooldown_skips={pipeline.get('cooldown_skips', 0)} | "
             f"adaptive_intake_level={pipeline.get('adaptive_intake_level', 0)} | "
             f"discover_checked={pipeline.get('discover_checked', 0)} | "
             f"discover_kept={pipeline.get('discover_kept', 0)} | "
@@ -1532,6 +1660,12 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             ])
     else:
         lines.append("Forming markets: none")
+
+    repeated_unresolved = sorted(unresolved_slug_failures.items(), key=lambda x: x[1], reverse=True)[:3]
+    top_fams = sorted(unresolved_family_failures.items(), key=lambda x: x[1], reverse=True)[:3]
+    lines.append("")
+    lines.append(f"Recurring unresolved slugs: {repeated_unresolved if repeated_unresolved else 'none'}")
+    lines.append(f"Recurring unresolved families: {top_fams if top_fams else 'none'}")
 
     lines.extend([
         "",

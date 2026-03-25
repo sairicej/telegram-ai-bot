@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v18.1-local-targeted-shortlist"
+SCRIPT_VERSION = "v18.2-events-tags-orderbook"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -58,6 +58,11 @@ DISCOVERY_QUERY_TERMS = [x.strip() for x in os.getenv(
 ).split(",") if x.strip()]
 
 LOCAL_TARGET_TERMS = DISCOVERY_QUERY_TERMS[:]
+DISCOVERY_TAGS = [x.strip() for x in os.getenv(
+    "DISCOVERY_TAGS",
+    "Politics,Crypto,Economy,Trump,Ukraine,Fed,ETF"
+).split(",") if x.strip()]
+EVENTS_DISCOVERY_LIMIT = int(os.getenv("EVENTS_DISCOVERY_LIMIT", "150"))
 
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "10000"))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.05"))
@@ -787,6 +792,113 @@ def build_local_targeted_markets(markets: List[Dict[str, Any]], total_limit: int
     return deduped[:total_limit], hit_counts
 
 
+def extract_markets_from_event_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not isinstance(row, dict):
+        return out
+    for key in ["markets", "market", "data"]:
+        val = row.get(key)
+        if isinstance(val, list):
+            for item in val:
+                if isinstance(item, dict):
+                    out.append(item)
+        elif isinstance(val, dict):
+            out.append(val)
+    return out
+
+
+def fetch_gamma_events(limit: int) -> List[Dict[str, Any]]:
+    urls = [
+        (f"{GAMMA_BASE}/events", {"limit": limit, "active": "true", "closed": "false"}),
+        (f"{GAMMA_BASE}/events", {"limit": limit}),
+    ]
+    rows: List[Dict[str, Any]] = []
+    for url, params in urls:
+        try:
+            data = fetch_json(url, params=params)
+            if isinstance(data, list):
+                rows = [x for x in data if isinstance(x, dict)]
+                if rows:
+                    return rows
+            if isinstance(data, dict):
+                for k in ["events", "data"]:
+                    if isinstance(data.get(k), list):
+                        rows = [x for x in data[k] if isinstance(x, dict)]
+                        if rows:
+                            return rows
+        except Exception:
+            continue
+    return []
+
+
+def fetch_gamma_markets_by_tag(tag: str, limit: int) -> List[Dict[str, Any]]:
+    urls = [
+        (f"{GAMMA_BASE}/markets", {"tag": tag, "limit": limit}),
+        (f"{GAMMA_BASE}/markets", {"tags": tag, "limit": limit}),
+        (f"{GAMMA_BASE}/events", {"tag": tag, "limit": limit}),
+    ]
+    out: List[Dict[str, Any]] = []
+    for url, params in urls:
+        try:
+            data = fetch_json(url, params=params)
+            if isinstance(data, list):
+                if "/events" in url:
+                    for row in data:
+                        out.extend(extract_markets_from_event_row(row))
+                else:
+                    out.extend([x for x in data if isinstance(x, dict)])
+                if out:
+                    return dedupe_markets(out)
+            if isinstance(data, dict):
+                for k in ["markets", "data", "events"]:
+                    val = data.get(k)
+                    if isinstance(val, list):
+                        if k == "events":
+                            for row in val:
+                                out.extend(extract_markets_from_event_row(row))
+                        else:
+                            out.extend([x for x in val if isinstance(x, dict)])
+                        if out:
+                            return dedupe_markets(out)
+        except Exception:
+            continue
+    return []
+
+
+def market_has_orderbook_enabled(market: Dict[str, Any]) -> bool:
+    for key in ["enableOrderBook", "orderBookEnabled"]:
+        val = market.get(key)
+        if isinstance(val, bool):
+            return val
+        if str(val).strip().lower() in ["true", "1", "yes"]:
+            return True
+    return False
+
+
+def build_events_seeded_markets(total_limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    event_rows = fetch_gamma_events(EVENTS_DISCOVERY_LIMIT)
+    pooled: List[Dict[str, Any]] = []
+    for row in event_rows:
+        pooled.extend(extract_markets_from_event_row(row))
+    deduped = dedupe_markets(pooled)
+    deduped.sort(key=lambda x: (market_has_orderbook_enabled(x), market_liquidity(x), market_volume(x)), reverse=True)
+    hit_counts = {"events_rows": len(event_rows), "events_markets": len(deduped)}
+    return deduped[:total_limit], hit_counts
+
+
+def build_tag_seeded_markets(total_limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    pooled: List[Dict[str, Any]] = []
+    hit_counts: Dict[str, int] = {}
+    per_tag = max(8, min(20, total_limit // max(1, len(DISCOVERY_TAGS))))
+    for tag in DISCOVERY_TAGS:
+        rows = fetch_gamma_markets_by_tag(tag, per_tag)
+        hit_counts[tag] = len(rows)
+        pooled.extend(rows)
+    deduped = dedupe_markets(pooled)
+    deduped.sort(key=lambda x: (market_has_orderbook_enabled(x), market_liquidity(x), market_volume(x)), reverse=True)
+    return deduped[:total_limit], hit_counts
+
+
 def fetch_gamma_markets_by_query(term: str, limit: int) -> List[Dict[str, Any]]:
     urls = [
         (f"{GAMMA_BASE}/markets", {"query": term, "limit": limit}),
@@ -1290,10 +1402,20 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "broad_backup_used": 0,
         "local_targeted_candidates": 0,
         "local_target_term_hits": {},
+        "events_seeded_candidates": 0,
+        "tag_seeded_candidates": 0,
+        "orderbook_disabled_skips": 0,
     }
     query_hit_counts: Dict[str, int] = {}
     broad_markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
-    targeted_seed_markets, query_hit_counts = build_local_targeted_markets(broad_markets, DISCOVER_LIMIT) if AUTO_DISCOVER else ([], {})
+    event_seed_markets, event_hit_counts = build_events_seeded_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else ([], {})
+    tag_seed_markets, tag_hit_counts = build_tag_seeded_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else ([], {})
+    local_targeted_markets, local_hit_counts = build_local_targeted_markets(broad_markets, DISCOVER_LIMIT) if AUTO_DISCOVER else ([], {})
+    targeted_seed_markets = dedupe_markets(event_seed_markets + tag_seed_markets + local_targeted_markets)
+    query_hit_counts = {}
+    query_hit_counts.update(event_hit_counts)
+    query_hit_counts.update({f"tag:{k}": v for k, v in tag_hit_counts.items()})
+    query_hit_counts.update({f"term:{k}": v for k, v in local_hit_counts.items()})
     markets = dedupe_markets(targeted_seed_markets + broad_markets)
     targeted_primary_pool: List[Dict[str, Any]] = []
     targeted_relaxed_pool: List[Dict[str, Any]] = []
@@ -1301,7 +1423,9 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     broad_relaxed_pool: List[Dict[str, Any]] = []
     failopen_pool: List[Dict[str, Any]] = []
 
-    stats["local_targeted_candidates"] = len(targeted_seed_markets)
+    stats["local_targeted_candidates"] = len(local_targeted_markets)
+    stats["events_seeded_candidates"] = len(event_seed_markets)
+    stats["tag_seeded_candidates"] = len(tag_seed_markets)
     stats["local_target_term_hits"] = query_hit_counts.copy()
 
     def add_hard_skip(reason: str, market: Dict[str, Any]):
@@ -1347,6 +1471,16 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 stats["discover_skip_samples"].append({
                     "slug": m.get("slug"),
                     "reason": bad_reason,
+                    "question": m.get("question"),
+                })
+            continue
+
+        if not market_has_orderbook_enabled(m):
+            stats["orderbook_disabled_skips"] += 1
+            if len(stats["discover_skip_samples"]) < 8:
+                stats["discover_skip_samples"].append({
+                    "slug": m.get("slug"),
+                    "reason": "orderbook_disabled",
                     "question": m.get("question"),
                 })
             continue
@@ -1831,6 +1965,9 @@ def format_health_text() -> str:
         f"targeted_kept={(last_pipeline_stats or {}).get('targeted_kept', 0)}",
         f"broad_backup_used={(last_pipeline_stats or {}).get('broad_backup_used', 0)}",
         f"local_targeted_candidates={(last_pipeline_stats or {}).get('local_targeted_candidates', 0)}",
+        f"events_seeded_candidates={(last_pipeline_stats or {}).get('events_seeded_candidates', 0)}",
+        f"tag_seeded_candidates={(last_pipeline_stats or {}).get('tag_seeded_candidates', 0)}",
+        f"orderbook_disabled_skips={(last_pipeline_stats or {}).get('orderbook_disabled_skips', 0)}",
         f"local_target_term_hits={(last_pipeline_stats or {}).get('local_target_term_hits', {})}",
         f"unresolved_slug_count={len(unresolved_slug_failures)}",
         f"top_unresolved_families={sorted(unresolved_family_failures.items(), key=lambda x: x[1], reverse=True)[:3]}",
@@ -1883,6 +2020,9 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"targeted_kept={pipeline.get('targeted_kept', 0)} | "
             f"broad_backup_used={pipeline.get('broad_backup_used', 0)} | "
             f"local_targeted_candidates={pipeline.get('local_targeted_candidates', 0)} | "
+            f"events_seeded_candidates={pipeline.get('events_seeded_candidates', 0)} | "
+            f"tag_seeded_candidates={pipeline.get('tag_seeded_candidates', 0)} | "
+            f"orderbook_disabled_skips={pipeline.get('orderbook_disabled_skips', 0)} | "
             f"adaptive_intake_level={pipeline.get('adaptive_intake_level', 0)} | "
             f"discover_checked={pipeline.get('discover_checked', 0)} | "
             f"discover_kept={pipeline.get('discover_kept', 0)} | "
@@ -1970,8 +2110,8 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
     lines.append(f"Recurring unresolved slugs: {repeated_unresolved if repeated_unresolved else 'none'}")
     lines.append(f"Recurring unresolved families: {top_fams if top_fams else 'none'}")
     query_hits = pipeline.get("local_target_term_hits", {}) or {}
-    top_query_hits = sorted(query_hits.items(), key=lambda x: x[1], reverse=True)[:5]
-    lines.append(f"Top local target term hits: {top_query_hits if top_query_hits else 'none'}")
+    top_query_hits = sorted(query_hits.items(), key=lambda x: x[1], reverse=True)[:8]
+    lines.append(f"Top discovery source hits: {top_query_hits if top_query_hits else 'none'}")
 
     lines.extend([
         "",

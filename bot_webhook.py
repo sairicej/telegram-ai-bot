@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v17-targeted-discovery-intake"
+SCRIPT_VERSION = "v17.1-near-endtime-timing-pass"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -422,6 +422,20 @@ def event_proximity_priority(market: Dict[str, Any]) -> float:
     if delta_hours <= 14 * 24:
         return 0.25
     return -0.5
+
+
+def has_near_end_time(market: Dict[str, Any]) -> bool:
+    end_dt, _ = get_market_end_dt(market)
+    if end_dt is None:
+        return False
+    delta_hours = (end_dt - now_utc()).total_seconds() / 3600.0
+    if delta_hours < 0:
+        return False
+    if delta_hours <= 72:
+        return True
+    if delta_hours <= 7 * 24 and catalyst_signal_score(market) >= 1.5:
+        return True
+    return False
 
 
 def discovery_intake_score(market: Dict[str, Any]) -> float:
@@ -1223,8 +1237,9 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             continue
 
         strong_time = has_strong_time_signal(m)
+        near_end_time = has_near_end_time(m)
         catalyst_score = catalyst_signal_score(m)
-        if not strong_time:
+        if not strong_time and not near_end_time:
             stats["weak_timing_skips"] += 1
             if len(stats["discover_skip_samples"]) < 8:
                 stats["discover_skip_samples"].append({

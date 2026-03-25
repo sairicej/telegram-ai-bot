@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v16-resolver-hardening-cooldowns"
+SCRIPT_VERSION = "v17-targeted-discovery-intake"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -354,6 +354,84 @@ def rolling_date_phrases() -> List[str]:
     if month_end <= start + timedelta(days=ROLLING_DISCOVERY_DAYS):
         phrases.add(f"end of {month_end.strftime('%B').lower()}")
     return sorted(phrases)
+
+
+def has_strong_time_signal(market: Dict[str, Any]) -> bool:
+    txt = full_market_text(market)
+    strong_terms = ["today", "tonight", "tomorrow", "this week", "by friday", "by saturday", "by sunday"]
+    if any(t in txt for t in strong_terms):
+        return True
+    for p in rolling_date_phrases():
+        if p in txt:
+            return True
+    return False
+
+
+def catalyst_signal_score(market: Dict[str, Any]) -> float:
+    txt = full_market_text(market)
+    strong = [
+        "cpi", "ppi", "fomc", "fed", "rates", "vote", "hearing", "ruling",
+        "approval", "decision", "deadline", "primary", "debate", "etf",
+        "ban", "legal", "sentencing", "settlement", "shutdown", "tariff"
+    ]
+    medium = [
+        "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "jobs report",
+        "payrolls", "treasury", "yield", "opec"
+    ]
+    weak_penalty = [
+        "championship", "nba finals", "stanley cup", "world series",
+        "super bowl", "will the ", "gta vi", "novelty", "winner"
+    ]
+    score = 0.0
+    for t in strong:
+        if t in txt:
+            score += 1.0
+    for t in medium:
+        if t in txt:
+            score += 0.45
+    for t in weak_penalty:
+        if t in txt:
+            score -= 0.8
+    if has_strong_time_signal(market):
+        score += 1.2
+    return round(score, 3)
+
+
+def is_bad_microstructure_family(market: Dict[str, Any]) -> Tuple[bool, str]:
+    txt = full_market_text(market)
+    if any(x in txt for x in ["nba finals", "stanley cup", "world series", "super bowl", "championship"]) and "will the " in txt:
+        return True, "sports_futures"
+    if any(x in txt for x in ["gta vi", "novelty", "before gta", "celebrity death", "ufo", "alien"]):
+        return True, "novelty_special"
+    return False, "ok"
+
+
+def event_proximity_priority(market: Dict[str, Any]) -> float:
+    end_dt, _ = get_market_end_dt(market)
+    if end_dt is None:
+        return 0.0
+    delta_hours = (end_dt - now_utc()).total_seconds() / 3600.0
+    if delta_hours < 0:
+        return -5.0
+    if delta_hours <= 24:
+        return 1.25
+    if delta_hours <= 72:
+        return 1.0
+    if delta_hours <= 7 * 24:
+        return 0.65
+    if delta_hours <= 14 * 24:
+        return 0.25
+    return -0.5
+
+
+def discovery_intake_score(market: Dict[str, Any]) -> float:
+    liq = market_liquidity(market)
+    vol = market_volume(market)
+    base = event_priority(market)
+    catalyst = catalyst_signal_score(market)
+    proximity = event_proximity_priority(market)
+    flow = min(1.5, (liq / max(DISCOVER_MIN_LIQUIDITY, 1.0)) * 0.35 + (vol / max(DISCOVER_MIN_VOLUME, 1.0)) * 0.25)
+    return round(base + catalyst + proximity + flow, 3)
 
 
 def is_yes_no_market(market: Dict[str, Any]) -> bool:
@@ -1088,6 +1166,9 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "cache_used": 0,
         "cache_refetched": 0,
         "cooldown_skips": 0,
+        "bad_family_skips": 0,
+        "weak_timing_skips": 0,
+        "low_catalyst_skips": 0,
     }
     markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
     primary_pool: List[Dict[str, Any]] = []
@@ -1126,6 +1207,38 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 stats["discover_skip_samples"].append({
                     "slug": m.get("slug"),
                     "reason": cooldown_reason,
+                    "question": m.get("question"),
+                })
+            continue
+
+        bad_family, bad_reason = is_bad_microstructure_family(m)
+        if bad_family:
+            stats["bad_family_skips"] += 1
+            if len(stats["discover_skip_samples"]) < 8:
+                stats["discover_skip_samples"].append({
+                    "slug": m.get("slug"),
+                    "reason": bad_reason,
+                    "question": m.get("question"),
+                })
+            continue
+
+        strong_time = has_strong_time_signal(m)
+        catalyst_score = catalyst_signal_score(m)
+        if not strong_time:
+            stats["weak_timing_skips"] += 1
+            if len(stats["discover_skip_samples"]) < 8:
+                stats["discover_skip_samples"].append({
+                    "slug": m.get("slug"),
+                    "reason": "weak_time_signal",
+                    "question": m.get("question"),
+                })
+            continue
+        if catalyst_score < 0.6:
+            stats["low_catalyst_skips"] += 1
+            if len(stats["discover_skip_samples"]) < 8:
+                stats["discover_skip_samples"].append({
+                    "slug": m.get("slug"),
+                    "reason": "low_catalyst_score",
                     "question": m.get("question"),
                 })
             continue
@@ -1537,6 +1650,9 @@ def format_health_text() -> str:
         f"adaptive_intake_level={(last_pipeline_stats or {}).get('adaptive_intake_level', 0)}",
         f"structural_reasons={list((last_pipeline_stats or {}).get('structural_reason_counts', {}).keys())[:3]}",
         f"cooldown_skips={(last_pipeline_stats or {}).get('cooldown_skips', 0)}",
+        f"bad_family_skips={(last_pipeline_stats or {}).get('bad_family_skips', 0)}",
+        f"weak_timing_skips={(last_pipeline_stats or {}).get('weak_timing_skips', 0)}",
+        f"low_catalyst_skips={(last_pipeline_stats or {}).get('low_catalyst_skips', 0)}",
         f"unresolved_slug_count={len(unresolved_slug_failures)}",
         f"top_unresolved_families={sorted(unresolved_family_failures.items(), key=lambda x: x[1], reverse=True)[:3]}",
         f"session_summary={session_summary}",
@@ -1580,6 +1696,9 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"discover_family_skips={pipeline.get('discover_family_skips', 0)} | "
             f"discover_bucket_skips={pipeline.get('discover_bucket_skips', 0)} | "
             f"cooldown_skips={pipeline.get('cooldown_skips', 0)} | "
+            f"bad_family_skips={pipeline.get('bad_family_skips', 0)} | "
+            f"weak_timing_skips={pipeline.get('weak_timing_skips', 0)} | "
+            f"low_catalyst_skips={pipeline.get('low_catalyst_skips', 0)} | "
             f"adaptive_intake_level={pipeline.get('adaptive_intake_level', 0)} | "
             f"discover_checked={pipeline.get('discover_checked', 0)} | "
             f"discover_kept={pipeline.get('discover_kept', 0)} | "

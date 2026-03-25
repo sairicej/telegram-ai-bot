@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v17.2-hydrate-weak-timing"
+SCRIPT_VERSION = "v17.3-targeted-first-discovery"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -447,14 +447,29 @@ def has_near_end_time(market: Dict[str, Any], hydrate_if_missing: bool = False) 
     return False
 
 
+def is_targeted_high_signal_market(market: Dict[str, Any]) -> bool:
+    txt = full_market_text(market)
+    strong_terms = [
+        "cpi", "ppi", "fomc", "fed", "rates", "vote", "hearing", "ruling",
+        "approval", "decision", "deadline", "primary", "debate", "etf",
+        "tariff", "shutdown", "sentencing", "settlement", "legal", "ban"
+    ]
+    crypto_terms = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol"]
+    has_strong = any(t in txt for t in strong_terms)
+    has_time = has_strong_time_signal(market) or has_near_end_time(market, hydrate_if_missing=True)
+    has_time_bound_crypto = any(t in txt for t in crypto_terms) and has_time
+    return bool((has_strong and has_time) or has_time_bound_crypto)
+
+
 def discovery_intake_score(market: Dict[str, Any]) -> float:
     liq = market_liquidity(market)
     vol = market_volume(market)
     base = event_priority(market)
     catalyst = catalyst_signal_score(market)
     proximity = event_proximity_priority(market)
+    targeted_bonus = 1.25 if is_targeted_high_signal_market(market) else 0.0
     flow = min(1.5, (liq / max(DISCOVER_MIN_LIQUIDITY, 1.0)) * 0.35 + (vol / max(DISCOVER_MIN_VOLUME, 1.0)) * 0.25)
-    return round(base + catalyst + proximity + flow, 3)
+    return round(base + catalyst + proximity + targeted_bonus + flow, 3)
 
 
 def is_yes_no_market(market: Dict[str, Any]) -> bool:
@@ -1193,10 +1208,15 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "weak_timing_skips": 0,
         "low_catalyst_skips": 0,
         "timing_hydration_checks": 0,
+        "targeted_prelim": 0,
+        "targeted_kept": 0,
+        "broad_backup_used": 0,
     }
     markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
-    primary_pool: List[Dict[str, Any]] = []
-    relaxed_pool: List[Dict[str, Any]] = []
+    targeted_primary_pool: List[Dict[str, Any]] = []
+    targeted_relaxed_pool: List[Dict[str, Any]] = []
+    broad_primary_pool: List[Dict[str, Any]] = []
+    broad_relaxed_pool: List[Dict[str, Any]] = []
     failopen_pool: List[Dict[str, Any]] = []
 
     def add_hard_skip(reason: str, market: Dict[str, Any]):
@@ -1321,18 +1341,34 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 stats["discover_skip_samples"].append({"slug": m.get("slug"), "reason": "non_curated_skip", "question": m.get("question")})
             continue
 
-        m["_priority"] = round(event_priority(m), 3)
+        is_targeted = is_targeted_high_signal_market(m)
+        if is_targeted:
+            stats["targeted_prelim"] += 1
+
+        m["_priority"] = discovery_intake_score(m)
         m["_low_flow"] = low_flow
         m["_sports_like"] = sports_like
         m["_curated_like"] = curated_like
+        m["_catalyst_score"] = catalyst_score
+        m["_strong_time"] = strong_time
+        m["_near_end_time"] = near_end_time
+        m["_is_targeted"] = is_targeted
         if low_flow:
             stats["discover_low_flow_candidates"] += 1
-            relaxed_pool.append(m)
+            if is_targeted:
+                targeted_relaxed_pool.append(m)
+            else:
+                broad_relaxed_pool.append(m)
         else:
-            primary_pool.append(m)
+            if is_targeted:
+                targeted_primary_pool.append(m)
+            else:
+                broad_primary_pool.append(m)
 
-    primary_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
-    relaxed_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
+    targeted_primary_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
+    targeted_relaxed_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
+    broad_primary_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
+    broad_relaxed_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
 
     selected: List[Dict[str, Any]] = []
     family_seen = set()
@@ -1374,17 +1410,34 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         return True
 
     target = min(DISCOVER_LIMIT, PREFLIGHT_MAX_CANDIDATES + target_bonus)
-    for m in primary_pool:
+
+    # Lane A: targeted high-signal discovery first
+    for m in targeted_primary_pool:
         if len(selected) >= target:
             break
-        try_add(m, relaxed=False)
+        if try_add(m, relaxed=False):
+            stats["targeted_kept"] += 1
 
-    # If the front door is still too narrow, let some low-flow event markets reach preflight.
     if len(selected) < min(target, 24):
-        for m in relaxed_pool:
+        for m in targeted_relaxed_pool:
             if len(selected) >= target:
                 break
-            try_add(m, relaxed=True)
+            if try_add(m, relaxed=True):
+                stats["targeted_kept"] += 1
+
+    # Lane B: broad backup only if targeted lane is too thin
+    if len(selected) < min(target, 18):
+        stats["broad_backup_used"] = 1
+        for m in broad_primary_pool:
+            if len(selected) >= target:
+                break
+            try_add(m, relaxed=False)
+
+        if len(selected) < min(target, 24):
+            for m in broad_relaxed_pool:
+                if len(selected) >= target:
+                    break
+                try_add(m, relaxed=True)
 
     # Final fail-open path: if discovery still admitted nobody, let a capped number of
     # short-term yes/no non-junk markets reach preflight so the real engine can judge them.
@@ -1682,6 +1735,9 @@ def format_health_text() -> str:
         f"weak_timing_skips={(last_pipeline_stats or {}).get('weak_timing_skips', 0)}",
         f"low_catalyst_skips={(last_pipeline_stats or {}).get('low_catalyst_skips', 0)}",
         f"timing_hydration_checks={(last_pipeline_stats or {}).get('timing_hydration_checks', 0)}",
+        f"targeted_prelim={(last_pipeline_stats or {}).get('targeted_prelim', 0)}",
+        f"targeted_kept={(last_pipeline_stats or {}).get('targeted_kept', 0)}",
+        f"broad_backup_used={(last_pipeline_stats or {}).get('broad_backup_used', 0)}",
         f"unresolved_slug_count={len(unresolved_slug_failures)}",
         f"top_unresolved_families={sorted(unresolved_family_failures.items(), key=lambda x: x[1], reverse=True)[:3]}",
         f"session_summary={session_summary}",
@@ -1729,6 +1785,9 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"weak_timing_skips={pipeline.get('weak_timing_skips', 0)} | "
             f"low_catalyst_skips={pipeline.get('low_catalyst_skips', 0)} | "
             f"timing_hydration_checks={pipeline.get('timing_hydration_checks', 0)} | "
+            f"targeted_prelim={pipeline.get('targeted_prelim', 0)} | "
+            f"targeted_kept={pipeline.get('targeted_kept', 0)} | "
+            f"broad_backup_used={pipeline.get('broad_backup_used', 0)} | "
             f"adaptive_intake_level={pipeline.get('adaptive_intake_level', 0)} | "
             f"discover_checked={pipeline.get('discover_checked', 0)} | "
             f"discover_kept={pipeline.get('discover_kept', 0)} | "

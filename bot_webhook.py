@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v19-staged-exploration-engine"
+SCRIPT_VERSION = "v20-quarantine-horizon-manualscan"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -92,6 +92,9 @@ FORCE_EVAL_COUNT = int(os.getenv("FORCE_EVAL_COUNT", "3"))
 EXPLORATION_FILL_CONFIDENCE = float(os.getenv("EXPLORATION_FILL_CONFIDENCE", "0.25"))
 EXPLORATION_MAX_SPREAD = float(os.getenv("EXPLORATION_MAX_SPREAD", "0.22"))
 EXPLORATION_MIN_BID = float(os.getenv("EXPLORATION_MIN_BID", "0.003"))
+POLITICS_MAX_DAYS = int(os.getenv("POLITICS_MAX_DAYS", "14"))
+STRUCTURAL_COOLDOWN_AFTER = int(os.getenv("STRUCTURAL_COOLDOWN_AFTER", "2"))
+STRUCTURAL_FAMILY_COOLDOWN_AFTER = int(os.getenv("STRUCTURAL_FAMILY_COOLDOWN_AFTER", "8"))
 
 # =========================================================
 # Runtime state
@@ -687,9 +690,9 @@ def should_cooldown_slug(market: Dict[str, Any]) -> Tuple[bool, str]:
     slug_failures = unresolved_slug_failures.get(slug, 0)
     fam = market_family_hint(market)
     fam_failures = unresolved_family_failures.get(fam, 0)
-    if slug_failures >= 3:
+    if slug_failures >= STRUCTURAL_COOLDOWN_AFTER:
         return True, "slug_repeat_unresolved"
-    if fam_failures >= 10 and "sports-futures" in fam:
+    if fam_failures >= STRUCTURAL_FAMILY_COOLDOWN_AFTER and fam in ["sports-futures", "novelty-special", "politics-personnel"]:
         return True, "family_repeat_unresolved"
     return False, "ok"
 
@@ -708,6 +711,23 @@ def record_market_resolved_success(market: Dict[str, Any]) -> None:
         unresolved_slug_failures[slug] = max(0, unresolved_slug_failures.get(slug, 0) - 1)
         if unresolved_slug_failures[slug] == 0:
             unresolved_slug_failures.pop(slug, None)
+
+
+def passes_final_horizon_cap(market: Dict[str, Any]) -> Tuple[bool, str]:
+    end_dt, _ = get_market_end_dt(market)
+    if end_dt is None:
+        return True, "no_end_dt"
+    delta_days = (end_dt - now_utc()).total_seconds() / 86400.0
+    if delta_days < 0:
+        return False, "past_event"
+    fam = family_bucket(market)
+    txt = full_market_text(market)
+    if fam == "politics-personnel" or "election" in txt or "presidential" in txt or "prime minister" in txt:
+        if delta_days > POLITICS_MAX_DAYS:
+            return False, "politics_horizon_cap"
+    elif delta_days > MAX_DAYS_TO_END:
+        return False, "max_days_to_end_cap"
+    return True, "ok"
 
 
 def deep_find_yes_no_tokens(obj: Any) -> Tuple[Optional[str], Optional[str]]:
@@ -1480,6 +1500,8 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "events_seeded_candidates": 0,
         "tag_seeded_candidates": 0,
         "orderbook_disabled_skips": 0,
+        "horizon_cap_skips": 0,
+        "structural_shortlist_rejects": 0,
     }
     query_hit_counts: Dict[str, int] = {}
     broad_markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
@@ -1572,6 +1594,17 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 stats["discover_skip_samples"].append({
                     "slug": m.get("slug"),
                     "reason": "weak_time_signal",
+                    "question": m.get("question"),
+                })
+            continue
+
+        horizon_ok, horizon_reason = passes_final_horizon_cap(m)
+        if not horizon_ok:
+            stats["horizon_cap_skips"] += 1
+            if len(stats["discover_skip_samples"]) < 8:
+                stats["discover_skip_samples"].append({
+                    "slug": m.get("slug"),
+                    "reason": horizon_reason,
                     "question": m.get("question"),
                 })
             continue
@@ -1785,6 +1818,7 @@ def scan_once() -> Dict[str, Any]:
         yes_token, no_token = extract_yes_no_tokens(hydrated_market)
         if not yes_token or not no_token:
             stats["discover_resolve_failures"] += 1
+            stats["structural_shortlist_rejects"] += 1
             structural_reason_counts["missing_token_ids"] = structural_reason_counts.get("missing_token_ids", 0) + 1
             record_unresolved_market_failure(hydrated_market)
             structural_observations.append({
@@ -2099,6 +2133,8 @@ def format_health_text() -> str:
         f"events_seeded_candidates={(last_pipeline_stats or {}).get('events_seeded_candidates', 0)}",
         f"tag_seeded_candidates={(last_pipeline_stats or {}).get('tag_seeded_candidates', 0)}",
         f"orderbook_disabled_skips={(last_pipeline_stats or {}).get('orderbook_disabled_skips', 0)}",
+        f"horizon_cap_skips={(last_pipeline_stats or {}).get('horizon_cap_skips', 0)}",
+        f"structural_shortlist_rejects={(last_pipeline_stats or {}).get('structural_shortlist_rejects', 0)}",
         f"staged_candidates={(last_pipeline_stats or {}).get('staged_candidates', 0)}",
         f"forced_eval_count={(last_pipeline_stats or {}).get('forced_eval_count', 0)}",
         f"local_target_term_hits={(last_pipeline_stats or {}).get('local_target_term_hits', {})}",
@@ -2123,112 +2159,28 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
     if reason_counts:
         k, v = sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[0]
         top_reason = f"{k}:{v}"
+
     hard_skip_reason = "none"
     hard_skip_counts = pipeline.get("discover_hard_skip_reason_counts", {}) or {}
     if hard_skip_counts:
         hk, hv = sorted(hard_skip_counts.items(), key=lambda x: x[1], reverse=True)[0]
         hard_skip_reason = f"{hk}:{hv}"
 
-    lines = [
-        "Scan finished. No qualifying markets." if not alerts and not watches else "Scan finished.",
-        "",
-        f"Total: {len(alerts) + len(watches)}",
-        f"Alerts: {len(alerts)}",
-        f"Watch: {len(watches)}",
-        "Skip: 0",
-        (
-            "Pipeline: source=none | "
-            f"discover_prelim={pipeline.get('discover_prelim', 0)} | "
-            f"discover_hard_skipped={pipeline.get('discover_hard_skipped', 0)} | "
-            f"discover_non_curated_skips={pipeline.get('discover_non_curated_skips', 0)} | "
-            f"discover_relaxed_admits={pipeline.get('discover_relaxed_admits', 0)} | "
-            f"discover_failopen_admits={pipeline.get('discover_failopen_admits', 0)} | "
-            f"discover_family_skips={pipeline.get('discover_family_skips', 0)} | "
-            f"discover_bucket_skips={pipeline.get('discover_bucket_skips', 0)} | "
-            f"cooldown_skips={pipeline.get('cooldown_skips', 0)} | "
-            f"bad_family_skips={pipeline.get('bad_family_skips', 0)} | "
-            f"weak_timing_skips={pipeline.get('weak_timing_skips', 0)} | "
-            f"low_catalyst_skips={pipeline.get('low_catalyst_skips', 0)} | "
-            f"timing_hydration_checks={pipeline.get('timing_hydration_checks', 0)} | "
-            f"targeted_prelim={pipeline.get('targeted_prelim', 0)} | "
-            f"targeted_kept={pipeline.get('targeted_kept', 0)} | "
-            f"broad_backup_used={pipeline.get('broad_backup_used', 0)} | "
-            f"local_targeted_candidates={pipeline.get('local_targeted_candidates', 0)} | "
-            f"events_seeded_candidates={pipeline.get('events_seeded_candidates', 0)} | "
-            f"tag_seeded_candidates={pipeline.get('tag_seeded_candidates', 0)} | "
-            f"orderbook_disabled_skips={pipeline.get('orderbook_disabled_skips', 0)} | "
-            f"staged_candidates={pipeline.get('staged_candidates', 0)} | "
-            f"forced_eval_count={pipeline.get('forced_eval_count', 0)} | "
-            f"adaptive_intake_level={pipeline.get('adaptive_intake_level', 0)} | "
-            f"discover_checked={pipeline.get('discover_checked', 0)} | "
-            f"discover_kept={pipeline.get('discover_kept', 0)} | "
-            f"fallback_items={pipeline.get('fallback_items', 0)} | "
-            f"fallback_checked={pipeline.get('fallback_checked', 0)} | "
-            f"fallback_kept={pipeline.get('fallback_kept', 0)} | "
-            f"cache_used={pipeline.get('cache_used', 0)} | "
-            f"cache_refetched={pipeline.get('cache_refetched', 0)} | "
-            f"resolve_failures={pipeline.get('discover_resolve_failures', 0)} | "
-            f"structural_top={sorted(structural_reason_counts.items(), key=lambda x: x[1], reverse=True)[0][0] + ':' + str(sorted(structural_reason_counts.items(), key=lambda x: x[1], reverse=True)[0][1]) if structural_reason_counts else 'none'} | "
-            f"resolve_samples={len(pipeline.get('resolve_failure_samples', []) or [])} | "f"book_samples={len(pipeline.get('book_failure_samples', []) or [])} | "f"hydrated_hits={pipeline.get('hydrated_detail_hits', 0)} | "f"hydrated_misses={pipeline.get('hydrated_detail_misses', 0)} | "
-            f"top_preflight_discover={top_reason} | top_preflight_fallback=none"
-        ),
-        "",
-        "Near-miss summary: No skip reasons available." if not near_passes else "Near-miss summary:",
-    ]
-    if near_passes:
-        for n in near_passes:
-            lines.extend([
-                f"{n['question']}",
-                f"slug={n['slug']}",
-                f"side={n.get('side', '?')} reason={n['reason']}",
-                f"bid={n['bid']} ask={n['ask']} spread={n['spread']} imbalance={n.get('imbalance', 0.0)} pressure={n.get('pressure', 0.0)}",
-            ])
-    else:
-        lines.extend([
-            "",
-            "No tradable near-misses found.",
-            "Most candidates failed preflight, depth, fill confidence, or cached candidate resolution.",
-            f"Preflight detail: discover={reason_counts} fallback={{}}",
-        ])
-        resolve_samples = pipeline.get("resolve_failure_samples", []) or []
-        book_samples = pipeline.get("book_failure_samples", []) or []
-        if resolve_samples:
-            lines.append("")
-            lines.append("Resolve failure samples:")
-            for s in resolve_samples[:3]:
-                lines.extend([
-                    f"{s.get('question') or 'unknown'}",
-                    f"slug={s.get('slug', '')}",
-                    f"hydration_source={s.get('hydration_source', 'unknown')}",
-                    f"yes_token={s.get('yes_token')} no_token={s.get('no_token')}",
-                    f"outcomes={s.get('outcomes')}",
-                ])
-        if book_samples:
-            lines.append("")
-            lines.append("Book failure samples:")
-            for s in book_samples[:3]:
-                lines.extend([
-                    f"{s.get('question') or 'unknown'}",
-                    f"slug={s.get('slug', '')}",
-                    f"yes_token={s.get('yes_token')} no_token={s.get('no_token')}",
-                    f"yes_book_ok={s.get('yes_book_ok')} no_book_ok={s.get('no_book_ok')}",
-                ])
+    structural_top = "none"
+    if structural_reason_counts:
+        sk, sv = sorted(structural_reason_counts.items(), key=lambda x: x[1], reverse=True)[0]
+        structural_top = f"{sk}:{sv}"
 
-    if staged_candidates:
-        lines.append("")
-        lines.append("Forced evaluation candidates:")
-        for s in staged_candidates[:5]:
-            lines.extend([
-                f"{s['question']}",
-                f"slug={s['slug']}",
-                f"side={s.get('side', '?')} stage={s.get('stage', 'staged')} raw_score={s.get('raw_score', 0.0)}",
-                f"bid={s['bid']} ask={s['ask']} spread={s['spread']} fill={s['fill_confidence']} imbalance={s.get('imbalance', 0.0)} pressure={s.get('pressure', 0.0)}",
-                f"reason={s['reason']}",
-            ])
+    repeated_unresolved = sorted(unresolved_slug_failures.items(), key=lambda x: x[1], reverse=True)[:3]
+    top_fams = sorted(unresolved_family_failures.items(), key=lambda x: x[1], reverse=True)[:3]
+    source_hits = pipeline.get("local_target_term_hits", {}) or {}
+    top_source_hits = sorted(source_hits.items(), key=lambda x: x[1], reverse=True)[:8]
 
+    lines = []
+    lines.append("Scan finished.")
+    lines.append("")
+    lines.append("Actionable now")
     if alerts or watches:
-        lines.append("")
-        lines.append("Tradable now:")
         for row in alerts + watches:
             lines.extend([
                 f"{row['category']} | {row['question']}",
@@ -2236,11 +2188,91 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
                 f"bid={row['bid']} ask={row['ask']} spread={row['spread']} fill={row['fill_confidence']} imbalance={row.get('imbalance', 0.0)} pressure={row.get('pressure', 0.0)}",
                 "",
             ])
+    else:
+        lines.append("None")
 
     lines.append("")
+    lines.append("Closest to test")
+    if staged_candidates:
+        for s in staged_candidates[:5]:
+            lines.extend([
+                f"{s['question']}",
+                f"slug={s['slug']} side={s.get('side', '?')} stage={s.get('stage', 'staged')} raw_score={s.get('raw_score', 0.0)}",
+                f"bid={s['bid']} ask={s['ask']} spread={s['spread']} fill={s['fill_confidence']} imbalance={s.get('imbalance', 0.0)} pressure={s.get('pressure', 0.0)}",
+                f"blocker={s['reason']}",
+                "",
+            ])
+    elif near_passes:
+        for n in near_passes[:5]:
+            lines.extend([
+                f"{n['question']}",
+                f"slug={n['slug']} side={n.get('side', '?')} reason={n['reason']}",
+                f"bid={n['bid']} ask={n['ask']} spread={n['spread']} imbalance={n.get('imbalance', 0.0)} pressure={n.get('pressure', 0.0)}",
+                "",
+            ])
+    else:
+        lines.append("None")
+
+    lines.append("")
+    lines.append("Structural blockers")
+    lines.append(f"top_structural={structural_top}")
+    lines.append(f"top_preflight={top_reason}")
+    lines.append(f"top_hard_skip={hard_skip_reason}")
+    lines.append(
+        " | ".join([
+            f"resolve_failures={pipeline.get('discover_resolve_failures', 0)}",
+            f"resolve_samples={len(pipeline.get('resolve_failure_samples', []) or [])}",
+            f"book_samples={len(pipeline.get('book_failure_samples', []) or [])}",
+            f"structural_shortlist_rejects={pipeline.get('structural_shortlist_rejects', 0)}",
+        ])
+    )
+    if pipeline.get("resolve_failure_samples"):
+        lines.append("samples:")
+        for s in pipeline.get("resolve_failure_samples", [])[:3]:
+            lines.extend([
+                f"{s.get('question') or 'unknown'}",
+                f"slug={s.get('slug', '')}",
+                f"hydration_source={s.get('hydration_source', 'unknown')}",
+                f"yes_token={s.get('yes_token')} no_token={s.get('no_token')}",
+                f"outcomes={s.get('outcomes')}",
+                "",
+            ])
+
+    lines.append("")
+    lines.append("Discovery health")
+    lines.append(
+        " | ".join([
+            f"prelim={pipeline.get('discover_prelim', 0)}",
+            f"targeted_prelim={pipeline.get('targeted_prelim', 0)}",
+            f"targeted_kept={pipeline.get('targeted_kept', 0)}",
+            f"checked={pipeline.get('discover_checked', 0)}",
+            f"kept={pipeline.get('discover_kept', 0)}",
+            f"weak_timing_skips={pipeline.get('weak_timing_skips', 0)}",
+            f"bad_family_skips={pipeline.get('bad_family_skips', 0)}",
+            f"horizon_cap_skips={pipeline.get('horizon_cap_skips', 0)}",
+        ])
+    )
+    lines.append(
+        " | ".join([
+            f"events_seeded={pipeline.get('events_seeded_candidates', 0)}",
+            f"tag_seeded={pipeline.get('tag_seeded_candidates', 0)}",
+            f"local_targeted={pipeline.get('local_targeted_candidates', 0)}",
+            f"broad_backup_used={pipeline.get('broad_backup_used', 0)}",
+            f"timing_hydration_checks={pipeline.get('timing_hydration_checks', 0)}",
+            f"orderbook_disabled_skips={pipeline.get('orderbook_disabled_skips', 0)}",
+        ])
+    )
+    lines.append(f"top_source_hits={top_source_hits if top_source_hits else 'none'}")
+
+    lines.append("")
+    lines.append("Cooldown candidates")
+    lines.append(f"slugs={repeated_unresolved if repeated_unresolved else 'none'}")
+    lines.append(f"families={top_fams if top_fams else 'none'}")
+
+    lines.append("")
+    lines.append("Forming markets")
     if observations:
-        lines.append("Forming markets:")
-        for o in observations:
+        for o in observations[:5]:
             lines.extend([
                 f"FORMING | {o['question']}",
                 f"slug={o['slug']} side={o.get('side', '?')} lane={o.get('lane', 'forming')} stage={o.get('stage', 'n/a')} score={o['score']} raw={o.get('raw_score', 0.0)} trend={o['trend']}",
@@ -2250,25 +2282,8 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
                 "",
             ])
     else:
-        lines.append("Forming markets: none")
+        lines.append("None")
 
-    repeated_unresolved = sorted(unresolved_slug_failures.items(), key=lambda x: x[1], reverse=True)[:3]
-    top_fams = sorted(unresolved_family_failures.items(), key=lambda x: x[1], reverse=True)[:3]
-    lines.append("")
-    lines.append(f"Recurring unresolved slugs: {repeated_unresolved if repeated_unresolved else 'none'}")
-    lines.append(f"Recurring unresolved families: {top_fams if top_fams else 'none'}")
-    query_hits = pipeline.get("local_target_term_hits", {}) or {}
-    top_query_hits = sorted(query_hits.items(), key=lambda x: x[1], reverse=True)[:8]
-    lines.append(f"Top discovery source hits: {top_query_hits if top_query_hits else 'none'}")
-
-    lines.extend([
-        "",
-        "Session summary:",
-        f"scans={session_summary.get('scans', 0)} | empty_prod_scans={session_summary.get('empty_prod_scans', 0)} | unique_forming={session_summary.get('unique_forming', 0)}",
-        f"observation_hits={session_summary.get('observation_hits', 0)} | observation_repeats={session_summary.get('observation_repeats', 0)}",
-        f"top_skip_reason={top_reason if top_reason else 'none'} | top_hard_skip={hard_skip_reason}",
-        f"best_forming={session_summary.get('best_forming', {}) or 'none'}",
-    ])
     return "\n".join(lines)
 
 

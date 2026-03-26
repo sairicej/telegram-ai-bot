@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v20-quarantine-horizon-manualscan"
+SCRIPT_VERSION = "v20.1-soft-target-lane"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -95,6 +95,7 @@ EXPLORATION_MIN_BID = float(os.getenv("EXPLORATION_MIN_BID", "0.003"))
 POLITICS_MAX_DAYS = int(os.getenv("POLITICS_MAX_DAYS", "14"))
 STRUCTURAL_COOLDOWN_AFTER = int(os.getenv("STRUCTURAL_COOLDOWN_AFTER", "2"))
 STRUCTURAL_FAMILY_COOLDOWN_AFTER = int(os.getenv("STRUCTURAL_FAMILY_COOLDOWN_AFTER", "8"))
+SOFT_TARGET_CHECK_BUDGET = int(os.getenv("SOFT_TARGET_CHECK_BUDGET", "5"))
 
 # =========================================================
 # Runtime state
@@ -478,6 +479,22 @@ def is_targeted_high_signal_market(market: Dict[str, Any]) -> bool:
     has_time = has_strong_time_signal(market) or has_near_end_time(market, hydrate_if_missing=True)
     has_time_bound_crypto = any(t in txt for t in crypto_terms) and has_time
     return bool((has_strong and has_time) or has_time_bound_crypto)
+
+
+def is_soft_target_market(market: Dict[str, Any]) -> bool:
+    bad_family, _ = is_bad_microstructure_family(market)
+    if bad_family:
+        return False
+    if not market_has_orderbook_enabled(market):
+        return False
+    horizon_ok, _ = passes_final_horizon_cap(market)
+    if not horizon_ok:
+        return False
+    txt = full_market_text(market)
+    from_event_seed = bool(market.get("_seed_event"))
+    from_tag_seed = bool(market.get("_seed_tag"))
+    from_local_target = any(term.lower() in txt for term in LOCAL_TARGET_TERMS)
+    return bool(from_event_seed or from_tag_seed or from_local_target)
 
 
 def discovery_intake_score(market: Dict[str, Any]) -> float:
@@ -1502,6 +1519,8 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "orderbook_disabled_skips": 0,
         "horizon_cap_skips": 0,
         "structural_shortlist_rejects": 0,
+        "soft_target_prelim": 0,
+        "soft_target_kept": 0,
     }
     query_hit_counts: Dict[str, int] = {}
     broad_markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
@@ -1516,6 +1535,8 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     markets = dedupe_markets(targeted_seed_markets + broad_markets)
     targeted_primary_pool: List[Dict[str, Any]] = []
     targeted_relaxed_pool: List[Dict[str, Any]] = []
+    soft_primary_pool: List[Dict[str, Any]] = []
+    soft_relaxed_pool: List[Dict[str, Any]] = []
     broad_primary_pool: List[Dict[str, Any]] = []
     broad_relaxed_pool: List[Dict[str, Any]] = []
     failopen_pool: List[Dict[str, Any]] = []
@@ -1676,8 +1697,13 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 break
 
         is_targeted = is_targeted_high_signal_market(m) or query_seeded
+        is_soft_target = False
         if is_targeted:
             stats["targeted_prelim"] += 1
+        else:
+            is_soft_target = is_soft_target_market(m)
+            if is_soft_target:
+                stats["soft_target_prelim"] += 1
 
         m["_priority"] = discovery_intake_score(m)
         m["_low_flow"] = low_flow
@@ -1687,20 +1713,27 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         m["_strong_time"] = strong_time
         m["_near_end_time"] = near_end_time
         m["_is_targeted"] = is_targeted
+        m["_is_soft_target"] = is_soft_target
         if low_flow:
             stats["discover_low_flow_candidates"] += 1
             if is_targeted:
                 targeted_relaxed_pool.append(m)
+            elif is_soft_target:
+                soft_relaxed_pool.append(m)
             else:
                 broad_relaxed_pool.append(m)
         else:
             if is_targeted:
                 targeted_primary_pool.append(m)
+            elif is_soft_target:
+                soft_primary_pool.append(m)
             else:
                 broad_primary_pool.append(m)
 
     targeted_primary_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
     targeted_relaxed_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
+    soft_primary_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
+    soft_relaxed_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
     broad_primary_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
     broad_relaxed_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
 
@@ -1759,7 +1792,24 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             if try_add(m, relaxed=True):
                 stats["targeted_kept"] += 1
 
-    # Lane B: broad backup only if targeted lane is too thin
+    # Lane B: soft targets get a small reserved checked budget
+    soft_budget = min(SOFT_TARGET_CHECK_BUDGET, max(0, target - len(selected)))
+    if soft_budget > 0:
+        for m in soft_primary_pool:
+            if soft_budget <= 0 or len(selected) >= target:
+                break
+            if try_add(m, relaxed=False):
+                stats["soft_target_kept"] += 1
+                soft_budget -= 1
+
+        for m in soft_relaxed_pool:
+            if soft_budget <= 0 or len(selected) >= target:
+                break
+            if try_add(m, relaxed=True):
+                stats["soft_target_kept"] += 1
+                soft_budget -= 1
+
+    # Lane C: broad backup only if targeted + soft lanes are too thin
     if len(selected) < min(target, 18):
         stats["broad_backup_used"] = 1
         for m in broad_primary_pool:
@@ -2128,6 +2178,8 @@ def format_health_text() -> str:
         f"timing_hydration_checks={(last_pipeline_stats or {}).get('timing_hydration_checks', 0)}",
         f"targeted_prelim={(last_pipeline_stats or {}).get('targeted_prelim', 0)}",
         f"targeted_kept={(last_pipeline_stats or {}).get('targeted_kept', 0)}",
+        f"soft_target_prelim={(last_pipeline_stats or {}).get('soft_target_prelim', 0)}",
+        f"soft_target_kept={(last_pipeline_stats or {}).get('soft_target_kept', 0)}",
         f"broad_backup_used={(last_pipeline_stats or {}).get('broad_backup_used', 0)}",
         f"local_targeted_candidates={(last_pipeline_stats or {}).get('local_targeted_candidates', 0)}",
         f"events_seeded_candidates={(last_pipeline_stats or {}).get('events_seeded_candidates', 0)}",
@@ -2245,6 +2297,8 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"prelim={pipeline.get('discover_prelim', 0)}",
             f"targeted_prelim={pipeline.get('targeted_prelim', 0)}",
             f"targeted_kept={pipeline.get('targeted_kept', 0)}",
+            f"soft_target_prelim={pipeline.get('soft_target_prelim', 0)}",
+            f"soft_target_kept={pipeline.get('soft_target_kept', 0)}",
             f"checked={pipeline.get('discover_checked', 0)}",
             f"kept={pipeline.get('discover_kept', 0)}",
             f"weak_timing_skips={pipeline.get('weak_timing_skips', 0)}",

@@ -15,7 +15,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "v20.2-seed-qualified-lane"
+SCRIPT_VERSION = "v21-force-inspect-empty-scan"
 ROLLING_DISCOVERY_DAYS = 30
 UTC = timezone.utc
 
@@ -97,6 +97,8 @@ STRUCTURAL_COOLDOWN_AFTER = int(os.getenv("STRUCTURAL_COOLDOWN_AFTER", "2"))
 STRUCTURAL_FAMILY_COOLDOWN_AFTER = int(os.getenv("STRUCTURAL_FAMILY_COOLDOWN_AFTER", "8"))
 SOFT_TARGET_CHECK_BUDGET = int(os.getenv("SOFT_TARGET_CHECK_BUDGET", "5"))
 SEED_QUALIFIED_CHECK_BUDGET = int(os.getenv("SEED_QUALIFIED_CHECK_BUDGET", "5"))
+EMPTY_SCAN_FORCE_INSPECT_AFTER = int(os.getenv("EMPTY_SCAN_FORCE_INSPECT_AFTER", "3"))
+FORCE_INSPECT_BUDGET = int(os.getenv("FORCE_INSPECT_BUDGET", "5"))
 
 # =========================================================
 # Runtime state
@@ -1541,6 +1543,8 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "soft_target_kept": 0,
         "seed_qualified_prelim": 0,
         "seed_qualified_kept": 0,
+        "force_inspect_prelim": 0,
+        "force_inspect_kept": 0,
     }
     query_hit_counts: Dict[str, int] = {}
     broad_markets = fetch_gamma_markets(DISCOVER_LIMIT) if AUTO_DISCOVER else []
@@ -1559,6 +1563,8 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     soft_relaxed_pool: List[Dict[str, Any]] = []
     seed_primary_pool: List[Dict[str, Any]] = []
     seed_relaxed_pool: List[Dict[str, Any]] = []
+    force_primary_pool: List[Dict[str, Any]] = []
+    force_relaxed_pool: List[Dict[str, Any]] = []
     broad_primary_pool: List[Dict[str, Any]] = []
     broad_relaxed_pool: List[Dict[str, Any]] = []
     failopen_pool: List[Dict[str, Any]] = []
@@ -1631,15 +1637,6 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         if not strong_time and not near_end_time:
             stats["timing_hydration_checks"] += 1
             near_end_time = has_near_end_time(m, hydrate_if_missing=True)
-        if not strong_time and not near_end_time:
-            stats["weak_timing_skips"] += 1
-            if len(stats["discover_skip_samples"]) < 8:
-                stats["discover_skip_samples"].append({
-                    "slug": m.get("slug"),
-                    "reason": "weak_time_signal",
-                    "question": m.get("question"),
-                })
-            continue
 
         horizon_ok, horizon_reason = passes_final_horizon_cap(m)
         if not horizon_ok:
@@ -1651,7 +1648,43 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                     "question": m.get("question"),
                 })
             continue
-        if catalyst_score < 0.6:
+
+        query_seeded = False
+        txt = full_market_text(m)
+        for term in LOCAL_TARGET_TERMS:
+            if term.lower() in txt:
+                query_seeded = True
+                break
+
+        is_targeted = is_targeted_high_signal_market(m) or query_seeded
+        is_soft_target = False
+        is_seed_qualified = False
+        is_force_inspect = False
+        if is_targeted:
+            stats["targeted_prelim"] += 1
+        else:
+            is_soft_target = is_soft_target_market(m)
+            if is_soft_target:
+                stats["soft_target_prelim"] += 1
+            else:
+                is_seed_qualified = is_seed_qualified_market(m)
+                if is_seed_qualified:
+                    stats["seed_qualified_prelim"] += 1
+                    if not strong_time and not near_end_time:
+                        is_force_inspect = True
+                        stats["force_inspect_prelim"] += 1
+
+        if not strong_time and not near_end_time and not is_force_inspect:
+            stats["weak_timing_skips"] += 1
+            if len(stats["discover_skip_samples"]) < 8:
+                stats["discover_skip_samples"].append({
+                    "slug": m.get("slug"),
+                    "reason": "weak_time_signal",
+                    "question": m.get("question"),
+                })
+            continue
+
+        if catalyst_score < 0.6 and not is_force_inspect:
             stats["low_catalyst_skips"] += 1
             if len(stats["discover_skip_samples"]) < 8:
                 stats["discover_skip_samples"].append({
@@ -1711,27 +1744,6 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 stats["discover_skip_samples"].append({"slug": m.get("slug"), "reason": "non_curated_skip", "question": m.get("question")})
             continue
 
-        query_seeded = False
-        txt = full_market_text(m)
-        for term in LOCAL_TARGET_TERMS:
-            if term.lower() in txt:
-                query_seeded = True
-                break
-
-        is_targeted = is_targeted_high_signal_market(m) or query_seeded
-        is_soft_target = False
-        is_seed_qualified = False
-        if is_targeted:
-            stats["targeted_prelim"] += 1
-        else:
-            is_soft_target = is_soft_target_market(m)
-            if is_soft_target:
-                stats["soft_target_prelim"] += 1
-            else:
-                is_seed_qualified = is_seed_qualified_market(m)
-                if is_seed_qualified:
-                    stats["seed_qualified_prelim"] += 1
-
         m["_priority"] = discovery_intake_score(m)
         m["_low_flow"] = low_flow
         m["_sports_like"] = sports_like
@@ -1742,12 +1754,15 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         m["_is_targeted"] = is_targeted
         m["_is_soft_target"] = is_soft_target
         m["_is_seed_qualified"] = is_seed_qualified
+        m["_is_force_inspect"] = is_force_inspect
         if low_flow:
             stats["discover_low_flow_candidates"] += 1
             if is_targeted:
                 targeted_relaxed_pool.append(m)
             elif is_soft_target:
                 soft_relaxed_pool.append(m)
+            elif is_force_inspect:
+                force_relaxed_pool.append(m)
             elif is_seed_qualified:
                 seed_relaxed_pool.append(m)
             else:
@@ -1757,6 +1772,8 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 targeted_primary_pool.append(m)
             elif is_soft_target:
                 soft_primary_pool.append(m)
+            elif is_force_inspect:
+                force_primary_pool.append(m)
             elif is_seed_qualified:
                 seed_primary_pool.append(m)
             else:
@@ -1768,6 +1785,8 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     soft_relaxed_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
     seed_primary_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
     seed_relaxed_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
+    force_primary_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
+    force_relaxed_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
     broad_primary_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
     broad_relaxed_pool.sort(key=lambda x: (x.get("_priority", 1.0), market_liquidity(x), market_volume(x)), reverse=True)
 
@@ -1860,7 +1879,26 @@ def discover_candidates() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 stats["seed_qualified_kept"] += 1
                 seed_budget -= 1
 
-    # Lane D: broad backup only if targeted + soft + seed lanes are too thin
+    # Lane D: force-inspect seeded markets can bypass weak timing after repeated empty scans
+    force_budget = 0
+    if session_summary.get("empty_prod_scans", 0) >= EMPTY_SCAN_FORCE_INSPECT_AFTER:
+        force_budget = min(FORCE_INSPECT_BUDGET, max(0, target - len(selected)))
+    if force_budget > 0:
+        for m in force_primary_pool:
+            if force_budget <= 0 or len(selected) >= target:
+                break
+            if try_add(m, relaxed=False):
+                stats["force_inspect_kept"] += 1
+                force_budget -= 1
+
+        for m in force_relaxed_pool:
+            if force_budget <= 0 or len(selected) >= target:
+                break
+            if try_add(m, relaxed=True):
+                stats["force_inspect_kept"] += 1
+                force_budget -= 1
+
+    # Lane E: broad backup only if targeted + soft + seed lanes are too thin
     if len(selected) < min(target, 18):
         stats["broad_backup_used"] = 1
         for m in broad_primary_pool:
@@ -2233,6 +2271,8 @@ def format_health_text() -> str:
         f"soft_target_kept={(last_pipeline_stats or {}).get('soft_target_kept', 0)}",
         f"seed_qualified_prelim={(last_pipeline_stats or {}).get('seed_qualified_prelim', 0)}",
         f"seed_qualified_kept={(last_pipeline_stats or {}).get('seed_qualified_kept', 0)}",
+        f"force_inspect_prelim={(last_pipeline_stats or {}).get('force_inspect_prelim', 0)}",
+        f"force_inspect_kept={(last_pipeline_stats or {}).get('force_inspect_kept', 0)}",
         f"broad_backup_used={(last_pipeline_stats or {}).get('broad_backup_used', 0)}",
         f"local_targeted_candidates={(last_pipeline_stats or {}).get('local_targeted_candidates', 0)}",
         f"events_seeded_candidates={(last_pipeline_stats or {}).get('events_seeded_candidates', 0)}",
@@ -2354,6 +2394,8 @@ def format_scan_text(scan: Dict[str, Any]) -> str:
             f"soft_target_kept={pipeline.get('soft_target_kept', 0)}",
             f"seed_qualified_prelim={pipeline.get('seed_qualified_prelim', 0)}",
             f"seed_qualified_kept={pipeline.get('seed_qualified_kept', 0)}",
+            f"force_inspect_prelim={pipeline.get('force_inspect_prelim', 0)}",
+            f"force_inspect_kept={pipeline.get('force_inspect_kept', 0)}",
             f"checked={pipeline.get('discover_checked', 0)}",
             f"kept={pipeline.get('discover_kept', 0)}",
             f"weak_timing_skips={pipeline.get('weak_timing_skips', 0)}",
